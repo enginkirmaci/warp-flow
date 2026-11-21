@@ -1,7 +1,7 @@
 name: ci
 
-# This app's own gate. No kit dependency today (the engine is plain Rust); the
-# GPUI build packages stay installed because the desktop app lands in S3.
+# This app's own gate: the desktop app pulls the kit and the GPUI stack from
+# tags, so the GTK-free Wayland/X11 build packages are installed below.
 on:
   push:
     branches: [main]

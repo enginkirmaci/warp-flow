@@ -8,9 +8,13 @@ repository is linked under `apps/`). This file adds only the app-specific facts.
 
 - `crates/warp-flow-core/` — the engine. No UI, no model client, no network of
   its own: it talks to warp-agent through the door.
-- `src/main.rs` — the CLI. When the desktop app lands (S3) `src/lib.rs` becomes
-  the probe boundary and the binary turns into a thin launcher, as in the
-  sibling apps.
+- `src/main.rs` — the thin launcher for the desktop app; `src/lib.rs` is the
+  probe boundary, and `src/store.rs` is the filesystem scan behind the board.
+- `src/bin/warp-flow-cli.rs` — the headless driver (`run`, `status`, `answer`).
+  It is the only way to start a run until the app's run screen hosts the
+  engine, so keep it building and keep its argument tests.
+- `src/ui/` — the shell: repository rail, kanban board and run detail. The
+  run screen with the DAG is S3b.
 - `app.toml`, `version.toml`, `rust-toolchain.toml`, `scripts/version.py` and
   `.githooks/pre-commit` follow the family's rules; do not hand-edit a version.
 

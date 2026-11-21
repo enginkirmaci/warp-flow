@@ -16,8 +16,14 @@ The design, its decisions and the build order are
 
 ```sh
 cargo test -p warp-flow-core   # the engine
-cargo run                      # the CLI
+cargo test -p warp-flow        # the desktop app's headless probes
+cargo run -- --repo <path>     # the desktop app (repeat --repo per repository)
+cargo run --bin warp-flow-cli -- run <issue-dir>   # drive a run from a terminal
 ```
 
-The desktop app (repo rail, kanban board, run screen) is build step S3; until
-then this repository is the engine and its CLI.
+The desktop app is build step S3. S3a lands the shell — the repository rail,
+the six-column kanban board and a read-only run detail pane. The full run
+screen with the workflow DAG, the task dependency strip and the question cards
+is S3b. Until that screen can start a run, `warp-flow-cli` is the headless
+driver for the same engine (`run`, `status`, `answer`, `--dry-run`); it is a
+second binary of this package, not a separate package.
