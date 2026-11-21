@@ -1506,10 +1506,12 @@ pub(crate) fn status_pill(run: &Run) -> AnyElement {
     let color = column_color(run.column);
     // The lane's word is what the board sorts by; the record can say something
     // sharper. A paused run sits in Waiting on you, but a person paused it —
-    // say so rather than telling them a question is open.
+    // say so rather than telling them a question is open; and a run whose
+    // every step finished is `done` whether or not it had a merge step, so the
+    // lane's word must not promise one.
     let word: String = if run.question.is_some() {
         "asking you".to_owned()
-    } else if matches!(run.status.as_str(), "paused" | "abandoned") {
+    } else if matches!(run.status.as_str(), "paused" | "abandoned" | "done") {
         run.status.clone()
     } else {
         column_word(run.column).to_owned()
