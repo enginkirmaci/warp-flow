@@ -12,6 +12,14 @@ markdown under `.scratch/<feature-slug>/`.
 The design, its decisions and the build order are
 `plans/warp-flow.md` in [warp-suite](https://github.com/enginkirmaci/warp-suite).
 
+## Install
+
+Released from [github.com/enginkirmaci/warp-flow](https://github.com/enginkirmaci/warp-flow):
+the Linux tarball, the Windows portable zip and the per-user Windows installer.
+The suite's release bundles it with the rest of the apps
+(`warp-suite`'s `suite.toml` pins the tag); installing the bundle is the normal
+way to get it on a desktop.
+
 ## Build
 
 ```sh
