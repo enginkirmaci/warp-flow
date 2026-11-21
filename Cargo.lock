@@ -7832,7 +7832,7 @@ dependencies = [
 
 [[package]]
 name = "warp-flow"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -7841,6 +7841,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "tracing",
  "tracing-appender",
  "warp-flow-core",
  "warpui-kit-build",
@@ -7851,7 +7852,7 @@ dependencies = [
 
 [[package]]
 name = "warp-flow-core"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "serde",
  "serde_json",

@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde::Serialize;
+
 use crate::{Error, Result};
 
 /// The `**Status:**` marker every task file carries.
@@ -34,7 +36,8 @@ const STATUS_NAMES: &str =
 ///
 /// `Resolved` is the only closed state: a `wontfix` task is still open, and a
 /// run never starts tasks that depend on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Status {
     /// Waiting for triage by a person.
     NeedsTriage,

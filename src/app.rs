@@ -2,10 +2,14 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{App, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 use gpui_platform::application;
+
+use crate::door::{Door, SharedBoard};
+use crate::host::Host;
 
 /// What a launch asks for: repositories to remember and show. `--repo` is
 /// repeatable; a bare launch shows the repositories already in settings.
@@ -43,7 +47,42 @@ pub fn run(launch: Launch) {
             // desktop preference is the only input.
             warpui_kit_core::bootstrap::init(cx, None, false, crate::theme::apply_kit_theme);
 
-            let launch = launch.clone();
+            // The app's own door, over the same host and board the window
+            // uses. A failure to bind or publish is logged and the window
+            // still opens: the app keeps working with its door down, and the
+            // door's absence is a client's problem.
+            let host = Arc::new(Host::new());
+            let board = SharedBoard::new();
+            let door = match Door::start(Arc::clone(&host), board.clone()) {
+                Ok(door) => {
+                    tracing::info!("warp-flow's door is listening on 127.0.0.1:{}", door.port());
+                    Some(Arc::new(door))
+                }
+                Err(error) => {
+                    tracing::warn!("warp-flow's door is down: {error}");
+                    None
+                }
+            };
+            // The quit path lives here, not on the window: gpui drops the
+            // window's view entity when the last window closes, before app
+            // shutdown, so an entity callback never runs and could neither
+            // withdraw the endpoint nor ask the engine to stop. The door goes
+            // down first (no new verbs), then the runs are abandoned at their
+            // next boundary, then the endpoint is withdrawn.
+            let quit_host = Arc::clone(&host);
+            cx.on_app_quit(move |_| {
+                if let Some(door) = &door {
+                    door.close();
+                    quit_host.shutdown();
+                    door.unpublish();
+                    tracing::info!("warp-flow's door is withdrawn");
+                } else {
+                    quit_host.shutdown();
+                }
+                std::future::ready(())
+            })
+            .detach();
+
             let bounds = Bounds::centered(None, size(px(1500.), px(960.)), cx);
             gpui_kit::open_window(
                 WindowOptions {
@@ -59,7 +98,11 @@ pub fn run(launch: Launch) {
                     ..Default::default()
                 },
                 cx,
-                |window, cx| cx.new(|cx| crate::ui::window::FlowApp::new(launch, window, cx)),
+                move |window, cx| {
+                    cx.new(|cx| {
+                        crate::ui::window::FlowApp::with_board(launch, host, board, window, cx)
+                    })
+                },
             )
             .expect("failed to open the warp-flow window");
             cx.activate(true);

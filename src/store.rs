@@ -80,7 +80,8 @@ fn absolute(path: &Path) -> PathBuf {
 }
 
 /// The board's six columns, in display order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Column {
     Triage,
     Ready,
@@ -147,7 +148,7 @@ impl Column {
 }
 
 /// One issue folder's identity: its repository and its folder slug.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct RunKey {
     pub repo: PathBuf,
     pub id: String,
@@ -160,7 +161,7 @@ impl std::fmt::Display for RunKey {
 }
 
 /// One attempt row from `run.md`'s log table.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RunRow {
     pub step: String,
     pub task: String,
@@ -180,7 +181,7 @@ pub struct LogGroup {
 }
 
 /// One task file, as the run screen's workflow lanes and task strip need it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct TaskRow {
     /// The number in the file name (`01` is 1).
     pub number: u32,
@@ -192,7 +193,8 @@ pub struct TaskRow {
 
 /// A step row's state, derived from `run.md`'s log and the task files. This is
 /// the run screen's vocabulary; it is deliberately not the board's [`Column`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum StepState {
     Done,
     Running,
@@ -226,7 +228,7 @@ impl StepState {
 }
 
 /// One lane of a `per_task` step: a task's own run through that step.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct LaneView {
     pub number: u32,
     pub title: String,
@@ -235,7 +237,7 @@ pub struct LaneView {
 
 /// One workflow step, already ordered and expanded into the rows the run
 /// screen draws. A `per_task` step carries one lane per task.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct StepView {
     pub id: String,
     /// `None` when the workflow could not be read and the row comes from the
@@ -251,7 +253,7 @@ pub struct StepView {
 }
 
 /// An open question in `questions/<NN>.md`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Question {
     /// The file the answer is written back into.
     pub path: PathBuf,
@@ -266,7 +268,7 @@ pub struct Question {
 }
 
 /// One issue folder, as the board and the detail pane show it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Run {
     pub key: RunKey,
     /// The issue folder, canonical so it compares with the host's snapshot
@@ -315,7 +317,7 @@ pub struct Run {
 }
 
 /// One configured repository.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RepoView {
     /// The configured path (absolute when it came through settings).
     pub path: PathBuf,
@@ -332,7 +334,7 @@ pub struct RepoView {
 
 /// One scan of every configured repository. Equality is what keeps an
 /// unchanged poll from repainting the window.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Snapshot {
     pub repos: Vec<RepoView>,
 }

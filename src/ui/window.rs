@@ -16,6 +16,7 @@ use warpui_kit_core::{A11y, icon, motion, shell, tooltip::tooltip_text};
 use warpui_kit_markdown::LiveEditorState;
 
 use crate::app::Launch;
+use crate::door::SharedBoard;
 use crate::host::{self, Host, HostSnapshot};
 use crate::store::{
     self, Column, MAX_LOG_ROWS, Question, Run, RunKey, RunRow, Snapshot, recent_rows,
@@ -40,6 +41,9 @@ pub struct FlowApp {
     scanning: bool,
     /// The engine host: one blocking run per repository, in memory.
     pub(crate) host: Arc<Host>,
+    /// The board the door answers with: the snapshot this window adopts. The
+    /// door never scans; this handle is the one source of truth they share.
+    pub(crate) board: SharedBoard,
     /// The host's in-memory snapshot, adopted only when it changes.
     pub(crate) host_snapshot: HostSnapshot,
     /// `None` is the "All repos" row.
@@ -83,7 +87,13 @@ impl FlowApp {
     /// Build the window, remember the launch's `--repo` arguments and start
     /// the background scan. The first snapshot lands after the first frame.
     pub fn new(launch: Launch, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::with_host(launch, Arc::new(Host::new()), window, cx)
+        Self::with_board(
+            launch,
+            Arc::new(Host::new()),
+            SharedBoard::new(),
+            window,
+            cx,
+        )
     }
 
     /// Build the window over `host`. The app uses [`FlowApp::new`]; a headless
@@ -93,6 +103,19 @@ impl FlowApp {
     pub fn with_host(
         launch: Launch,
         host: Arc<Host>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::with_board(launch, host, SharedBoard::new(), window, cx)
+    }
+
+    /// Build the window over the host and board handle the app's bootstrap
+    /// created: the window shows the board the door answers with, and the door
+    /// publishes the host snapshot the window renders.
+    pub fn with_board(
+        launch: Launch,
+        host: Arc<Host>,
+        board: SharedBoard,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -112,6 +135,7 @@ impl FlowApp {
             snapshot: Snapshot::default(),
             scanning: false,
             host,
+            board,
             host_snapshot: HostSnapshot::default(),
             selected_repo: None,
             selected_run: None,
@@ -136,14 +160,10 @@ impl FlowApp {
         };
         app.start_scan(cx);
         app.start_host_poll(cx);
-        // A blocking engine on a background thread must be asked to stop when
-        // the window closes; dropping the host would leave the thread running.
-        cx.on_app_quit(|this, cx| {
-            let host = Arc::clone(&this.host);
-            cx.background_executor()
-                .spawn(async move { host.shutdown() })
-        })
-        .detach();
+        // The quit path is the app's, in [`crate::app::run`]: gpui drops this
+        // window's view entity when the last window closes, before app
+        // shutdown, so an entity-level `on_app_quit` never runs. It is what
+        // withdraws the door and asks the blocking engine to stop.
         app
     }
 
@@ -196,6 +216,9 @@ impl FlowApp {
             return;
         }
         self.snapshot = next;
+        // The board the door answers with is the snapshot this window just
+        // adopted: one source of truth, and the door never runs a scan.
+        self.board.publish(self.snapshot.clone());
         self.reconcile_selection(cx);
         cx.notify();
     }
