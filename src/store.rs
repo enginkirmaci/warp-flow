@@ -34,6 +34,10 @@ pub const MAX_LOG_ROWS: usize = 8;
 pub struct Settings {
     /// Repositories the app shows, in the order the owner added them.
     pub repos: Vec<PathBuf>,
+    /// The settings screen's reduce-motion switch: the family's motion is on
+    /// unless a person (or the desktop) turns it off. Additive, so an older
+    /// document without the key reads as `false`.
+    pub reduce_motion: bool,
 }
 
 impl Settings {

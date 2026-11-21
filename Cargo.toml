@@ -1,6 +1,6 @@
 [package]
 name = "warp-flow"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2024"
 description = "warp-flow — workflow engine for the warp-suite"
 license = "GPL-3.0"
@@ -19,6 +19,9 @@ default-run = "warp-flow"
 # kit line: pinned by tag, patched to kits/ by warp-suite's local build
 warpui-kit-core = { git = "https://github.com/enginkirmaci/warp-suite", tag = "kits-v0.2.112", package = "warpui-kit-core" }
 warpui-kit-markdown = { git = "https://github.com/enginkirmaci/warp-suite", tag = "kits-v0.2.112", package = "warpui-kit-markdown", features = ["all-languages"] }
+# the task & diff screen draws patches with the family's renderer; the markdown
+# kit pulls it in too, but a transitive dependency cannot be named in code
+warpui-kit-diff = { git = "https://github.com/enginkirmaci/warp-suite", tag = "kits-v0.2.112", package = "warpui-kit-diff", features = ["all-languages"] }
 warpui-kit-platform = { git = "https://github.com/enginkirmaci/warp-suite", tag = "kits-v0.2.112", package = "warpui-kit-platform" }
 
 # the gpui stack, pinned here because the app builds standalone
