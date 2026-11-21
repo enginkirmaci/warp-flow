@@ -40,6 +40,8 @@ pub struct FlowApp {
     settings: store::Settings,
     pub(crate) snapshot: Snapshot,
     scanning: bool,
+    /// Which run of the scan loop is current, so a restart retires the old one.
+    scan_generation: u64,
     /// The engine host: one blocking run per repository, in memory.
     pub(crate) host: Arc<Host>,
     /// The board the door answers with: the snapshot this window adopts. The
@@ -133,11 +135,13 @@ impl FlowApp {
         // Submit button that reads whether the field is empty.
         cx.observe(&answer_field, |_, _, cx| cx.notify()).detach();
         window.focus(&board_focus, cx);
-        let screens = Screens::new(Arc::clone(&host), settings.clone(), cx);
+        let window_handle = cx.entity().downgrade();
+        let screens = Screens::new(Arc::clone(&host), settings.clone(), Some(window_handle), cx);
         let mut app = Self {
             settings,
             snapshot: Snapshot::default(),
             scanning: false,
+            scan_generation: 0,
             host,
             board,
             host_snapshot: HostSnapshot::default(),
@@ -175,12 +179,15 @@ impl FlowApp {
     /// Poll the engine's files every [`store::POLL_INTERVAL`] on the background
     /// executor. This gpui rev does not service cross-thread channel wakeups
     /// on foreground tasks, so the scan polls instead of waiting for a push.
+    ///
+    /// A run of the loop is stamped with a generation: [`Self::reload_settings`]
+    /// starts a new one with the new repository list and the old loop notices
+    /// the stamp on its next tick and stops, so two loops never scan at once.
     fn start_scan(&mut self, cx: &mut Context<Self>) {
         let repos = self.settings.repos.clone();
-        if repos.is_empty() {
-            return;
-        }
         self.scanning = true;
+        self.scan_generation = self.scan_generation.wrapping_add(1);
+        let generation = self.scan_generation;
         cx.spawn(async move |this, cx| {
             loop {
                 let scan_repos = repos.clone();
@@ -188,10 +195,14 @@ impl FlowApp {
                     .background_executor()
                     .spawn(async move { store::scan(&scan_repos) })
                     .await;
-                if this
-                    .update(cx, |this, cx| this.adopt_snapshot(next, cx))
-                    .is_err()
-                {
+                let keep_going = this.update(cx, |this, cx| {
+                    if this.scan_generation != generation {
+                        return false;
+                    }
+                    this.adopt_snapshot(next, cx);
+                    true
+                });
+                if !keep_going.unwrap_or(false) {
                     break;
                 }
                 cx.background_executor().timer(store::POLL_INTERVAL).await;
@@ -207,6 +218,39 @@ impl FlowApp {
             }
         })
         .detach();
+    }
+
+    /// Re-read the settings the screens may have changed (a repository added or
+    /// forgotten), drop a selection that no longer exists, and rescan at once.
+    ///
+    /// The Repos & gates screen calls this after it saves, so the rail's rows
+    /// and the board's cards follow the click instead of a relaunch.
+    pub(crate) fn reload_settings(&mut self, cx: &mut Context<Self>) {
+        let settings = store::Settings::load();
+        if settings.repos == self.settings.repos
+            && settings.reduce_motion == self.settings.reduce_motion
+        {
+            return;
+        }
+        self.settings = settings;
+        let known = |repo: &Path| self.settings.repos.iter().any(|known| known == repo);
+        if self.selected_repo.as_ref().is_some_and(|repo| !known(repo)) {
+            self.selected_repo = None;
+        }
+        if self
+            .selected_run
+            .as_ref()
+            .is_some_and(|key| !known(&key.repo))
+        {
+            self.selected_run = None;
+            self.screen = None;
+        }
+        if self.cursor.as_ref().is_some_and(|key| !known(&key.repo)) {
+            self.cursor = None;
+        }
+        // the new list is scanned now, not on the next two-second poll
+        self.start_scan(cx);
+        cx.notify();
     }
 
     /// Adopt a finished scan. The snapshot is the only data compared: an
@@ -1558,6 +1602,19 @@ impl FlowApp {
     #[doc(hidden)]
     pub fn run_action_error_for_probe(&self) -> Option<&str> {
         self.run_action_error.as_deref()
+    }
+
+    /// The screens the rail opens, for a probe that drives one directly.
+    #[doc(hidden)]
+    pub fn screens_for_probe(&self) -> &Screens {
+        &self.screens
+    }
+
+    /// The settings the window currently scans, for a probe that checks a
+    /// reload.
+    #[doc(hidden)]
+    pub fn settings_for_probe(&self) -> &store::Settings {
+        &self.settings
     }
 }
 

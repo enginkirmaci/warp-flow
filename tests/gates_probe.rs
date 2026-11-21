@@ -127,7 +127,7 @@ fn open_screen(
     let host = Arc::new(Host::new());
     let mut screen = None;
     let handle = cx.open_window(size(px(1500.), px(960.)), |_window, cx| {
-        let view = cx.new(|cx| GatesScreen::new(Arc::clone(&host), settings.clone(), cx));
+        let view = cx.new(|cx| GatesScreen::new(Arc::clone(&host), settings.clone(), None, cx));
         screen = Some(view.clone());
         ScreenHost(view)
     });

@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime};
 use gpui::prelude::*;
 use gpui::{
     AnyElement, Context, Entity, FocusHandle, FontWeight, IntoElement, KeyDownEvent, Render,
-    ScrollHandle, SharedString, Window, div, px, relative,
+    ScrollHandle, SharedString, WeakEntity, Window, div, px, relative,
 };
 use gpui_kit::component::input::InputState;
 use warp_flow_core::config::{FlowConfig, MergeMode};
@@ -31,7 +31,7 @@ use warpui_kit_core::{A11y, field, list_nav, motion, scroll, tooltip::tooltip_te
 use crate::host::{Host, Phase};
 use crate::store;
 use crate::theme;
-use crate::ui::window::repo_label;
+use crate::ui::window::{FlowApp, repo_label};
 
 use super::{ScreenRun, write_atomic_raw};
 
@@ -190,12 +190,21 @@ pub struct GatesScreen {
     save_note: Option<Note>,
     /// The last save, with the path and the time it landed.
     save_report: Option<String>,
+    /// The window that owns these screens: a repository added or forgotten here
+    /// changes what the board scans, and only the window can rescan it.
+    window: Option<WeakEntity<FlowApp>>,
 }
 
 impl GatesScreen {
     /// A screen with no run.
-    pub fn new(host: Arc<Host>, settings: store::Settings, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        host: Arc<Host>,
+        settings: store::Settings,
+        window: Option<WeakEntity<FlowApp>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
+            window,
             host,
             run: None,
             settings,
@@ -617,9 +626,81 @@ impl GatesScreen {
         };
         self.settings.repos.push(path.clone());
         self.settings.save();
+        self.notify_window(cx);
         input.update(cx, |state, cx| state.set_value("", window, cx));
         self.add_note = Some(note);
         self.select_repository(path, cx);
+    }
+
+    /// Add `path` as a remembered repository, for a probe that drives the list
+    /// without typing into the field.
+    ///
+    /// The button's own checks come first: a folder that exists, and no
+    /// duplicate. Saving is what the button does, so the window is told the
+    /// same way.
+    #[doc(hidden)]
+    pub fn add_repository_for_probe(
+        &mut self,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> std::result::Result<(), String> {
+        let path = path.canonicalize().unwrap_or(path);
+        if !path.is_dir() {
+            return Err(format!("{} is not a folder.", path.display()));
+        }
+        if self
+            .settings
+            .repos
+            .iter()
+            .any(|known| same_path(known, &path))
+        {
+            return Err(format!(
+                "{} is already a repository of this window.",
+                store::display_path(&path)
+            ));
+        }
+        self.settings.repos.push(path.clone());
+        self.settings.save();
+        self.notify_window(cx);
+        self.select_repository(path, cx);
+        Ok(())
+    }
+
+    /// Forget `path` for a probe, by the path rather than the row's index.
+    #[doc(hidden)]
+    pub fn remove_repository_for_probe(
+        &mut self,
+        path: &Path,
+        cx: &mut Context<Self>,
+    ) -> std::result::Result<(), String> {
+        let Some(index) = self
+            .settings
+            .repos
+            .iter()
+            .position(|repo| same_path(repo, path))
+        else {
+            return Err(format!(
+                "{} is not a repository of this window.",
+                store::display_path(path)
+            ));
+        };
+        self.remove_repository(index, cx);
+        Ok(())
+    }
+
+    /// Tell the window its settings changed, so it rescans with the new list
+    /// and repaints the rail. A screen built without a window (a probe) has
+    /// nobody to tell.
+    fn notify_window(&self, cx: &mut Context<Self>) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        // deferred, not immediate: the window's scan is what changes, and gpui
+        // refuses an entity update from inside that entity's own update, which
+        // is exactly the nesting a probe (or a future caller) can create
+        cx.defer(move |cx| {
+            window.update(cx, |app, cx| app.reload_settings(cx)).ok();
+        });
     }
 
     /// Forget one repository from this window. The checkout is never touched.
@@ -629,6 +710,7 @@ impl GatesScreen {
         }
         let removed = self.settings.repos.remove(index);
         self.settings.save();
+        self.notify_window(cx);
         self.add_note = Some(Note::quiet(format!(
             "Removed {} from this window; the folder is untouched.",
             store::display_path(&removed)

@@ -17,11 +17,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::prelude::*;
-use gpui::{AnyElement, App, Context, Entity, IntoElement, SharedString, div, px};
+use gpui::{AnyElement, App, Context, Entity, IntoElement, SharedString, WeakEntity, div, px};
 
 use crate::host::Host;
 use crate::store;
 use crate::theme;
+use crate::ui::window::FlowApp;
 
 pub mod artifacts;
 pub mod diff;
@@ -132,14 +133,30 @@ pub struct Screens {
 
 impl Screens {
     /// Build every screen over the app's host and settings.
-    pub fn new(host: Arc<Host>, settings: store::Settings, cx: &mut App) -> Self {
+    ///
+    /// `window` is the frame that owns them: the gates screen writes the
+    /// window's settings (a repository added or forgotten), and the window is
+    /// what rescans and repaints the board, so that screen needs a way back to
+    /// it. A probe that builds the screens without a window passes `None`.
+    pub fn new(
+        host: Arc<Host>,
+        settings: store::Settings,
+        window: Option<WeakEntity<FlowApp>>,
+        cx: &mut App,
+    ) -> Self {
         Self {
             artifacts: cx.new(|cx| ArtifactsScreen::new(Arc::clone(&host), cx)),
             diff: cx.new(|cx| DiffScreen::new(Arc::clone(&host), cx)),
             workflow: cx.new(|cx| WorkflowScreen::new(Arc::clone(&host), cx)),
-            gates: cx.new(|cx| GatesScreen::new(Arc::clone(&host), settings.clone(), cx)),
+            gates: cx.new(|cx| GatesScreen::new(Arc::clone(&host), settings.clone(), window, cx)),
             settings: cx.new(|cx| SettingsScreen::new(settings, cx)),
         }
+    }
+
+    /// The gates screen, for a probe that drives the repository list.
+    #[doc(hidden)]
+    pub fn gates_for_probe(&self) -> Entity<GatesScreen> {
+        self.gates.clone()
     }
 
     /// Point `screen` at `run`. Only the screen being shown is refreshed; the
