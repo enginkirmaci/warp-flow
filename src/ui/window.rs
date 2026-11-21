@@ -22,6 +22,7 @@ use crate::store::{
     self, Column, MAX_LOG_ROWS, Question, Run, RunKey, RunRow, Snapshot, recent_rows,
 };
 use crate::theme;
+use crate::ui::screens::{Screen, ScreenRun, Screens};
 
 /// The board's page step: a page key moves five cards.
 const PAGE: usize = 5;
@@ -57,9 +58,11 @@ pub struct FlowApp {
     detail_scroll: ScrollHandle,
     detail_spec: Option<DocSlot>,
     detail_tasks: Option<DocSlot>,
-    /// The run screen's run. `None` is the board; the selected run stays
-    /// selected so Back returns to it.
-    pub(crate) run_screen: Option<RunKey>,
+    /// The screen the window shows for `selected_run`; `None` is the board.
+    /// The selected run stays selected so Back returns to it.
+    pub(crate) screen: Option<Screen>,
+    /// The five screens that are their own entities (S5).
+    pub(crate) screens: Screens,
     /// The run screen's scrolling content.
     pub(crate) run_focus: FocusHandle,
     pub(crate) run_scroll: ScrollHandle,
@@ -130,6 +133,7 @@ impl FlowApp {
         // Submit button that reads whether the field is empty.
         cx.observe(&answer_field, |_, _, cx| cx.notify()).detach();
         window.focus(&board_focus, cx);
+        let screens = Screens::new(Arc::clone(&host), settings.clone(), cx);
         let mut app = Self {
             settings,
             snapshot: Snapshot::default(),
@@ -145,7 +149,8 @@ impl FlowApp {
             detail_scroll: ScrollHandle::new(),
             detail_spec: None,
             detail_tasks: None,
-            run_screen: None,
+            screen: None,
+            screens,
             run_focus,
             run_scroll: ScrollHandle::new(),
             run_question: None,
@@ -220,6 +225,7 @@ impl FlowApp {
         // adopted: one source of truth, and the door never runs a scan.
         self.board.publish(self.snapshot.clone());
         self.reconcile_selection(cx);
+        self.refresh_screens(cx);
         cx.notify();
     }
 
@@ -251,7 +257,54 @@ impl FlowApp {
             return;
         }
         self.host_snapshot = next;
+        self.refresh_screens(cx);
         cx.notify();
+    }
+
+    /// Show `screen` for the selected run, or `None` for the board. The screen
+    /// is told which run it shows on the way in, so it never renders stale.
+    pub(crate) fn open_screen(
+        &mut self,
+        screen: Option<Screen>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.screen = screen;
+        self.refresh_screens(cx);
+        match screen {
+            Some(Screen::Run) => window.focus(&self.run_focus, cx),
+            _ => window.focus(&self.board_focus, cx),
+        }
+        cx.notify();
+    }
+
+    /// Hand the open screen the current reading of its run. Only the screen on
+    /// display is refreshed: a screen that is not showing catches up when it is
+    /// opened, so a poll never builds five views' worth of state.
+    fn refresh_screens(&mut self, cx: &mut Context<Self>) {
+        let Some(screen) = self.screen else {
+            return;
+        };
+        if screen == Screen::Run {
+            return;
+        }
+        let Some(run) = self
+            .selected_run
+            .as_ref()
+            .and_then(|key| self.snapshot.find(key))
+        else {
+            return;
+        };
+        let driving = self
+            .host_snapshot
+            .run(&run.dir)
+            .is_some_and(|host_run| host_run.phase.is_driving());
+        let payload = ScreenRun {
+            run: Arc::new(run.clone()),
+            repo: run.key.repo.clone(),
+            driving,
+        };
+        self.screens.show(screen, payload, cx);
     }
 
     /// Keep the filter, cursor and open run attached to things the new
@@ -275,11 +328,14 @@ impl FlowApp {
         {
             self.close_detail(cx);
         }
-        if let Some(open) = &self.run_screen
-            && self.snapshot.find(open).is_none()
+        if self.screen.is_some()
+            && self
+                .selected_run
+                .as_ref()
+                .is_none_or(|key| self.snapshot.find(key).is_none())
         {
             // The open run left the snapshot: fall back to the board.
-            self.run_screen = None;
+            self.screen = None;
             self.run_question = None;
             self.run_multi.clear();
             self.run_answer_error = None;
@@ -328,7 +384,7 @@ impl FlowApp {
     fn open_run(&mut self, key: RunKey, window: &mut Window, cx: &mut Context<Self>) {
         self.cursor = Some(key.clone());
         self.selected_run = Some(key);
-        self.run_screen = None;
+        self.screen = None;
         self.run_question = None;
         self.run_multi.clear();
         self.run_answer_error = None;
@@ -342,7 +398,7 @@ impl FlowApp {
 
     fn close_detail(&mut self, cx: &mut Context<Self>) {
         self.selected_run = None;
-        self.run_screen = None;
+        self.screen = None;
         self.run_question = None;
         self.run_multi.clear();
         self.run_answer_error = None;
@@ -457,6 +513,8 @@ impl FlowApp {
             repo_rows = repo_rows.child(self.render_repo_row(repo, cx));
         }
 
+        let screen_nav = self.render_screen_nav(cx);
+
         let runs_head = div()
             .flex()
             .items_center()
@@ -545,10 +603,53 @@ impl FlowApp {
                     ),
             )
             .child(repo_rows)
+            .child(screen_nav)
             .child(runs_head)
             .child(run_rows)
             .child(self.render_rail_foot())
             .into_any_element()
+    }
+
+    /// The rail's list for the open run: Board, then the six screens. Empty
+    /// until a run is selected, so the rail stays a repository list otherwise.
+    fn render_screen_nav(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.selected_run.is_none() {
+            return div().into_any_element();
+        }
+        let mut list = div()
+            .id("flow-screen-nav")
+            .debug_selector(|| "flow-screen-nav".into())
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .px(px(8.))
+            .pt(px(6.))
+            .child(
+                div()
+                    .px(px(6.))
+                    .pb(px(4.))
+                    .text_size(px(theme::font_micro()))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::text_muted())
+                    .child("THIS RUN"),
+            );
+        list = list.child(screen_row(
+            "board",
+            "Board",
+            self.screen.is_none(),
+            cx.listener(|this, _, window, cx| this.open_screen(None, window, cx)),
+        ));
+        for screen in Screen::ALL {
+            list = list.child(screen_row(
+                screen.key(),
+                screen.label(),
+                self.screen == Some(screen),
+                cx.listener(move |this, _, window, cx| {
+                    this.open_screen(Some(screen), window, cx);
+                }),
+            ));
+        }
+        list.into_any_element()
     }
 
     fn render_all_repos_row(&self, total: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -771,15 +872,18 @@ impl FlowApp {
             .h_full()
             .bg(theme::surface());
 
-        if self.settings.repos.is_empty() {
-            main = main.child(self.render_empty());
-        } else if let Some(run) = self
-            .run_screen
+        let open_run = self
+            .selected_run
             .as_ref()
             .and_then(|key| self.snapshot.find(key))
-            .cloned()
-        {
-            main = main.child(self.render_run_screen(run, window, cx));
+            .cloned();
+        if self.settings.repos.is_empty() {
+            main = main.child(self.render_empty());
+        } else if let (Some(screen), Some(run)) = (self.screen, open_run.clone()) {
+            main = match screen {
+                Screen::Run => main.child(self.render_run_screen(run, window, cx)),
+                other => main.child(self.screens.render(other)),
+            };
         } else {
             let detail = self
                 .selected_run
@@ -1415,7 +1519,15 @@ impl FlowApp {
     /// The run screen's run, or `None` while the board is shown.
     #[doc(hidden)]
     pub fn run_screen_for_probe(&self) -> Option<&RunKey> {
-        self.run_screen.as_ref()
+        (self.screen == Some(Screen::Run))
+            .then_some(self.selected_run.as_ref())
+            .flatten()
+    }
+
+    /// The screen the window shows, for the routing probe.
+    #[doc(hidden)]
+    pub fn screen_for_probe(&self) -> Option<Screen> {
+        self.screen
     }
 
     /// The run the detail pane (and Back) keeps selected.
@@ -1472,6 +1584,38 @@ impl Render for FlowApp {
 }
 
 // ---- small rendering helpers ----------------------------------------------
+
+/// One row of the rail's screen list: the board's shape at a smaller size, so
+/// the screen list reads as a second list in the same rail.
+fn screen_row(
+    key: &'static str,
+    label: &'static str,
+    selected: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    let selector = format!("flow-nav-{key}");
+    shell::list_row(SharedString::from(selector.clone()), selected)
+        .debug_selector(move || selector.clone())
+        .a11y_button(label)
+        .flex()
+        .items_center()
+        .h(px(26.))
+        .px(px(8.))
+        .gap(px(8.))
+        .on_click(on_click)
+        .child(
+            div()
+                .text_size(px(theme::font_meta()))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(if selected {
+                    theme::text()
+                } else {
+                    theme::text_dim()
+                })
+                .child(label),
+        )
+        .into_any_element()
+}
 
 pub(crate) fn repo_label(path: &Path) -> String {
     path.file_name()

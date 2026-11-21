@@ -24,6 +24,7 @@ use crate::store::{
     self, LaneView, Question, Run, RunKey, StepState, StepView, TaskRow, outcome_state,
 };
 use crate::theme;
+use crate::ui::screens::Screen;
 use crate::ui::window::{FlowApp, attempt_word, ensure_document, repo_label, status_pill, tag};
 
 impl FlowApp {
@@ -39,7 +40,7 @@ impl FlowApp {
     ) {
         self.cursor = Some(key.clone());
         self.selected_run = Some(key.clone());
-        self.run_screen = Some(key);
+        self.screen = Some(Screen::Run);
         self.run_scroll = gpui::ScrollHandle::new();
         self.run_log_scroll = gpui::ScrollHandle::new();
         self.run_question = None;
@@ -56,7 +57,7 @@ impl FlowApp {
 
     /// Back to the board: the run stays selected, so its detail pane is open.
     pub(crate) fn close_run_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_screen = None;
+        self.screen = None;
         self.run_question = None;
         self.run_multi.clear();
         self.run_answer_error = None;
