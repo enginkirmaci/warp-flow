@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use warp_flow_core::artifact::{Document, Issue, Status};
+use warp_flow_core::control::{Control, Signal};
 use warp_flow_core::gate::Gate;
 use warp_flow_core::graph::Workflow;
 use warp_flow_core::harness::{FakeHarness, Scripted};
@@ -319,6 +320,83 @@ per_task = true
 
     let issue = Issue::open(&world.issue).expect("issue reopens");
     assert_eq!(issue.task(1).expect("task 1").status, Status::ReadyForAgent);
+}
+
+/// The workflow a waiting run leaves behind: one harness step, then a question.
+const WAITING_WORKFLOW: &str = r#"
+schema = 1
+name = "implement"
+revision = 1
+
+[[step]]
+id = "analyze"
+kind = "harness"
+skill = "analyze"
+produces = "spec.md"
+
+[[step]]
+id = "approve-plan"
+kind = "question"
+depends_on = ["analyze"]
+"#;
+
+#[test]
+fn a_resume_whose_control_already_says_abandon_runs_no_step() {
+    let world = World::new(WAITING_WORKFLOW);
+    let mut harness = FakeHarness::new();
+    harness.script(
+        "analyze",
+        Scripted::Done {
+            files: vec![(
+                world.issue.join("spec.md"),
+                "# Spec\n\nA distilled request.\n".to_owned(),
+            )],
+            text: "distilled".to_owned(),
+        },
+    );
+
+    let mut runner = world.runner(harness);
+    assert_eq!(runner.run().expect("run"), RunStatus::Waiting);
+    let rows_before = world.run_md().body.matches("| ").count();
+
+    // the app's host starts a resume worker whose control value is already
+    // Abandon: the engine's first step-boundary check must see it and record
+    // the abandon before the next step runs (decision 17's seam)
+    let mut config = {
+        let workflow = Workflow::read(world.issue.join("workflow.toml")).expect("workflow parses");
+        let mut config = RunnerConfig::new(&world.issue, workflow, FakeHarness::new());
+        config.workdir = world.root.clone();
+        config
+            .gates
+            .insert("test".to_owned(), test_gate(&world.root));
+        config
+    };
+    config.control = Box::new(AlreadyAbandoning);
+    let mut resumed = Runner::resume(config).expect("resume");
+    assert_eq!(resumed.run().expect("resume"), RunStatus::Abandoned);
+
+    let document = world.run_md();
+    assert_eq!(document.front.get("status"), Some("abandoned"));
+    assert_eq!(
+        document.body.matches("| ").count(),
+        rows_before,
+        "no step ran after the abandon: {}",
+        document.body
+    );
+    assert!(
+        !world.issue.join("questions/02.md").exists(),
+        "the question the run would have asked was not asked"
+    );
+}
+
+/// A control that has already been asked to abandon, the way the host hands one
+/// to a resume worker.
+struct AlreadyAbandoning;
+
+impl Control for AlreadyAbandoning {
+    fn check(&mut self) -> Signal {
+        Signal::Abandon
+    }
 }
 
 #[test]

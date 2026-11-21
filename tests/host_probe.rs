@@ -460,6 +460,39 @@ fn a_pause_asked_while_a_question_waits_is_not_lost() {
 }
 
 #[test]
+fn abandoning_a_waiting_run_records_it_without_answering() {
+    let fixture = Fixture::new("abandon-waiting", QUESTION_WORKFLOW);
+    let host = Host::with_factory(probe_factory(Arc::new(ProbeGate::default())));
+
+    host.start(&fixture.issue).expect("start");
+    wait_for_phase(&host, &fixture.issue, Phase::Waiting);
+    // the record the waiting run wrote, before the abandon
+    let waiting = Document::read(fixture.issue.join("run.md")).expect("run.md");
+    let rows_before = waiting.body.matches("| ").count();
+
+    // a waiting run has no worker to ask, so the host starts one whose control
+    // already says abandon; the engine records it at its first boundary
+    host.abandon(&fixture.issue).expect("abandon a waiting run");
+    wait_for_phase(&host, &fixture.issue, Phase::Abandoned);
+
+    assert_eq!(run_status(&fixture.issue).as_deref(), Some("abandoned"));
+    let record = Document::read(fixture.issue.join("run.md")).expect("run.md");
+    assert_eq!(record.front.get("status"), Some("abandoned"));
+    assert_eq!(
+        record.body.matches("| ").count(),
+        rows_before,
+        "the abandon ran no step: {}",
+        record.body
+    );
+    // the question stays unanswered: nobody gave up by answering it
+    let question =
+        Document::read(fixture.issue.join("questions/01.md")).expect("the question is still there");
+    assert_eq!(question.front.get("state"), Some("open"));
+
+    host.shutdown_within(Duration::from_secs(1));
+}
+
+#[test]
 fn answering_a_question_continues_the_run_this_host_drives() {
     let fixture = Fixture::new("answer-resumes", QUESTION_WORKFLOW);
     let host = Host::with_factory(probe_factory(Arc::new(ProbeGate::default())));

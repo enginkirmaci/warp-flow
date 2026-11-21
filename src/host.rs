@@ -374,12 +374,12 @@ impl Host {
     /// that is not defined or a dirty working tree is a `start` error the run
     /// screen can show, never a panic and never a half-started run.
     pub fn start(&self, issue: &Path) -> std::result::Result<(), String> {
-        self.begin(issue, DriveMode::Fresh)
+        self.begin(issue, DriveMode::Fresh, None)
     }
 
     /// Continue `issue`'s run from `run.md`, on a worker thread.
     pub fn resume(&self, issue: &Path) -> std::result::Result<(), String> {
-        self.begin(issue, DriveMode::Resume)
+        self.begin(issue, DriveMode::Resume, None)
     }
 
     /// Ask a driven run to pause at its next step boundary.
@@ -399,17 +399,28 @@ impl Host {
         slot.shared.request_pause()
     }
 
-    /// Abandon a driven run at its next step boundary.
+    /// Abandon `issue`'s run at its next step boundary.
+    ///
+    /// A run with a worker is asked and stops at its boundary, as before. A run
+    /// whose worker is gone — waiting on a question, paused, blocked — has
+    /// nobody to ask, and only the engine may write `run.md`, so this starts a
+    /// resume worker whose control value is already [`Signal::Abandon`]: the
+    /// engine's first step-boundary check records the abandon before any step
+    /// runs (decision 17's seam, used for a second verb).
     pub fn abandon(&self, issue: &Path) -> std::result::Result<(), String> {
         let issue = canonical_issue(issue);
-        let runs = lock(&self.runs);
-        let Some(slot) = runs.get(&issue) else {
-            return Err(format!(
+        let shared = {
+            let runs = lock(&self.runs);
+            runs.get(&issue).map(|slot| Arc::clone(&slot.shared))
+        };
+        match shared {
+            Some(shared) if shared.phase().is_driving() => shared.request_abandon(),
+            Some(_) => self.begin(&issue, DriveMode::Resume, Some(Signal::Abandon)),
+            None => Err(format!(
                 "No run here is being driven (`{}`).",
                 issue.display()
-            ));
-        };
-        slot.shared.request_abandon()
+            )),
+        }
     }
 
     /// Write an answer back into one of this issue's question files.
@@ -520,7 +531,12 @@ impl Host {
     }
 
     /// Build and start one worker, fresh or resumed.
-    fn begin(&self, issue: &Path, mode: DriveMode) -> std::result::Result<(), String> {
+    fn begin(
+        &self,
+        issue: &Path,
+        mode: DriveMode,
+        initial: Option<Signal>,
+    ) -> std::result::Result<(), String> {
         let issue = canonical_issue(issue);
         let prepared = prepare(&issue).map_err(|error| error.to_string())?;
         let id = prepared
@@ -569,6 +585,13 @@ impl Host {
                 &prepared.title,
             )),
         };
+
+        // A request that arrives before the worker exists is the worker's
+        // first reading: an abandon asked for on a waiting run must not be
+        // cleared by `restart`, and must be in place before the engine starts.
+        if let Some(signal) = initial {
+            state.control.request(signal);
+        }
 
         let context = DriverContext {
             issue: prepared.issue.clone(),

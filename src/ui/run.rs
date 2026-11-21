@@ -406,6 +406,9 @@ impl FlowApp {
                 Some("Continue the paused run from its record."),
                 cx.listener(move |this, _, _, cx| this.resume_run(resume_issue.clone(), cx)),
             ));
+            if let Some(abandon) = self.render_abandon_offered(run, cx) {
+                row = row.child(abandon);
+            }
         } else if phase == Some(Phase::Waiting) && question_open {
             row = row.child(action_button(
                 "flow-run-resume",
@@ -425,6 +428,9 @@ impl FlowApp {
                     .or(Some("The question is answered; continue the run.")),
                 cx.listener(move |this, _, _, cx| this.resume_run(resume_issue.clone(), cx)),
             ));
+            if let Some(abandon) = self.render_abandon_offered(run, cx) {
+                row = row.child(abandon);
+            }
         } else if phase == Some(Phase::Failed) && has_record {
             let resume_issue = issue.clone();
             row = row.child(action_button(
@@ -434,6 +440,9 @@ impl FlowApp {
                 Some("The engine stopped; resume to try again."),
                 cx.listener(move |this, _, _, cx| this.resume_run(resume_issue.clone(), cx)),
             ));
+            if let Some(abandon) = self.render_abandon_offered(run, cx) {
+                row = row.child(abandon);
+            }
         } else if terminal {
             row = row.child(action_button(
                 "flow-run-start",
@@ -458,6 +467,9 @@ impl FlowApp {
                 Some(reason),
                 cx.listener(move |this, _, _, cx| this.resume_run(resume_issue.clone(), cx)),
             ));
+            if let Some(abandon) = self.render_abandon_offered(run, cx) {
+                row = row.child(abandon);
+            }
         } else if has_record && record_status == "blocked" {
             let resume_issue = issue.clone();
             row = row.child(action_button(
@@ -467,6 +479,9 @@ impl FlowApp {
                 Some("Continue the run from its record."),
                 cx.listener(move |this, _, _, cx| this.resume_run(resume_issue.clone(), cx)),
             ));
+            if let Some(abandon) = self.render_abandon_offered(run, cx) {
+                row = row.child(abandon);
+            }
         } else {
             let start_issue = issue.clone();
             row = row.child(action_button(
@@ -478,6 +493,33 @@ impl FlowApp {
             ));
         }
         row.into_any_element()
+    }
+
+    /// Abandon for a run no worker is driving, behind the same one-step
+    /// confirmation the driving case uses.
+    ///
+    /// The host starts a resume worker that never runs a step: its first
+    /// step-boundary check records the abandon. A record that is `done` or
+    /// `merged` has nothing to abandon, so it gets no button.
+    fn render_abandon_offered(&self, run: &Run, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if matches!(run.status.as_str(), "done" | "merged" | "abandoned") {
+            return None;
+        }
+        let issue = run.dir.clone();
+        if self.run_abandon_confirm.as_ref() == Some(&run.key) {
+            return Some(self.render_abandon_confirm(&issue, cx));
+        }
+        let key = run.key.clone();
+        Some(action_button(
+            "flow-run-abandon",
+            "Abandon",
+            true,
+            Some("Give up on this run; the engine records it and stops."),
+            cx.listener(move |this, _, _, cx| {
+                this.run_abandon_confirm = Some(key.clone());
+                cx.notify();
+            }),
+        ))
     }
 
     /// The one-step Abandon confirmation: a small inline row, no scrim.
