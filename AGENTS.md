@@ -1,8 +1,9 @@
 # warp-flow — agent instructions
 
 The suite's conventions apply: read
-[warp-suite's AGENTS.md](../warp-suite/AGENTS.md) (`../../AGENTS.md` once this
-repository is linked under `apps/`). This file adds only the app-specific facts.
+[`../../AGENTS.md`](../../AGENTS.md) first — the checkout is a sibling of
+`warp-suite` and `apps/warp-flow` is the link to it, so the same path works
+either way. This file adds only the app-specific facts.
 
 ## Shape
 
