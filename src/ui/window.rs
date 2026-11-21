@@ -3,12 +3,15 @@
 //! arrow handler.
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
+
+use std::cell::RefCell;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, FontWeight, KeyDownEvent, MouseButton,
-    ScrollHandle, SharedString, Window, div, px, relative,
+    AnyElement, App, Bounds, Context, Entity, FocusHandle, FontWeight, KeyDownEvent, MouseButton,
+    ScrollHandle, SharedString, Window, div, point, px, relative,
 };
 use gpui_kit::component::input::InputState;
 use warpui_kit_core::list_nav::{self, ListKey};
@@ -36,6 +39,10 @@ pub(crate) struct DocSlot {
 }
 
 /// The app window's state.
+/// Where each card was painted, in window coordinates: `(run, bounds)` pairs the
+/// board's columns fill during prepaint.
+type CardBounds = Rc<RefCell<Vec<(RunKey, Bounds<gpui::Pixels>)>>>;
+
 pub struct FlowApp {
     settings: store::Settings,
     pub(crate) snapshot: Snapshot,
@@ -56,6 +63,14 @@ pub struct FlowApp {
     /// The board's keyboard cursor; distinct from the open run.
     pub(crate) cursor: Option<RunKey>,
     pub(crate) board_focus: FocusHandle,
+    board_scroll: ScrollHandle,
+    /// How many more frames must pass before the board reveals the cursor's
+    /// card: a frame is needed for the layout a change caused to be measured.
+    reveal_frames: u8,
+    /// Where the last frame painted each card, in window coordinates. The cards
+    /// are nested inside their columns, so the scroll handle cannot reach them
+    /// by index; this is what [`FlowApp::reveal_cursor`] measures against.
+    card_bounds: CardBounds,
     rail_scroll: ScrollHandle,
     detail_scroll: ScrollHandle,
     detail_spec: Option<DocSlot>,
@@ -149,6 +164,9 @@ impl FlowApp {
             selected_run: None,
             cursor: None,
             board_focus,
+            board_scroll: ScrollHandle::new(),
+            reveal_frames: 0,
+            card_bounds: Rc::new(RefCell::new(Vec::new())),
             rail_scroll: ScrollHandle::new(),
             detail_scroll: ScrollHandle::new(),
             detail_spec: None,
@@ -427,7 +445,7 @@ impl FlowApp {
 
     fn open_run(&mut self, key: RunKey, window: &mut Window, cx: &mut Context<Self>) {
         self.cursor = Some(key.clone());
-        self.selected_run = Some(key);
+        self.selected_run = Some(key.clone());
         self.screen = None;
         self.run_question = None;
         self.run_multi.clear();
@@ -437,6 +455,11 @@ impl FlowApp {
         self.run_issue = None;
         self.detail_scroll = ScrollHandle::new();
         window.focus(&self.board_focus, cx);
+        // The detail pane narrows the board, so the card that is open can slide
+        // under it. The bounds a frame renders from are the previous frame's,
+        // and the narrowing itself is only measured at the end of this one, so
+        // the reveal runs in the render two frames from now.
+        self.reveal_frames = 2;
         cx.notify();
     }
 
@@ -1001,13 +1024,26 @@ impl FlowApp {
             .filter(|key| runs.iter().any(|run| &run.key == key))
             .or_else(|| runs.first().map(|run| run.key.clone()));
         let focused = self.board_focus.is_focused(window);
+        if self.reveal_frames > 0 {
+            self.reveal_frames -= 1;
+            self.reveal_cursor();
+        }
 
+        // The six lanes keep a readable floor. A row whose children stop
+        // shrinking is as wide as its content only when it says so, and the
+        // scroller measures its direct child: without this the lanes squashed
+        // instead of the board scrolling sideways.
+        let lanes = Column::ALL.len() as f32;
+        let floor = lanes * theme::BOARD_COLUMN_MIN_WIDTH
+            + (lanes - 1.) * theme::BOARD_GAP
+            + 2. * theme::BOARD_PADDING;
         let mut columns = div()
             .flex()
             .flex_row()
             .items_start()
             .gap(px(theme::scaled(theme::BOARD_GAP)))
-            .p(px(theme::scaled(theme::BOARD_PADDING)));
+            .p(px(theme::scaled(theme::BOARD_PADDING)))
+            .min_w(px(theme::scaled(floor)));
         for column in Column::ALL {
             let column_runs: Vec<&Run> = runs.iter().filter(|run| run.column == column).collect();
             columns = columns.child(self.render_column(
@@ -1037,16 +1073,65 @@ impl FlowApp {
             .flex_1()
             .min_w_0()
             .h_full()
-            .child(
+            .child({
+                // recorded afresh every frame: a card that left the board must
+                // not leave a rectangle behind for the reveal to scroll to
+                self.card_bounds.borrow_mut().clear();
                 div()
                     .id("flow-board-scroll")
                     .debug_selector(|| "flow-board-scroll".into())
                     .flex_1()
                     .min_h_0()
                     .overflow_scroll()
-                    .child(columns),
-            )
+                    .track_scroll(&self.board_scroll)
+                    .child(columns)
+            })
             .into_any_element()
+    }
+
+    /// Scroll the board so the cursor's card is wholly in view.
+    ///
+    /// Called after a keyboard move and when the detail pane opens (it narrows
+    /// the board), from the bounds the last frame recorded; a card that is
+    /// already visible needs no offset, so this is cheap on every move.
+    fn reveal_cursor(&mut self) {
+        let Some(key) = self.cursor.clone() else {
+            return;
+        };
+        let bounds = self
+            .card_bounds
+            .borrow()
+            .iter()
+            .find(|(card, _)| card == &key)
+            .map(|(_, bounds)| *bounds);
+        let Some(bounds) = bounds else {
+            return;
+        };
+        let viewport = self.board_scroll.bounds();
+        if viewport.size.width <= gpui::px(0.) && viewport.size.height <= gpui::px(0.) {
+            // the board has not been laid out yet
+            return;
+        }
+        // A gpui scroll offset is never positive: content moves up and left, so
+        // an offset lives in `[-max, 0]` and scrolling *down* decreases it.
+        let offset = self.board_scroll.offset();
+        let max = self.board_scroll.max_offset();
+        let mut next = offset;
+        if bounds.left() < viewport.left() {
+            next.x += viewport.left() - bounds.left();
+        } else if bounds.right() > viewport.right() {
+            next.x -= bounds.right() - viewport.right();
+        }
+        if bounds.top() < viewport.top() {
+            next.y += viewport.top() - bounds.top();
+        } else if bounds.bottom() > viewport.bottom() {
+            next.y -= bounds.bottom() - viewport.bottom();
+        }
+        next.x = next.x.clamp(-max.x, gpui::px(0.));
+        next.y = next.y.clamp(-max.y, gpui::px(0.));
+        if next != offset {
+            self.board_scroll.set_offset(point(next.x, next.y));
+        }
     }
 
     fn render_column(
@@ -1095,6 +1180,16 @@ impl FlowApp {
         for run in runs {
             cards = cards.child(self.render_card(run, cursor, focused, cx));
         }
+        // the one place that knows where a card landed: the scroller's handle
+        // sees only its direct children, and a card is two levels down
+        let keys: Vec<RunKey> = runs.iter().map(|run| run.key.clone()).collect();
+        let recorded = Rc::clone(&self.card_bounds);
+        cards = cards.on_children_prepainted(move |bounds, _, _| {
+            let mut recorded = recorded.borrow_mut();
+            for (key, bounds) in keys.iter().cloned().zip(bounds) {
+                recorded.push((key, bounds));
+            }
+        });
 
         div()
             .id(SharedString::from(format!("flow-column-{}", column.key())))
@@ -1464,6 +1559,7 @@ impl FlowApp {
             } else {
                 visible.last().cloned()
             };
+            self.reveal_cursor();
             cx.notify();
             return true;
         }
@@ -1521,6 +1617,9 @@ impl FlowApp {
             ListKey::Home | ListKey::End => {}
             ListKey::Menu => return false,
         }
+        // the card the cursor moved to may sit under the detail pane or below
+        // the fold; the board follows the keyboard
+        self.reveal_cursor();
         cx.notify();
         true
     }
@@ -1543,6 +1642,54 @@ impl FlowApp {
     #[doc(hidden)]
     pub fn cursor_for_probe(&self) -> Option<&RunKey> {
         self.cursor.as_ref()
+    }
+
+    /// The board scroller's offset and viewport, for the reveal probe.
+    #[doc(hidden)]
+    pub fn board_scroll_for_probe(&self) -> (gpui::Point<gpui::Pixels>, Bounds<gpui::Pixels>) {
+        (self.board_scroll.offset(), self.board_scroll.bounds())
+    }
+
+    /// The scroller's maximum offset, for the reveal probe.
+    #[doc(hidden)]
+    pub fn board_max_offset_for_probe(&self) -> gpui::Point<gpui::Pixels> {
+        self.board_scroll.max_offset()
+    }
+
+    /// Where the last frame painted `key`'s card, in window coordinates.
+    #[doc(hidden)]
+    pub fn card_bounds_for_probe(&self, key: &RunKey) -> Option<Bounds<gpui::Pixels>> {
+        self.card_bounds
+            .borrow()
+            .iter()
+            .find(|(card, _)| card == key)
+            .map(|(_, bounds)| *bounds)
+    }
+
+    /// Open `key`'s detail pane, as a click or Enter would.
+    #[doc(hidden)]
+    pub fn open_run_for_probe(&mut self, key: RunKey, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_run(key, window, cx);
+    }
+
+    /// Move the cursor as a key press would, for the reveal probe.
+    #[doc(hidden)]
+    pub fn press_for_probe(
+        &mut self,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let key = match key {
+            "up" => ListKey::Up,
+            "down" => ListKey::Down,
+            "left" => ListKey::Left,
+            "right" => ListKey::Right,
+            "home" => ListKey::Home,
+            "end" => ListKey::End,
+            _ => return false,
+        };
+        self.move_cursor(key, window, cx)
     }
 
     /// The selected repository filter (`None` is "All repos").
