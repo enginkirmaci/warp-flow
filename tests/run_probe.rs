@@ -170,6 +170,131 @@ fn click(cx: &mut VisualTestContext, name: &str) {
     settle(cx);
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a probe seeds a file field by field; one call per session reads better than a builder"
+)]
+fn seed_session(
+    repo: &Path,
+    id: &str,
+    name: &str,
+    session: &str,
+    step: &str,
+    task: Option<&str>,
+    attempt: u32,
+    status: &str,
+    updated: &str,
+    text: &str,
+) {
+    let dir = repo.join(".scratch").join(id).join("sessions");
+    std::fs::create_dir_all(&dir).expect("sessions folder");
+    let mut front = format!("---\nsession: {session}\nharness: opencode\nstep: {step}\n");
+    if let Some(task) = task {
+        front.push_str(&format!("task: {task}\n"));
+    }
+    front.push_str(&format!(
+        "attempt: {attempt}\nstatus: {status}\nupdated: {updated}\n---\n\n# Session: {step}\n\n{text}\n"
+    ));
+    std::fs::write(dir.join(name), front).expect("session file");
+}
+
+#[gpui_kit::gpui::test]
+fn the_run_screen_shows_the_harness_sessions_newest_last(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("sessions");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+
+    let repo = seed_repo(&home, "repo-a");
+    seed_spec(
+        &repo,
+        "run-sessions",
+        "ready-for-agent",
+        "Sessions beside the log",
+        "Body.",
+    );
+    seed_run(
+        &repo,
+        "run-sessions",
+        "running",
+        "code",
+        &[("analyze", "-", 1, "done"), ("code", "01", 1, "running")],
+    );
+    seed_workflow(
+        &repo,
+        "run-sessions",
+        "[[step]]\nid = \"analyze\"\nkind = \"harness\"\nskill = \"analyze\"\nproduces = \"spec.md\"\n\n\
+         [[step]]\nid = \"code\"\nkind = \"harness\"\nskill = \"code\"\nper_task = true\ndepends_on = [\"analyze\"]\n",
+    );
+    seed_task(
+        &repo,
+        "run-sessions",
+        1,
+        "The task",
+        "ready-for-agent",
+        "None",
+    );
+    seed_session(
+        &repo,
+        "run-sessions",
+        "analyze.md",
+        "ses_analyze",
+        "analyze",
+        None,
+        1,
+        "done",
+        "2026-11-22T09:00:00Z",
+        "I read the request and distilled it.",
+    );
+    seed_session(
+        &repo,
+        "run-sessions",
+        "code-task-01.md",
+        "ses_code",
+        "code",
+        Some("01"),
+        1,
+        "done",
+        "2026-11-22T09:20:00Z",
+        "I changed the rail and left the tests alone.",
+    );
+
+    let (handle, _page) = open_app(cx, vec![repo.clone()]);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    click(cx, "flow-card-repo-a-run-sessions");
+    click(cx, "flow-detail-open-run");
+    assert!(cx.debug_bounds("flow-run-sessions").is_some());
+
+    // a session per step, in the order they settled: analyze first, code last
+    assert!(cx.debug_bounds("flow-run-session-0").is_some());
+    assert!(cx.debug_bounds("flow-run-session-1").is_some());
+    let sessions = {
+        let snapshot = warp_flow::store::scan(std::slice::from_ref(&repo));
+        snapshot
+            .runs()
+            .next()
+            .map(|run| {
+                run.sessions
+                    .iter()
+                    .map(|session| (session.step.clone(), session.session.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        sessions,
+        vec![
+            ("analyze".to_owned(), "ses_analyze".to_owned()),
+            ("code".to_owned(), "ses_code".to_owned())
+        ],
+        "oldest first, newest last"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[gpui_kit::gpui::test]
 fn the_run_screen_has_a_band_per_step_and_a_lane_per_task(cx: &mut TestAppContext) {
     let _guard = hold_home();

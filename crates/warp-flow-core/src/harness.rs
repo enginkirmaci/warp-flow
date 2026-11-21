@@ -23,6 +23,10 @@ pub struct StepRequest {
     pub workdir: PathBuf,
     /// The prompt the engine hands to the harness session.
     pub prompt: String,
+    /// The task this step is running for, when the step is per task.
+    pub task: Option<u32>,
+    /// Which attempt at this step this is, from 1.
+    pub attempt: u32,
 }
 
 /// What a harness reports for one step.
@@ -148,6 +152,8 @@ mod tests {
             issue: workdir.join("issue"),
             workdir: workdir.to_path_buf(),
             prompt: "do the step".to_owned(),
+            task: None,
+            attempt: 1,
         }
     }
 

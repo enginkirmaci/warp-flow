@@ -619,7 +619,7 @@ impl<H: Harness> Runner<H> {
         loop {
             let failure = match step.kind {
                 StepKind::Gate => self.attempt_gate(step, task)?,
-                StepKind::Harness => self.attempt_harness(step, task)?,
+                StepKind::Harness => self.attempt_harness(step, task, attempt)?,
                 StepKind::Question | StepKind::Merge => {
                     return Err(Error::Run(format!(
                         "step `{}` reached the attempt loop with kind {:?}",
@@ -718,13 +718,20 @@ impl<H: Harness> Runner<H> {
     }
 
     /// Hand a harness step to the harness.
-    fn attempt_harness(&mut self, step: &Step, task: Option<&Task>) -> Result<Option<Failure>> {
+    fn attempt_harness(
+        &mut self,
+        step: &Step,
+        task: Option<&Task>,
+        attempt: u32,
+    ) -> Result<Option<Failure>> {
         let workdir = self.step_workdir(step, task)?;
         let request = StepRequest {
             step: step.clone(),
             issue: self.issue.clone(),
             workdir,
             prompt: self.prompt(step, task),
+            task: task.map(|task| task.number),
+            attempt,
         };
         match self.harness.run(&request)? {
             StepOutcome::Done { .. } => Ok(None),

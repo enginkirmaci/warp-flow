@@ -229,7 +229,9 @@ impl FlowApp {
         if let Some(question) = &question {
             body = body.child(self.render_question(question, question_doc.as_ref(), window, cx));
         }
-        body = body.child(self.render_attempt_history(&run));
+        body = body
+            .child(self.render_attempt_history(&run))
+            .child(self.render_sessions(&run));
 
         div()
             .id("flow-run")
@@ -1172,9 +1174,136 @@ impl FlowApp {
         }
         card.into_any_element()
     }
+
+    /// What the harness sessions said, the newest last.
+    ///
+    /// The engine writes `run.md`; the sessions are what a person actually wants
+    /// to read — the ask, the answer and the tools a step ran. Each is one
+    /// markdown file the harness wrote into `sessions/`, shown with the session
+    /// it belongs to, in the order it settled.
+    fn render_sessions(&self, run: &Run) -> AnyElement {
+        let mut card = div()
+            .id("flow-run-sessions")
+            .debug_selector(|| "flow-run-sessions".into())
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(theme::hairline())
+            .bg(theme::panel())
+            .p(px(12.))
+            .child(section_head("Sessions", sessions_word(run.sessions.len())));
+        if run.sessions.is_empty() {
+            card = card.child(quiet_line(
+                "No session recorded yet. A harness step writes one when it settles.",
+            ));
+            return card.into_any_element();
+        }
+        for (index, session) in run.sessions.iter().enumerate() {
+            let selector = format!("flow-run-session-{index}");
+            let mut head = div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .border_b_1()
+                .border_color(theme::border_light())
+                .px(px(10.))
+                .py(px(6.))
+                .font_family(theme::code_font())
+                .text_size(px(theme::font_micro()))
+                .text_color(theme::text_muted())
+                .child(
+                    div()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::text_dim())
+                        .child(session.step.clone()),
+                );
+            if let Some(task) = &session.task {
+                head = head.child(format!("task {task}"));
+            }
+            head = head
+                .child(format!("attempt {}", session.attempt))
+                .child(format!("{} · {}", session.harness, session.session))
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_color(match session.status.as_str() {
+                            "done" => theme::ADD,
+                            "failed" | "timed-out" => theme::DANGER,
+                            _ => theme::text_muted(),
+                        })
+                        .child(session.status.clone()),
+                );
+            // the transcript's tail: a session can be long, and the run screen
+            // is a page of sections, not one document. Lines, not one text run,
+            // so a transcript that wraps reads as a log, like the engine's own.
+            let lines: Vec<&str> = session.text.lines().collect();
+            let shown: Vec<&str> = lines
+                .iter()
+                .rev()
+                .take(SESSION_LINES)
+                .rev()
+                .copied()
+                .collect();
+            let mut text = div()
+                .id(SharedString::from(format!("{selector}-text")))
+                .debug_selector({
+                    let selector = format!("{selector}-text");
+                    move || selector.clone()
+                })
+                .flex()
+                .flex_col()
+                .max_h(px(240.))
+                .overflow_y_scroll()
+                .px(px(10.))
+                .py(px(8.))
+                .gap(px(1.))
+                .font_family(theme::code_font())
+                .text_size(px(theme::font_micro()))
+                .text_color(theme::text_dim());
+            if lines.len() > shown.len() {
+                text = text.child(
+                    div()
+                        .text_color(theme::text_muted())
+                        .child(format!("… {} earlier lines", lines.len() - shown.len())),
+                );
+            }
+            for line in shown {
+                text = text.child(div().child(line.to_owned()));
+            }
+            card = card.child(
+                div()
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector.clone())
+                    .flex()
+                    .flex_col()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(theme::border_light())
+                    .bg(theme::surface())
+                    .child(head)
+                    .child(text),
+            );
+        }
+        card.into_any_element()
+    }
 }
 
 // ---- small rendering helpers ----------------------------------------------
+
+/// How many lines of a session's transcript the run screen shows: the tail is
+/// what a person reads, and the panel must not become the page.
+const SESSION_LINES: usize = 40;
+
+/// `1 session` / `3 sessions`.
+fn sessions_word(count: usize) -> String {
+    if count == 1 {
+        "1 session".to_owned()
+    } else {
+        format!("{count} sessions")
+    }
+}
 
 fn section_head(title: &str, meta: String) -> AnyElement {
     let mut row = div()

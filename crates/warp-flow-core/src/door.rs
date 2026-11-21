@@ -32,7 +32,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 
+use crate::artifact::{Document, FrontMatter};
 use crate::harness::{Harness, StepOutcome, StepRequest};
+use crate::run::timestamp;
 use crate::{Error, Result};
 
 /// How long the door gets to answer one request.
@@ -553,16 +555,20 @@ impl DoorHarness {
         match self.await_idle(&harness, &session)? {
             Status::Idle => {
                 let text = self.transcript_text(&harness, &session, &directory)?;
-                Ok(StepOutcome::Done {
-                    wrote: Vec::new(),
-                    text,
-                })
+                let wrote = record_session(request, &harness, &session, "done", &text)
+                    .into_iter()
+                    .collect();
+                Ok(StepOutcome::Done { wrote, text })
             }
             Status::Failed(message) => {
                 let transcript = self.transcript_text(&harness, &session, &directory);
-                Ok(StepOutcome::Blocked {
-                    reason: with_partial_text(message, transcript),
-                })
+                let recorded = match &transcript {
+                    Ok(text) => text.clone(),
+                    Err(error) => error.to_string(),
+                };
+                let reason = with_partial_text(message, transcript);
+                record_session(request, &harness, &session, "failed", &recorded);
+                Ok(StepOutcome::Blocked { reason })
             }
             Status::TimedOut => {
                 let reason = format!(
@@ -582,9 +588,13 @@ impl DoorHarness {
                     }
                 }
                 let transcript = self.transcript_text(&harness, &session, &directory);
-                Ok(StepOutcome::Blocked {
-                    reason: with_partial_text(interrupted, transcript),
-                })
+                let recorded = match &transcript {
+                    Ok(text) => text.clone(),
+                    Err(error) => error.to_string(),
+                };
+                let reason = with_partial_text(interrupted, transcript);
+                record_session(request, &harness, &session, "timed-out", &recorded);
+                Ok(StepOutcome::Blocked { reason })
             }
         }
     }
@@ -889,6 +899,135 @@ fn set_failure(failure: &Failure, reason: &str) {
     let mut slot = lock(failure);
     if slot.is_none() {
         *slot = Some(reason.to_owned());
+    }
+}
+
+/// One step attempt's session, as a file in the issue folder.
+///
+/// The run screen reads these to show what the harness was asked and answered:
+/// the door is the only place that knows a session id, and this is where it
+/// becomes markdown a person (and the engine's own record) can read. One file
+/// per step and task, rewritten on every attempt — a session replaces its
+/// previous attempt, it never appends to it, so the file always describes the
+/// session `run.md`'s newest row names.
+///
+/// The write is best effort: a run must not fail because the transcript of a
+/// finished session could not be stored.
+fn record_session(
+    request: &StepRequest,
+    harness: &str,
+    session: &str,
+    status: &str,
+    text: &str,
+) -> Option<PathBuf> {
+    let path = session_path(request);
+    let mut front = FrontMatter::new();
+    front.set("session", session);
+    front.set("harness", harness);
+    front.set("step", request.step.id.clone());
+    if let Some(task) = request.task {
+        front.set("task", format!("{task:02}"));
+    }
+    front.set("attempt", request.attempt.to_string());
+    front.set("status", status);
+    front.set("updated", timestamp(SystemTime::now()));
+
+    let mut body = format!("# Session: {}\n\n", request.step.id);
+    let text = text.trim();
+    if text.is_empty() {
+        body.push_str("_The session reported no text._\n");
+    } else {
+        body.push_str(text);
+        body.push('\n');
+    }
+    Document::new(front, body)
+        .write_atomic(&path)
+        .ok()
+        .map(|()| path)
+}
+
+/// Where a session file lives: `sessions/<step>.md`, or
+/// `sessions/<step>-task-NN.md` for a per-task step.
+fn session_path(request: &StepRequest) -> PathBuf {
+    let name = match request.task {
+        Some(task) => format!("{}-task-{task:02}.md", request.step.id),
+        None => format!("{}.md", request.step.id),
+    };
+    request.issue.join("sessions").join(name)
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::graph::StepKind;
+
+    fn request(task: Option<u32>) -> StepRequest {
+        let dir =
+            std::env::temp_dir().join(format!("warp-flow-session-{}-{task:?}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("issue folder");
+        StepRequest {
+            step: crate::graph::Step {
+                id: "code".to_owned(),
+                kind: StepKind::Harness,
+                skill: Some("code".to_owned()),
+                gate: None,
+                depends_on: Vec::new(),
+                produces: None,
+                per_task: task.is_some(),
+            },
+            issue: dir.clone(),
+            workdir: dir,
+            prompt: "do it".to_owned(),
+            task,
+            attempt: 1,
+        }
+    }
+
+    #[test]
+    fn a_session_becomes_markdown_in_the_issue_folder() {
+        let request = request(Some(2));
+        let path = record_session(
+            &request,
+            "opencode",
+            "ses_abc",
+            "done",
+            "I added the offset.",
+        )
+        .expect("the session is written");
+        assert_eq!(
+            path,
+            request.issue.join("sessions/code-task-02.md"),
+            "one file per step and task"
+        );
+        let document = Document::read(&path).expect("it parses");
+        assert_eq!(document.front.get("session"), Some("ses_abc"));
+        assert_eq!(document.front.get("harness"), Some("opencode"));
+        assert_eq!(document.front.get("step"), Some("code"));
+        assert_eq!(document.front.get("task"), Some("02"));
+        assert_eq!(document.front.get("attempt"), Some("1"));
+        assert_eq!(document.front.get("status"), Some("done"));
+        assert!(document.body.contains("I added the offset."));
+    }
+
+    #[test]
+    fn a_second_attempt_replaces_the_first_session_file() {
+        let mut request = request(None);
+        request.attempt = 1;
+        let first = record_session(&request, "opencode", "ses_one", "failed", "first try")
+            .expect("the first attempt writes");
+        request.attempt = 2;
+        let second = record_session(&request, "opencode", "ses_two", "done", "second try")
+            .expect("the second attempt writes");
+        assert_eq!(first, second, "the same step replaces its own session file");
+        let text = std::fs::read_to_string(&second).expect("the file");
+        assert!(
+            text.contains("ses_two"),
+            "the newest session is the one kept"
+        );
+        assert!(!text.contains("ses_one"));
+        assert!(text.contains("second try"));
+        let _ = std::fs::remove_dir_all(&request.issue);
     }
 }
 

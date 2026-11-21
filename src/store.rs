@@ -316,8 +316,34 @@ pub struct Run {
     /// `tasks.md` when the run has one, else a markdown summary built from
     /// `issues/<NN>-*.md`.
     pub tasks: String,
+    /// The harness sessions the run's steps recorded, oldest first.
+    pub sessions: Vec<Session>,
     /// The first artifact problem found while scanning this folder.
     pub note: Option<String>,
+}
+
+/// One harness session a step recorded, read from `sessions/<step>[-task-NN].md`.
+///
+/// The door is the only place that knows a session id, so the harness writes one
+/// short markdown file per step and task: the id, what kind of session it was,
+/// which attempt, how it ended, and the transcript the person actually wants to
+/// read. The run screen shows them beside the engine's own log.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Session {
+    /// The session id the door named.
+    pub session: String,
+    /// The harness backend (`opencode`, `dsh`, …).
+    pub harness: String,
+    pub step: String,
+    /// The task, when the step is per task.
+    pub task: Option<String>,
+    pub attempt: String,
+    /// `done`, `failed` or `timed-out`.
+    pub status: String,
+    /// When the harness recorded it, as it wrote it.
+    pub updated: String,
+    /// The transcript's text.
+    pub text: String,
 }
 
 /// One configured repository.
@@ -497,6 +523,7 @@ fn scan_run(dir: &Path, repo_path: &Path, repo_note: Option<&str>) -> Run {
     let (tasks_markdown, task_rows, tasks_done) = read_tasks(dir, &mut note);
     let tasks_total = task_rows.len();
     let task_levels = task_levels(&task_rows);
+    let sessions = read_sessions(&dir.join("sessions"), &mut note);
     let steps = match &graph {
         Some(graph) => step_views(graph, &rows, &task_rows, &open_questions, &status, &step),
         None => log_steps(&rows, &open_questions),
@@ -527,6 +554,7 @@ fn scan_run(dir: &Path, repo_path: &Path, repo_note: Option<&str>) -> Run {
         steps,
         spec,
         tasks: tasks_markdown,
+        sessions,
         note,
     }
 }
@@ -678,6 +706,60 @@ fn question_options(document: &DocView) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Every `sessions/<step>[-task-NN].md` the run recorded, oldest first.
+///
+/// One bad file is a note, not a failed scan: the run still shows what it has.
+/// Order is by the recorded `updated` stamp (then step and task), because the
+/// file names sort by step id and that is not the order the steps ran in.
+fn read_sessions(dir: &Path, note: &mut Option<String>) -> Vec<Session> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            note.get_or_insert_with(|| format!("{}: {error}", dir.display()));
+            return Vec::new();
+        }
+    };
+    let mut sessions = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                note.get_or_insert_with(|| format!("{}: {error}", path.display()));
+                continue;
+            }
+        };
+        let document = match Document::parse(&text) {
+            Ok(document) => document,
+            Err(error) => {
+                note.get_or_insert_with(|| format!("{}: {error}", path.display()));
+                continue;
+            }
+        };
+        sessions.push(Session {
+            session: document.front.get("session").unwrap_or("—").to_owned(),
+            harness: document.front.get("harness").unwrap_or("—").to_owned(),
+            step: document.front.get("step").unwrap_or("—").to_owned(),
+            task: document.front.get("task").map(str::to_owned),
+            attempt: document.front.get("attempt").unwrap_or("—").to_owned(),
+            status: document.front.get("status").unwrap_or("—").to_owned(),
+            updated: document.front.get("updated").unwrap_or("").to_owned(),
+            text: document.body.trim().to_owned(),
+        });
+    }
+    sessions.sort_by(|left, right| {
+        left.updated
+            .cmp(&right.updated)
+            .then_with(|| left.step.cmp(&right.step))
+            .then_with(|| left.task.cmp(&right.task))
+    });
+    sessions
 }
 
 /// `tasks.md` when the run has one, else a markdown summary of the task files.

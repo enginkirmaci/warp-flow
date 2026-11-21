@@ -535,6 +535,8 @@ fn step_request(prompt: &str) -> StepRequest {
         issue: workdir.join("issue"),
         workdir,
         prompt: prompt.to_owned(),
+        task: None,
+        attempt: 1,
     }
 }
 
@@ -549,9 +551,15 @@ fn a_round_trip_returns_the_assistant_text_only() {
 
     match outcome {
         StepOutcome::Done { wrote, text } => {
+            // the one file a door step reports is the session it recorded
+            assert_eq!(
+                wrote.len(),
+                1,
+                "a door step reports its session file: {wrote:?}"
+            );
             assert!(
-                wrote.is_empty(),
-                "a door step reports no files of its own: {wrote:?}"
+                wrote[0].ends_with("sessions/code.md"),
+                "the session file is named for the step: {wrote:?}"
             );
             assert_eq!(text, "ok", "the transcript's assistant text is the answer");
             assert_ne!(text, PROMPT, "the echoed prompt must not be returned");
