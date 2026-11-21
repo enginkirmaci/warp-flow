@@ -172,6 +172,49 @@ def facts(version: str | None = None) -> dict:
 # Cargo sync
 
 
+
+def workspace_root() -> Path:
+    """The cargo workspace root that contains this repository.
+
+    Normally that is ROOT itself. While this checkout lives inside warp-suite's
+    `apps/` directory, cargo resolves the enclosing workspace instead, and the
+    lockfile belongs to it; the app then keeps only its manifests in sync.
+    """
+    cargo = find_cargo()
+    run = subprocess.run(
+        [cargo, "metadata", "--no-deps", "--format-version", "1"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+    )
+    if run.returncode != 0:
+        fail(f"cargo metadata failed:\n{run.stderr.strip()}")
+    return Path(json.loads(run.stdout)["workspace_root"]).resolve()
+
+
+def is_nested() -> bool:
+    return workspace_root() != ROOT.resolve()
+
+
+def sync_nested_lock(version: str) -> None:
+    """Rewrite this package's versions in its own lockfile.
+
+    Cargo refuses to maintain a lockfile for a package that sits inside another
+    workspace, so the two entries this repository owns are rewritten directly;
+    the versions are the only thing that moves on a commit. A dependency change
+    has to regenerate the lock from a standalone checkout.
+    """
+    if not LOCK_FILE.is_file():
+        return
+    text = LOCK_FILE.read_text(encoding="utf-8")
+    for name in ("warp-flow", "warp-flow-core"):
+        pattern = re.compile(
+            r'(\[\[package\]\]\nname = "' + re.escape(name) + r'"\nversion = ")[^"]*(")'
+        )
+        text = pattern.sub(lambda match: match.group(1) + version + match.group(2), text)
+    LOCK_FILE.write_text(text, encoding="utf-8")
+
+
 def manifests() -> list[Path]:
     return sorted(
         path
@@ -211,6 +254,10 @@ def sync_cargo(version: str) -> None:
         if new != text:
             path.write_text(new, encoding="utf-8")
 
+    if is_nested():
+        sync_nested_lock(version)
+        return
+
     cargo = find_cargo()
     for extra in (["--offline"], []):
         run = subprocess.run(
@@ -227,6 +274,22 @@ def sync_cargo(version: str) -> None:
 
 
 def check_locked() -> dict:
+    if is_nested():
+        if LOCK_FILE.is_file():
+            text = LOCK_FILE.read_text(encoding="utf-8")
+            version = read_facts()["version"]
+            for name in ("warp-flow", "warp-flow-core"):
+                pattern = re.compile(
+                    r'\[\[package\]\]\nname = "' + re.escape(name) + r'"\nversion = "([^"]*)"'
+                )
+                found = pattern.search(text)
+                if found and found.group(1) != version:
+                    fail(
+                        f"Cargo.lock names {name} {found.group(1)}, version.toml is "
+                        f"{version}; run `python3 scripts/version.py sync`"
+                    )
+        return {"workspace_members": [], "packages": []}
+
     cargo = find_cargo()
     run = subprocess.run(
         [cargo, "metadata", "--locked", "--no-deps", "--format-version", "1"],
@@ -311,13 +374,42 @@ def cmd_pre_commit(argv: list[str]) -> int:
     return 0
 
 
+def _own_packages() -> list[dict]:
+    packages = []
+    for path in manifests():
+        text = path.read_text(encoding="utf-8")
+        name = re.search(r'(?m)^name\s*=\s*"([^"]+)"', text)
+        version = re.search(r'(?m)^version\s*=\s*"([^"]+)"', text)
+        if name and version:
+            packages.append(
+                {
+                    "name": name.group(1),
+                    "version": version.group(1),
+                    "manifest_path": str(path),
+                }
+            )
+    return packages
+
+
 def check_errors() -> list[str]:
     data = read_facts()
     version = data["version"]
     errors: list[str] = []
     metadata = check_locked()
     members = set(metadata.get("workspace_members", []))
-    packages = [p for p in metadata.get("packages", []) if p.get("id") in members]
+    packages = [
+        p
+        for p in metadata.get("packages", [])
+        if p.get("id") in members
+        and Path(p.get("manifest_path", "")).resolve().is_relative_to(ROOT)
+    ]
+    if is_nested():
+        # The enclosing workspace owns Cargo.lock; this repository owns only its
+        # manifests, and its own entries are checked by check_locked().
+        packages = [
+            p
+            for p in _own_packages()
+        ]
     if not packages:
         errors.append("cargo metadata returned no workspace member")
     for package in packages:
