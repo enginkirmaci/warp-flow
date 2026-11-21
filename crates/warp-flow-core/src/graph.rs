@@ -91,6 +91,70 @@ impl Workflow {
         })
     }
 
+    /// The canonical document for this graph.
+    ///
+    /// It validates first — a caller must never be able to persist a graph the
+    /// engine would refuse — and the field order is the one a person reads:
+    /// schema, name, revision, then the steps in their order.
+    ///
+    /// # Errors
+    ///
+    /// The validation error, or a serialization failure.
+    pub fn to_toml(&self) -> Result<String> {
+        self.validate()?;
+        toml::to_string_pretty(self)
+            .map_err(|error| Error::Workflow(format!("cannot write this workflow: {error}")))
+    }
+
+    /// Write this graph to `path`, atomically.
+    ///
+    /// The engine re-reads `workflow.toml` at every step boundary (ADR-0010),
+    /// so a half-written file could land in a running step's lap: the document
+    /// goes to a temporary file and is renamed into place.
+    ///
+    /// # Errors
+    ///
+    /// The validation error, or the filesystem's.
+    pub fn write(&self, path: impl AsRef<Path>) -> Result<()> {
+        let text = self.to_toml()?;
+        crate::artifact::write_atomic(path.as_ref(), &text)
+    }
+
+    /// The next revision of this graph: the same steps, `revision + 1`.
+    ///
+    /// ADR-0010: every change appends a revision, and that is what a running
+    /// engine reads at its next step boundary.
+    pub fn next_revision(&self) -> Self {
+        let mut next = self.clone();
+        next.revision = self.revision.saturating_add(1);
+        next
+    }
+
+    /// Save this graph as its next revision and return what was written.
+    ///
+    /// A save that changes nothing is not a revision: the caller compares the
+    /// steps before writing, and this function returns the graph unchanged when
+    /// they match, so the file keeps its revision and its bytes.
+    ///
+    /// # Errors
+    ///
+    /// The validation error, or the filesystem's.
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let current = Self::read(path).ok();
+        let unchanged = current.as_ref().is_some_and(|current| {
+            current.steps == self.steps
+                && current.schema == self.schema
+                && current.name == self.name
+        });
+        if unchanged {
+            return Ok(current.unwrap_or_else(|| self.clone()));
+        }
+        let next = self.next_revision();
+        next.write(path)?;
+        Ok(next)
+    }
+
     /// The step with `id`, if the graph has one.
     pub fn step(&self, id: &str) -> Option<&Step> {
         self.steps.iter().find(|step| step.id == id)
@@ -438,6 +502,53 @@ depends_on = ["code"]
         workflow.schema = 2;
         let error = workflow.validate().expect_err("schema");
         assert!(error.to_string().contains("schema 2"), "{error}");
+    }
+
+    #[test]
+    fn a_written_workflow_reads_back_the_same() {
+        let graph = workflow(vec![
+            step("analyze", StepKind::Harness, &[]),
+            step("check", StepKind::Gate, &["analyze"]),
+        ]);
+        let text = graph.to_toml().expect("write");
+        assert!(text.starts_with("schema = 1\n"), "{text}");
+        assert!(text.contains("name = \"test\""), "{text}");
+        assert!(text.contains("[[step]]"), "{text}");
+        let back = parse(&text);
+        assert_eq!(back, graph);
+    }
+
+    #[test]
+    fn an_invalid_graph_cannot_be_written() {
+        let error = workflow(Vec::new())
+            .to_toml()
+            .expect_err("an empty graph is refused");
+        assert!(error.to_string().contains("no steps"), "{error}");
+    }
+
+    #[test]
+    fn saving_bumps_the_revision_and_a_no_op_save_does_not() {
+        let dir = crate::test_support::TempDir::new();
+        let path = dir.path().join("workflow.toml");
+        let graph = workflow(vec![step("analyze", StepKind::Harness, &[])]);
+        graph.write(&path).expect("write");
+
+        // the same graph saved again is not a revision
+        let saved = graph.save(&path).expect("save");
+        assert_eq!(saved.revision, graph.revision);
+        assert_eq!(
+            Workflow::read(&path).expect("read").revision,
+            graph.revision
+        );
+
+        // a changed step is
+        let mut changed = graph.clone();
+        changed.steps[0].produces = Some("spec.md".to_owned());
+        let saved = changed.save(&path).expect("save");
+        assert_eq!(saved.revision, graph.revision + 1);
+        let on_disk = Workflow::read(&path).expect("read");
+        assert_eq!(on_disk.revision, graph.revision + 1);
+        assert_eq!(on_disk.steps[0].produces.as_deref(), Some("spec.md"));
     }
 
     #[test]
