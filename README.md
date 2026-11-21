@@ -21,11 +21,26 @@ cargo run -- --repo <path>     # the desktop app (repeat --repo per repository)
 cargo run --bin warp-flow-cli -- run <issue-dir>   # drive a run from a terminal
 ```
 
-The desktop app is build step S3. S3a landed the shell — the repository rail,
-the six-column kanban board and a read-only run detail pane. S3b adds the run
-screen: the workflow's step bands and task lanes, the task dependency strip,
-the open question's answer controls and the attempt history. The screen answers
-a question through the issue folder; starting a run from the app is still the
-next step. Until then, `warp-flow-cli` is the headless driver for the same
-engine (`run`, `status`, `answer`, `--dry-run`); it is a second binary of this
-package, not a separate package.
+The app is the process that drives a run. The board is the six lanes the issue
+folders fall into; opening a run shows its workflow as step bands with one lane
+per task, the task dependency strip, the attempt history and the open question.
+The run screen's actions start, pause, resume and abandon the engine, which
+blocks on a worker thread while the UI reads a snapshot from memory.
+
+`warp-flow-cli` drives the same engine from a terminal (`run`, `status`,
+`answer`, `--dry-run`); it is a second binary of this package, not a separate
+package, and it is the way to run a flow on a machine with no window.
+
+## The door
+
+The app publishes a loopback door the way its siblings do
+([ADR-0012](https://github.com/enginkirmaci/warp-suite/blob/main/docs/adr/0012-warp-flow-publishes-a-door-of-its-own.md)):
+`~/.warp/flow/ipc.port` and `ipc.token`, token-authenticated NDJSON on
+`127.0.0.1`, protocol 1. The verbs are `runs` (the board the window is showing
+and the live runs), `run` (one issue folder's detail and phase), `answer`,
+`pause`, `resume`, `abandon` and `subscribe` (run pushes, plus a contentless
+board notification to re-ask `runs`). `ping` reports the app and the version.
+
+There is no start verb: starting a run is the app's own action. The contract is
+in `warp-suite`'s [cross-app contracts](https://github.com/enginkirmaci/warp-suite#cross-app-contracts),
+and warp-agent's Flow surface is its first client.

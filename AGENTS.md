@@ -10,14 +10,25 @@ repository is linked under `apps/`). This file adds only the app-specific facts.
   its own: it talks to warp-agent through the door.
 - `src/main.rs` — the thin launcher for the desktop app; `src/lib.rs` is the
   probe boundary, and `src/store.rs` is the filesystem scan behind the board.
-- `src/bin/warp-flow-cli.rs` — the headless driver (`run`, `status`, `answer`).
-  It is the only way to start a run until the app's run screen hosts the
-  engine, so keep it building and keep its argument tests.
+- `src/host.rs` — the engine host: one blocking `Runner` per issue folder on a
+  worker thread, one run per repository, the control value the engine reads at
+  a step boundary, the log ring, and the snapshot the window and the door read.
+- `src/door.rs` — the app's own loopback door (protocol 1). It answers from the
+  snapshot the window adopted and never scans; the contract is warp-suite's
+  cross-app contracts section.
+- `src/bin/warp-flow-cli.rs` — the headless driver (`run`, `status`, `answer`)
+  over `core::prepare`, the same preparation the app uses. Keep it building and
+  keep its argument tests.
 - `src/ui/` — the shell: repository rail, kanban board, run detail and the run
   screen (`run.rs`: workflow step bands, task dependency strip, open question
   and attempt history).
 - `app.toml`, `version.toml`, `rust-toolchain.toml`, `scripts/version.py` and
   `.githooks/pre-commit` follow the family's rules; do not hand-edit a version.
+
+The quit path lives on the `App` in `src/app.rs`, not on the window: gpui drops
+a window's view entity when the last window closes, before app shutdown, so an
+entity-level `on_app_quit` never runs (verified live). That hook is what
+withdraws the door and asks a blocking engine to stop.
 
 ## Invariants
 
