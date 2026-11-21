@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Warp Flow
+Comment=Workflow engine: a request to merged code through agent sessions
+Exec=__WARP_SUITE_BIN__/warp-flow
+Icon=warpflow
+Terminal=false
+Categories=Development;
+StartupWMClass=warp-flow
