@@ -19,6 +19,7 @@
 pub mod artifact;
 pub mod config;
 pub mod control;
+pub mod diff;
 pub mod door;
 pub mod gate;
 pub mod graph;
