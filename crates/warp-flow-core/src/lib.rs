@@ -17,10 +17,13 @@
 #![warn(missing_docs)]
 
 pub mod artifact;
+pub mod door;
 pub mod gate;
 pub mod graph;
 pub mod harness;
+pub mod merge;
 pub mod run;
+pub mod worktree;
 
 #[cfg(test)]
 mod test_support;

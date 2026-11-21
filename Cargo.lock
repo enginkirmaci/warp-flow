@@ -192,7 +192,7 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "warp-flow"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -201,12 +201,21 @@ dependencies = [
 
 [[package]]
 name = "warp-flow-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
  "thiserror",
  "toml",
+ "warpui-kit-worktree",
+]
+
+[[package]]
+name = "warpui-kit-worktree"
+version = "0.2.112"
+source = "git+https://github.com/enginkirmaci/warp-suite?tag=kits-v0.2.112#fb8d5ac78f9b01d767b808349f0ba3930fe9589e"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]
