@@ -1,0 +1,17 @@
+[package]
+name = "warp-flow-core"
+version = "0.1.1"
+edition = "2024"
+description = "The warp-flow engine: issue folder protocol, workflow graph, scheduler, gates"
+license = "GPL-3.0"
+repository = "https://github.com/enginkirmaci/warp-flow"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,22 @@
+[package]
+name = "warp-flow"
+version = "0.1.1"
+edition = "2024"
+description = "warp-flow — workflow engine for the warp-suite"
+license = "GPL-3.0"
+repository = "https://github.com/enginkirmaci/warp-flow"
+publish = false
+
+# The engine lives in crates/warp-flow-core; this binary is its CLI until the
+# desktop app lands (build step S3), when src/lib.rs becomes the probe boundary
+# and the binary turns into a thin launcher, as in the sibling apps.
+
+[dependencies]
+warp-flow-core = { path = "crates/warp-flow-core" }
+anyhow = "1"
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
