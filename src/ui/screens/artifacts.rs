@@ -504,19 +504,12 @@ impl Render for ArtifactsScreen {
                 .track_scroll(&self.scroll)
                 .p(px(theme::scaled(theme::BOARD_PADDING)))
                 .child(if editable {
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .child(
-                            LiveEditor::new(editor.as_ref().expect("the editor just ensured"))
-                                .aria_label(SharedString::from(format!(
-                                    "{} contents",
-                                    file_name(&path)
-                                )))
-                                .text_size(px(theme::font_body()))
-                                .surface(theme::surface())
-                                .into_any_element(),
-                        )
+                    // the editor fills the scroll container itself: a flex
+                    // wrapper inside a scroller collapses to nothing
+                    LiveEditor::new(editor.as_ref().expect("the editor just ensured"))
+                        .aria_label(SharedString::from(format!("{} contents", file_name(&path))))
+                        .text_size(px(theme::font_body()))
+                        .surface(theme::surface())
                         .into_any_element()
                 } else {
                     match editor.as_ref() {

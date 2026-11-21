@@ -27,6 +27,21 @@ per task, the task dependency strip, the attempt history and the open question.
 The run screen's actions start, pause, resume and abandon the engine, which
 blocks on a worker thread while the UI reads a snapshot from memory.
 
+A run has six screens, listed under the rail's `THIS RUN`:
+
+| Screen | What it is |
+| --- | --- |
+| Run | the workflow, the task strip, the question, the engine's log |
+| Artifacts | the issue folder's documents, edited in place and saved atomically |
+| Task & diff | one task's file and the diff its branch carries against `main` |
+| Workflow | the graph as rows, saved as a new revision the engine reads at its next step boundary |
+| Repos & gates | the window's repositories and their `flow.toml` gates, with a gate you can run once |
+| Settings | reduce motion, where the app keeps its files, the door's state, the version |
+
+The engine owns an issue folder while it drives a run: Artifacts refuses an
+edit then (one line says why), while Workflow and Repos & gates may save —
+their files are read at step boundaries, and both validate before writing.
+
 `warp-flow-cli` drives the same engine from a terminal (`run`, `status`,
 `answer`, `--dry-run`); it is a second binary of this package, not a separate
 package, and it is the way to run a flow on a machine with no window.

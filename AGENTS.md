@@ -23,6 +23,11 @@ either way. This file adds only the app-specific facts.
 - `src/ui/` — the shell: repository rail, kanban board, run detail and the run
   screen (`run.rs`: workflow step bands, task dependency strip, open question
   and attempt history).
+- `src/ui/screens/` — the run's five screens, one entity each: `artifacts.rs`,
+  `diff.rs`, `workflow.rs`, `gates.rs`, `settings.rs`. `mod.rs` owns the
+  `Screen` vocabulary, the `ScreenRun` a screen is handed, and the two rules
+  they all follow: `edit_permission` (the engine owns the folder while it
+  drives) and `write_artifact`/`write_atomic_raw` (the only writers).
 - `app.toml`, `version.toml`, `rust-toolchain.toml`, `scripts/version.py` and
   `.githooks/pre-commit` follow the family's rules; do not hand-edit a version.
 

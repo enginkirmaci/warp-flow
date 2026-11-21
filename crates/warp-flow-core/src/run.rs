@@ -2065,7 +2065,7 @@ depends_on = ["first"]
 "#;
 
     /// A runner over [`TWO_GATES`] with the control set to `control`.
-    fn two_gate_runner(issue: &Path, control: Box<dyn Control>) -> Runner<FakeHarness> {
+    fn two_gate_config(issue: &Path, control: Box<dyn Control>) -> RunnerConfig<FakeHarness> {
         let workflow = workflow(TWO_GATES);
         let mut config = RunnerConfig::new(issue, workflow, FakeHarness::new());
         config.gates.insert(
@@ -2079,7 +2079,18 @@ depends_on = ["first"]
         );
         config.control = control;
         config.log = Box::new(MemoryLog::new());
-        Runner::new(config).expect("runner")
+        config
+    }
+
+    /// A fresh runner over `TWO_GATES`: it writes a new `run.md`.
+    fn two_gate_runner(issue: &Path, control: Box<dyn Control>) -> Runner<FakeHarness> {
+        Runner::new(two_gate_config(issue, control)).expect("runner")
+    }
+
+    /// A runner that continues `issue`'s record, the way the host and the CLI
+    /// resume a run.
+    fn two_gate_resume(issue: &Path, control: Box<dyn Control>) -> Runner<FakeHarness> {
+        Runner::resume(two_gate_config(issue, control)).expect("runner")
     }
 
     #[test]
@@ -2200,10 +2211,17 @@ depends_on = ["first"]
             &issue,
             Box::new(ScriptedControl::new([Signal::Continue, Signal::Pause])),
         );
-        let started = runner.started.clone();
         assert_eq!(runner.run().expect("run"), RunStatus::Paused);
+        // the record's own start time, not the runner's construction: the two
+        // can straddle a second boundary, and what the resume must preserve is
+        // what `run.md` said
+        let started = run_md(&issue)
+            .front
+            .get("started")
+            .map(str::to_owned)
+            .expect("the pause recorded a start time");
 
-        let mut resumed = two_gate_runner(&issue, Box::new(KeepGoing));
+        let mut resumed = two_gate_resume(&issue, Box::new(KeepGoing));
         assert_eq!(resumed.run().expect("resumed run"), RunStatus::Done);
 
         let document = run_md(&issue);
