@@ -21,9 +21,11 @@ cargo run -- --repo <path>     # the desktop app (repeat --repo per repository)
 cargo run --bin warp-flow-cli -- run <issue-dir>   # drive a run from a terminal
 ```
 
-The desktop app is build step S3. S3a lands the shell — the repository rail,
-the six-column kanban board and a read-only run detail pane. The full run
-screen with the workflow DAG, the task dependency strip and the question cards
-is S3b. Until that screen can start a run, `warp-flow-cli` is the headless
-driver for the same engine (`run`, `status`, `answer`, `--dry-run`); it is a
-second binary of this package, not a separate package.
+The desktop app is build step S3. S3a landed the shell — the repository rail,
+the six-column kanban board and a read-only run detail pane. S3b adds the run
+screen: the workflow's step bands and task lanes, the task dependency strip,
+the open question's answer controls and the attempt history. The screen answers
+a question through the issue folder; starting a run from the app is still the
+next step. Until then, `warp-flow-cli` is the headless driver for the same
+engine (`run`, `status`, `answer`, `--dry-run`); it is a second binary of this
+package, not a separate package.

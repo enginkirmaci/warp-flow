@@ -40,6 +40,12 @@ pub const DETAIL_WIDTH: f32 = 460.;
 /// The detail pane's inner padding.
 pub const DETAIL_PADDING: f32 = 20.;
 
+/// The run screen's inner padding.
+pub const RUN_PADDING: f32 = 24.;
+
+/// The gap between the run screen's sections.
+pub const RUN_GAP: f32 = 16.;
+
 // ---- gpui-kit theme mapping ------------------------------------------------
 
 /// Map the family palette onto gpui-kit's theme tokens. Called by

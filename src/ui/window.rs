@@ -9,12 +9,15 @@ use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, FontWeight, KeyDownEvent, MouseButton,
     ScrollHandle, SharedString, Window, div, px, relative,
 };
+use gpui_kit::component::input::InputState;
 use warpui_kit_core::list_nav::{self, ListKey};
 use warpui_kit_core::{A11y, icon, motion, shell, tooltip::tooltip_text};
 use warpui_kit_markdown::LiveEditorState;
 
 use crate::app::Launch;
-use crate::store::{self, Column, Question, Run, RunKey, RunRow, Snapshot};
+use crate::store::{
+    self, Column, MAX_LOG_ROWS, Question, Run, RunKey, RunRow, Snapshot, recent_rows,
+};
 use crate::theme;
 
 /// The board's page step: a page key moves five cards.
@@ -22,7 +25,7 @@ const PAGE: usize = 5;
 
 /// One view of one document: the source it was built from, so a scan that
 /// changed it replaces the read-only editor instead of showing stale markdown.
-struct DocSlot {
+pub(crate) struct DocSlot {
     key: RunKey,
     source: String,
     editor: Entity<LiveEditorState>,
@@ -31,19 +34,33 @@ struct DocSlot {
 /// The app window's state.
 pub struct FlowApp {
     settings: store::Settings,
-    snapshot: Snapshot,
+    pub(crate) snapshot: Snapshot,
     scanning: bool,
     /// `None` is the "All repos" row.
     selected_repo: Option<PathBuf>,
     /// The run whose detail pane is open.
-    selected_run: Option<RunKey>,
+    pub(crate) selected_run: Option<RunKey>,
     /// The board's keyboard cursor; distinct from the open run.
-    cursor: Option<RunKey>,
-    board_focus: FocusHandle,
+    pub(crate) cursor: Option<RunKey>,
+    pub(crate) board_focus: FocusHandle,
     rail_scroll: ScrollHandle,
     detail_scroll: ScrollHandle,
     detail_spec: Option<DocSlot>,
     detail_tasks: Option<DocSlot>,
+    /// The run screen's run. `None` is the board; the selected run stays
+    /// selected so Back returns to it.
+    pub(crate) run_screen: Option<RunKey>,
+    /// The run screen's scrolling content.
+    pub(crate) run_focus: FocusHandle,
+    pub(crate) run_scroll: ScrollHandle,
+    /// The open question's rendered markdown.
+    pub(crate) run_question: Option<DocSlot>,
+    /// Ticked labels of an open `multi` question.
+    pub(crate) run_multi: Vec<String>,
+    /// Why the last answer could not be written.
+    pub(crate) run_answer_error: Option<String>,
+    /// The single-line answer field a `text` (or unknown-kind) question uses.
+    pub(crate) answer_field: Entity<InputState>,
     window_title: String,
 }
 
@@ -56,6 +73,11 @@ impl FlowApp {
             settings.save();
         }
         let board_focus = cx.focus_handle();
+        let run_focus = cx.focus_handle();
+        let answer_field = cx.new(|cx| InputState::new(window, cx).placeholder("Type your answer"));
+        // The answer field is FlowApp state: a keystroke must repaint the
+        // Submit button that reads whether the field is empty.
+        cx.observe(&answer_field, |_, _, cx| cx.notify()).detach();
         window.focus(&board_focus, cx);
         let mut app = Self {
             settings,
@@ -69,6 +91,13 @@ impl FlowApp {
             detail_scroll: ScrollHandle::new(),
             detail_spec: None,
             detail_tasks: None,
+            run_screen: None,
+            run_focus,
+            run_scroll: ScrollHandle::new(),
+            run_question: None,
+            run_multi: Vec::new(),
+            run_answer_error: None,
+            answer_field,
             window_title: String::new(),
         };
         app.start_scan(cx);
@@ -149,6 +178,15 @@ impl FlowApp {
         {
             self.close_detail(cx);
         }
+        if let Some(open) = &self.run_screen
+            && self.snapshot.find(open).is_none()
+        {
+            // The open run left the snapshot: fall back to the board.
+            self.run_screen = None;
+            self.run_question = None;
+            self.run_multi.clear();
+            self.run_answer_error = None;
+        }
     }
 
     /// The keys of every run in board order: column by column, then card.
@@ -190,6 +228,10 @@ impl FlowApp {
     fn open_run(&mut self, key: RunKey, window: &mut Window, cx: &mut Context<Self>) {
         self.cursor = Some(key.clone());
         self.selected_run = Some(key);
+        self.run_screen = None;
+        self.run_question = None;
+        self.run_multi.clear();
+        self.run_answer_error = None;
         self.detail_scroll = ScrollHandle::new();
         window.focus(&self.board_focus, cx);
         cx.notify();
@@ -197,6 +239,10 @@ impl FlowApp {
 
     fn close_detail(&mut self, cx: &mut Context<Self>) {
         self.selected_run = None;
+        self.run_screen = None;
+        self.run_question = None;
+        self.run_multi.clear();
+        self.run_answer_error = None;
         self.detail_spec = None;
         self.detail_tasks = None;
         cx.notify();
@@ -611,6 +657,13 @@ impl FlowApp {
 
         if self.settings.repos.is_empty() {
             main = main.child(self.render_empty());
+        } else if let Some(run) = self
+            .run_screen
+            .as_ref()
+            .and_then(|key| self.snapshot.find(key))
+            .cloned()
+        {
+            main = main.child(self.render_run_screen(run, window, cx));
         } else {
             let detail = self
                 .selected_run
@@ -922,7 +975,7 @@ impl FlowApp {
             );
         }
         body = body
-            .child(log_card(&run.rows, run.attempts))
+            .child(log_card(recent_rows(&run.rows, MAX_LOG_ROWS), run.attempts))
             .child(document_section("Spec", spec_body, "flow-detail-spec"))
             .child(document_section("Tasks", tasks_body, "flow-detail-tasks"));
 
@@ -974,6 +1027,21 @@ impl FlowApp {
                                         run.status
                                     )),
                             ),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "flow-detail-open-run".into())
+                            .child(warpui_kit_core::controls::button(
+                                "flow-detail-open-run-button",
+                                "Open run",
+                                warpui_kit_core::controls::BtnKind::Chip,
+                                theme::accent(),
+                                theme::font_control(),
+                                true,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.open_run_screen(key.clone(), window, cx);
+                                }),
+                            )),
                     )
                     .child(
                         warpui_kit_core::controls::icon_button(
@@ -1124,7 +1192,12 @@ impl FlowApp {
 
         match key {
             ListKey::Enter => {
-                self.open_run(current, window, cx);
+                // With the detail pane already open, Enter opens the full run
+                // screen for that run; otherwise it opens the pane.
+                match self.selected_run.clone() {
+                    Some(open) => self.open_run_screen(open, window, cx),
+                    None => self.open_run(current, window, cx),
+                }
                 return true;
             }
             ListKey::Up | ListKey::Down | ListKey::PageUp | ListKey::PageDown => {
@@ -1208,6 +1281,24 @@ impl FlowApp {
             .as_ref()
             .map(|slot| slot.editor.read(cx).value().to_string())
     }
+
+    /// The run screen's run, or `None` while the board is shown.
+    #[doc(hidden)]
+    pub fn run_screen_for_probe(&self) -> Option<&RunKey> {
+        self.run_screen.as_ref()
+    }
+
+    /// The run the detail pane (and Back) keeps selected.
+    #[doc(hidden)]
+    pub fn selected_run_for_probe(&self) -> Option<&RunKey> {
+        self.selected_run.as_ref()
+    }
+
+    /// The run screen's focus handle, for its own Escape handling.
+    #[doc(hidden)]
+    pub fn run_focus_handle(&self) -> FocusHandle {
+        self.run_focus.clone()
+    }
 }
 
 impl Render for FlowApp {
@@ -1234,7 +1325,7 @@ impl Render for FlowApp {
 
 // ---- small rendering helpers ----------------------------------------------
 
-fn repo_label(path: &Path) -> String {
+pub(crate) fn repo_label(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
@@ -1263,7 +1354,7 @@ fn column_word(column: Column) -> &'static str {
     }
 }
 
-fn status_pill(run: &Run) -> AnyElement {
+pub(crate) fn status_pill(run: &Run) -> AnyElement {
     let color = column_color(run.column);
     let word = if run.question.is_some() {
         "asking you"
@@ -1286,7 +1377,7 @@ fn status_pill(run: &Run) -> AnyElement {
         .into_any_element()
 }
 
-fn tag(text: String) -> AnyElement {
+pub(crate) fn tag(text: String) -> AnyElement {
     div()
         .flex()
         .items_center()
@@ -1305,7 +1396,7 @@ fn tag(text: String) -> AnyElement {
         .into_any_element()
 }
 
-fn attempt_word(attempts: usize) -> String {
+pub(crate) fn attempt_word(attempts: usize) -> String {
     match attempts {
         0 => "no attempts".to_owned(),
         1 => "1 attempt".to_owned(),
@@ -1313,7 +1404,7 @@ fn attempt_word(attempts: usize) -> String {
     }
 }
 
-fn meta_row(label: &str, value: String) -> AnyElement {
+pub(crate) fn meta_row(label: &str, value: String) -> AnyElement {
     div()
         .flex()
         .items_center()
@@ -1498,7 +1589,7 @@ fn document_section(title: &str, body: AnyElement, selector: &'static str) -> An
 /// Read (or rebuild) the read-only editor for one document. The slot keeps
 /// the source it was built from, so a scan that changed `spec.md` replaces
 /// the markdown instead of leaving the old text behind.
-fn ensure_document(
+pub(crate) fn ensure_document(
     slot: &mut Option<DocSlot>,
     key: &RunKey,
     source: String,

@@ -5,13 +5,15 @@
 //! on the background executor and only adopts a snapshot that differs from the
 //! one it already shows.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use warp_flow_core::artifact::{Document, Issue, Task};
+use warp_flow_core::artifact::{Document, Issue, Status, Task};
+use warp_flow_core::graph::{Step, StepKind, Workflow};
 use warp_flow_core::worktree::Repo;
 use warpui_kit_platform::config::Store;
 use warpui_kit_platform::paths;
@@ -21,7 +23,8 @@ use crate::paths::AppPaths;
 /// How often the UI re-reads the engine's files while the app runs.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// How many of `run.md`'s newest log rows the detail pane keeps.
+/// How many of `run.md`'s newest log rows the detail pane keeps. The run
+/// screen renders every row through [`group_log`].
 pub const MAX_LOG_ROWS: usize = 8;
 
 /// `~/.warp/flow/settings.json`: the remembered repositories. The platform
@@ -164,13 +167,100 @@ pub struct RunRow {
     pub at: String,
 }
 
+/// One row of `run.md`'s log table, grouped by the step and task it belongs to,
+/// oldest first. The group keeps the log's own order: a group appears where its
+/// first row appeared.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogGroup {
+    pub step: String,
+    pub task: String,
+    pub rows: Vec<RunRow>,
+}
+
+/// One task file, as the run screen's workflow lanes and task strip need it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskRow {
+    /// The number in the file name (`01` is 1).
+    pub number: u32,
+    pub title: String,
+    pub status: Status,
+    /// The numbers this task waits on before it may start.
+    pub blocked_by: Vec<u32>,
+}
+
+/// A step row's state, derived from `run.md`'s log and the task files. This is
+/// the run screen's vocabulary; it is deliberately not the board's [`Column`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepState {
+    Done,
+    Running,
+    Failed,
+    Waiting,
+    Idle,
+}
+
+impl StepState {
+    /// A stable key for debug selectors and state.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Running => "running",
+            Self::Failed => "failed",
+            Self::Waiting => "waiting",
+            Self::Idle => "idle",
+        }
+    }
+
+    /// The row's word.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Running => "running",
+            Self::Failed => "failed",
+            Self::Waiting => "waiting on you",
+            Self::Idle => "idle",
+        }
+    }
+}
+
+/// One lane of a `per_task` step: a task's own run through that step.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LaneView {
+    pub number: u32,
+    pub title: String,
+    pub state: StepState,
+}
+
+/// One workflow step, already ordered and expanded into the rows the run
+/// screen draws. A `per_task` step carries one lane per task.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StepView {
+    pub id: String,
+    /// `None` when the workflow could not be read and the row comes from the
+    /// log instead.
+    pub kind: Option<StepKind>,
+    /// What the step produces, gates or runs: `produces`, `gate`, `skill`.
+    pub detail: String,
+    pub per_task: bool,
+    pub state: StepState,
+    /// The gate's last outcome, or the question's open/answered state.
+    pub note: Option<String>,
+    pub lanes: Vec<LaneView>,
+}
+
 /// An open question in `questions/<NN>.md`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Question {
+    /// The file the answer is written back into.
+    pub path: PathBuf,
     pub kind: String,
     pub title: String,
+    /// The full markdown body, rendered read-only on the run screen.
+    pub body: String,
     pub asked_by: String,
     pub task: Option<String>,
+    /// The comma-separated `options:` entries, split and trimmed.
+    pub options: Vec<String>,
 }
 
 /// One issue folder, as the board and the detail pane show it.
@@ -189,10 +279,24 @@ pub struct Run {
     pub attempts: usize,
     pub tasks_total: usize,
     pub tasks_done: usize,
+    /// The tasks with their blockers, in task-number order.
+    pub task_rows: Vec<TaskRow>,
+    /// The task strip's levels: level 0 has no blockers, level N waits on a
+    /// task at level N-1. Empty when there are no task files.
+    pub task_levels: Vec<Vec<u32>>,
     /// The first open question; its presence puts the run in Waiting on you.
     pub question: Option<Question>,
-    /// The newest rows of `run.md`'s log table, oldest first.
+    /// Every open question, in file-name order.
+    pub open_questions: Vec<Question>,
+    /// Every row of `run.md`'s log table, oldest first.
     pub rows: Vec<RunRow>,
+    /// `workflow.toml`, when the issue folder carries one it could read.
+    pub graph: Option<Workflow>,
+    /// Why `workflow.toml` could not be read, for the run screen's one line.
+    pub workflow_note: Option<String>,
+    /// The workflow's steps in topological order, or the log's steps when the
+    /// graph is missing or unreadable.
+    pub steps: Vec<StepView>,
     /// `spec.md`'s body, rendered read-only in the detail pane.
     pub spec: String,
     /// `tasks.md` when the run has one, else a markdown summary built from
@@ -351,20 +455,37 @@ fn scan_run(dir: &Path, repo_path: &Path, repo_note: Option<&str>) -> Run {
         .map(str::to_owned)
         .or(spec_status)
         .unwrap_or_else(|| "needs-triage".to_owned());
-    let mut rows = table_rows(run_body);
+    let rows = table_rows(run_body);
     let attempts = rows.len();
-    rows = rows.split_off(attempts.saturating_sub(MAX_LOG_ROWS));
     let step = run_doc
         .as_ref()
         .and_then(|doc| doc.value("step"))
         .map(str::to_owned)
         .or_else(|| rows.last().map(|row| row.step.clone()))
         .unwrap_or_else(|| "—".to_owned());
-    let workflow = workflow_name(run_doc.as_ref());
+
+    // workflow.toml: the graph the run screen draws. A missing or unreadable
+    // copy is a note and a log-only fallback, never a failed scan.
+    let mut workflow_note = None;
+    let graph = read_workflow(dir, &mut workflow_note);
+    let workflow = workflow_name(run_doc.as_ref())
+        .or_else(|| {
+            graph
+                .as_ref()
+                .map(|graph| format!("{}@{}", graph.name, graph.revision))
+        })
+        .unwrap_or_else(|| "—".to_owned());
 
     // questions/: an open one outranks the status.
-    let question = first_open_question(&dir.join("questions"), &mut note);
-    let (tasks_markdown, tasks_total, tasks_done) = read_tasks(dir, &mut note);
+    let open_questions = open_questions(&dir.join("questions"), &mut note);
+    let question = open_questions.first().cloned();
+    let (tasks_markdown, task_rows, tasks_done) = read_tasks(dir, &mut note);
+    let tasks_total = task_rows.len();
+    let task_levels = task_levels(&task_rows);
+    let steps = match &graph {
+        Some(graph) => step_views(graph, &rows, &task_rows, &open_questions, &status, &step),
+        None => log_steps(&rows, &open_questions),
+    };
 
     Run {
         key: RunKey {
@@ -379,8 +500,14 @@ fn scan_run(dir: &Path, repo_path: &Path, repo_note: Option<&str>) -> Run {
         attempts,
         tasks_total,
         tasks_done,
+        task_rows,
+        task_levels,
         question,
+        open_questions,
         rows,
+        graph,
+        workflow_note,
+        steps,
         spec,
         tasks: tasks_markdown,
         note,
@@ -431,14 +558,31 @@ fn first_heading(body: &str) -> Option<String> {
     })
 }
 
-/// `run.md`'s workflow and revision, as the detail head shows them.
-fn workflow_name(document: Option<&DocView>) -> String {
-    let Some(name) = document.and_then(|doc| doc.value("workflow")) else {
-        return "—".to_owned();
-    };
-    match document.and_then(|doc| doc.value("revision")) {
+/// `run.md`'s workflow and revision, when it records one.
+fn workflow_name(document: Option<&DocView>) -> Option<String> {
+    let name = document.and_then(|doc| doc.value("workflow"))?;
+    Some(match document.and_then(|doc| doc.value("revision")) {
         Some(revision) => format!("{name}@{revision}"),
         None => name.to_owned(),
+    })
+}
+
+/// Read `<issue>/workflow.toml`. A missing or unreadable copy is a note and a
+/// log-only fallback, never a failed scan.
+fn read_workflow(dir: &Path, note: &mut Option<String>) -> Option<Workflow> {
+    let path = dir.join("workflow.toml");
+    match Workflow::read(&path) {
+        Ok(workflow) => Some(workflow),
+        Err(_) => {
+            // The screen states this in one line; a TOML error's own text can
+            // span several, so it is not carried into the row.
+            *note = Some(if path.is_file() {
+                "workflow.toml could not be read — showing the run log's steps.".to_owned()
+            } else {
+                "workflow.toml is missing — showing the run log's steps.".to_owned()
+            });
+            None
+        }
     }
 }
 
@@ -471,16 +615,19 @@ fn table_rows(body: &str) -> Vec<RunRow> {
     rows
 }
 
-/// The first `state: open` question, in file-name order.
-fn first_open_question(dir: &Path, note: &mut Option<String>) -> Option<Question> {
-    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
-        .ok()?
+/// Every `state: open` question, in file-name order.
+fn open_questions(dir: &Path, note: &mut Option<String>) -> Vec<Question> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
         .collect();
     paths.sort();
 
+    let mut questions = Vec::new();
     for path in paths {
         let Some(document) = read_doc(&path, note) else {
             continue;
@@ -489,20 +636,37 @@ fn first_open_question(dir: &Path, note: &mut Option<String>) -> Option<Question
             continue;
         }
         let title = first_heading(&document.body).unwrap_or_else(|| folder_name(&path));
-        return Some(Question {
+        questions.push(Question {
+            path,
             kind: document.value("kind").unwrap_or("question").to_owned(),
             title,
+            body: document.body.clone(),
             asked_by: document.value("asked_by").unwrap_or("a step").to_owned(),
             task: document.value("task").map(str::to_owned),
+            options: question_options(&document),
         });
     }
-    None
+    questions
+}
+
+/// The `options:` entries: comma-separated, trimmed, empty entries dropped.
+fn question_options(document: &DocView) -> Vec<String> {
+    document
+        .value("options")
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|option| !option.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `tasks.md` when the run has one, else a markdown summary of the task files.
 /// The counts come from the task files themselves; a malformed task folder is
 /// noted and reads as no tasks.
-fn read_tasks(dir: &Path, note: &mut Option<String>) -> (String, usize, usize) {
+fn read_tasks(dir: &Path, note: &mut Option<String>) -> (String, Vec<TaskRow>, usize) {
     let authored = read_doc(&dir.join("tasks.md"), note).map(|doc| doc.body);
     match Issue::open(dir) {
         Ok(issue) => {
@@ -511,18 +675,406 @@ fn read_tasks(dir: &Path, note: &mut Option<String>) -> (String, usize, usize) {
                 .iter()
                 .filter(|task| task.status.is_resolved())
                 .count();
+            let rows = tasks
+                .iter()
+                .map(|task| TaskRow {
+                    number: task.number,
+                    title: task.title.clone(),
+                    status: task.status,
+                    blocked_by: task.blocked_by.clone(),
+                })
+                .collect();
             let markdown = authored.unwrap_or_else(|| synthesize_tasks(tasks));
-            (markdown, tasks.len(), done)
+            (markdown, rows, done)
         }
         Err(error) => {
             note.get_or_insert_with(|| error.to_string());
             (
                 authored.unwrap_or_else(|| "# Tasks\n\nTask files could not be read.\n".to_owned()),
-                0,
+                Vec::new(),
                 0,
             )
         }
     }
+}
+
+/// The workflow's steps in topological order. Independent steps keep their
+/// declaration order. A cycle or an unknown dependency (which the engine
+/// rejects) falls back to declaration order, so a bad copy still draws.
+fn topological_steps(workflow: &Workflow) -> Vec<&Step> {
+    let mut pending: Vec<&Step> = workflow.steps.iter().collect();
+    let mut done: BTreeSet<String> = BTreeSet::new();
+    let mut ordered = Vec::with_capacity(pending.len());
+    while !pending.is_empty() {
+        let ready = pending.iter().position(|step| {
+            step.depends_on
+                .iter()
+                .all(|dependency| done.contains(dependency))
+        });
+        let Some(index) = ready else {
+            ordered.extend(pending);
+            break;
+        };
+        let step = pending.remove(index);
+        done.insert(step.id.clone());
+        ordered.push(step);
+    }
+    ordered
+}
+
+/// Expand a workflow into the run screen's rows: one band per step, and one
+/// lane per task for a `per_task` step.
+fn step_views(
+    workflow: &Workflow,
+    rows: &[RunRow],
+    tasks: &[TaskRow],
+    questions: &[Question],
+    run_status: &str,
+    run_step: &str,
+) -> Vec<StepView> {
+    topological_steps(workflow)
+        .into_iter()
+        .map(|step| {
+            let lanes = if step.per_task {
+                tasks
+                    .iter()
+                    .map(|task| lane_view(step, task, tasks, rows, questions, run_status, run_step))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let state = if step.per_task {
+                let aggregate = aggregate_state(&lanes);
+                if aggregate == StepState::Idle && question_open(step, None, questions) {
+                    StepState::Waiting
+                } else {
+                    aggregate
+                }
+            } else {
+                step_state(step, None, rows, questions, run_status, run_step)
+            };
+            StepView {
+                id: step.id.clone(),
+                kind: Some(step.kind),
+                detail: step_detail(step),
+                per_task: step.per_task,
+                state,
+                note: step_note(step, rows, questions),
+                lanes,
+            }
+        })
+        .collect()
+}
+
+/// The fallback when `workflow.toml` cannot be read: one band per step the log
+/// names, in first-appearance order.
+fn log_steps(rows: &[RunRow], questions: &[Question]) -> Vec<StepView> {
+    let mut ids: Vec<String> = Vec::new();
+    for row in rows {
+        if !ids.contains(&row.step) {
+            ids.push(row.step.clone());
+        }
+    }
+    ids.into_iter()
+        .map(|id| {
+            let latest = rows.iter().rev().find(|row| row.step == id);
+            let state = match latest {
+                Some(row) if row.outcome == "waiting" => {
+                    if questions.iter().any(|question| question.asked_by == id) {
+                        StepState::Waiting
+                    } else {
+                        StepState::Done
+                    }
+                }
+                Some(row) => outcome_state(&row.outcome),
+                None => StepState::Idle,
+            };
+            StepView {
+                id,
+                kind: None,
+                detail: String::new(),
+                per_task: false,
+                state,
+                note: latest.map(|row| format!("last outcome: {}", row.outcome)),
+                lanes: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+/// One lane of a `per_task` step. The task file is the second evidence: a
+/// resolved task is done even when the log's last row predates the merge.
+fn lane_view(
+    step: &Step,
+    task: &TaskRow,
+    tasks: &[TaskRow],
+    rows: &[RunRow],
+    questions: &[Question],
+    run_status: &str,
+    run_step: &str,
+) -> LaneView {
+    // A resolved task has landed: its lane is done whatever an older log row
+    // still says.
+    let mut state = if task.status.is_resolved() {
+        StepState::Done
+    } else {
+        step_state(
+            step,
+            Some(task.number),
+            rows,
+            questions,
+            run_status,
+            run_step,
+        )
+    };
+    if state == StepState::Idle
+        && run_status == "running"
+        && run_step == step.id
+        && next_ready_task(tasks) == Some(task.number)
+    {
+        state = StepState::Running;
+    }
+    LaneView {
+        number: task.number,
+        title: task.title.clone(),
+        state,
+    }
+}
+
+/// A step row's state. The log wins; a question is waiting only while its file
+/// is open; the step `run.md` names is running while the status says so.
+fn step_state(
+    step: &Step,
+    task: Option<u32>,
+    rows: &[RunRow],
+    questions: &[Question],
+    run_status: &str,
+    run_step: &str,
+) -> StepState {
+    let open = question_open(step, task, questions);
+    if let Some(row) = latest_row(rows, &step.id, task) {
+        if row.outcome == "waiting" {
+            return if open || step.kind != StepKind::Question {
+                StepState::Waiting
+            } else {
+                StepState::Done
+            };
+        }
+        let state = outcome_state(&row.outcome);
+        if state == StepState::Idle && step.kind == StepKind::Question && !open {
+            return StepState::Done;
+        }
+        return state;
+    }
+    if open {
+        return StepState::Waiting;
+    }
+    if task.is_none() && run_status == "running" && run_step == step.id {
+        return StepState::Running;
+    }
+    StepState::Idle
+}
+
+/// A `per_task` band's state: the worst lane wins, and all done is done.
+fn aggregate_state(lanes: &[LaneView]) -> StepState {
+    if lanes.is_empty() {
+        return StepState::Idle;
+    }
+    if lanes.iter().any(|lane| lane.state == StepState::Failed) {
+        return StepState::Failed;
+    }
+    if lanes.iter().any(|lane| lane.state == StepState::Running) {
+        return StepState::Running;
+    }
+    if lanes.iter().any(|lane| lane.state == StepState::Waiting) {
+        return StepState::Waiting;
+    }
+    if lanes.iter().all(|lane| lane.state == StepState::Done) {
+        return StepState::Done;
+    }
+    StepState::Idle
+}
+
+/// The first task the engine may pick next: unresolved, every blocker
+/// resolved, in task-number order.
+fn next_ready_task(tasks: &[TaskRow]) -> Option<u32> {
+    let resolved: BTreeSet<u32> = tasks
+        .iter()
+        .filter(|task| task.status.is_resolved())
+        .map(|task| task.number)
+        .collect();
+    tasks
+        .iter()
+        .find(|task| {
+            !task.status.is_resolved()
+                && task
+                    .blocked_by
+                    .iter()
+                    .all(|blocker| resolved.contains(blocker))
+        })
+        .map(|task| task.number)
+}
+
+/// Whether an open question belongs to this step (and lane).
+fn question_open(step: &Step, task: Option<u32>, questions: &[Question]) -> bool {
+    let task = task.map(|number| format!("{number:02}"));
+    questions.iter().any(|question| {
+        question.asked_by == step.id
+            && match task.as_deref() {
+                Some(number) => question.task.as_deref() == Some(number),
+                None => true,
+            }
+    })
+}
+
+/// The newest log row for a step, or for one of its task lanes.
+fn latest_row<'a>(rows: &'a [RunRow], step: &str, task: Option<u32>) -> Option<&'a RunRow> {
+    let task = task.map(|number| format!("{number:02}"));
+    rows.iter().rev().find(|row| {
+        row.step == step
+            && match task.as_deref() {
+                Some(number) => row.task == number,
+                None => row.task == "-" || row.task.is_empty(),
+            }
+    })
+}
+
+/// The log's outcome vocabulary, as a row state.
+pub fn outcome_state(outcome: &str) -> StepState {
+    match outcome {
+        "done" | "merged" | "passed" | "approved" => StepState::Done,
+        "running" => StepState::Running,
+        "waiting" => StepState::Waiting,
+        "failed" | "timed-out" | "blocked" | "conflicted" | "gate-failed" | "dirty"
+        | "rejected" => StepState::Failed,
+        _ => StepState::Idle,
+    }
+}
+
+/// What a step produces, gates or runs, in the row's words.
+fn step_detail(step: &Step) -> String {
+    let mut parts = Vec::new();
+    if let Some(skill) = &step.skill {
+        parts.push(format!("skill: {skill}"));
+    }
+    if let Some(produces) = &step.produces {
+        parts.push(format!("produces: {produces}"));
+    }
+    if let Some(gate) = &step.gate {
+        parts.push(format!("gate: {gate}"));
+    }
+    if step.kind == StepKind::Merge {
+        parts.push("merge queue".to_owned());
+    }
+    parts.join(" · ")
+}
+
+/// A gate's last outcome, a question's open/answered state, and the log's last
+/// outcome for every other single step.
+fn step_note(step: &Step, rows: &[RunRow], questions: &[Question]) -> Option<String> {
+    match step.kind {
+        StepKind::Gate => Some(match latest_row(rows, &step.id, None) {
+            Some(row) => format!("last outcome: {}", row.outcome),
+            None => "not run yet".to_owned(),
+        }),
+        StepKind::Question => {
+            if question_open(step, None, questions) {
+                Some("open question".to_owned())
+            } else {
+                latest_row(rows, &step.id, None).map(|row| format!("answered · {}", row.at))
+            }
+        }
+        _ => latest_row(rows, &step.id, None).map(|row| format!("last outcome: {}", row.outcome)),
+    }
+}
+
+/// The task strip's levels: a task's level is one past its deepest blocker.
+/// Level 0 tasks have no blockers and may run together.
+pub fn task_levels(tasks: &[TaskRow]) -> Vec<Vec<u32>> {
+    let by_number: BTreeMap<u32, &TaskRow> = tasks.iter().map(|task| (task.number, task)).collect();
+    let mut memo: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut levels: Vec<Vec<u32>> = Vec::new();
+    for task in tasks {
+        let level = task_level(task.number, &by_number, &mut memo, &mut BTreeSet::new()) as usize;
+        while levels.len() <= level {
+            levels.push(Vec::new());
+        }
+        levels[level].push(task.number);
+    }
+    levels
+}
+
+/// One task's level, memoized. A blocker that does not exist still costs a
+/// level; a cycle (which the issue reader rejects) stops at the revisit.
+fn task_level(
+    number: u32,
+    by_number: &BTreeMap<u32, &TaskRow>,
+    memo: &mut BTreeMap<u32, u32>,
+    visiting: &mut BTreeSet<u32>,
+) -> u32 {
+    if let Some(level) = memo.get(&number) {
+        return *level;
+    }
+    if !visiting.insert(number) {
+        return 0;
+    }
+    let level = by_number
+        .get(&number)
+        .map(|task| {
+            task.blocked_by
+                .iter()
+                .map(|blocker| {
+                    if by_number.contains_key(blocker) {
+                        task_level(*blocker, by_number, memo, visiting) + 1
+                    } else {
+                        1
+                    }
+                })
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    visiting.remove(&number);
+    memo.insert(number, level);
+    level
+}
+
+/// `run.md`'s rows grouped by step and task, oldest first. A group keeps the
+/// position of its first row, and its rows keep the log's order.
+pub fn group_log(rows: &[RunRow]) -> Vec<LogGroup> {
+    let mut groups: Vec<LogGroup> = Vec::new();
+    for row in rows {
+        match groups
+            .iter_mut()
+            .find(|group| group.step == row.step && group.task == row.task)
+        {
+            Some(group) => group.rows.push(row.clone()),
+            None => groups.push(LogGroup {
+                step: row.step.clone(),
+                task: row.task.clone(),
+                rows: vec![row.clone()],
+            }),
+        }
+    }
+    groups
+}
+
+/// The newest `count` rows, still oldest first — the detail pane's short log.
+pub fn recent_rows(rows: &[RunRow], count: usize) -> &[RunRow] {
+    let start = rows.len().saturating_sub(count);
+    &rows[start..]
+}
+
+/// Write an answer back into a question file: `answer:` set, `state: answered`,
+/// through core's atomic document write. Nothing else is touched — the engine
+/// owns every other transition.
+pub fn answer_question(question: &Question, answer: &str) -> Result<(), String> {
+    let mut document = Document::read(&question.path).map_err(|error| error.to_string())?;
+    document.front.set("answer", answer);
+    document.front.set("state", "answered");
+    document
+        .write_atomic(&question.path)
+        .map_err(|error| error.to_string())
 }
 
 fn synthesize_tasks(tasks: &[Task]) -> String {
@@ -656,5 +1208,144 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].step, "analyze");
         assert_eq!(rows[0].outcome, "done");
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("warpflow-store-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn task(number: u32, blocked_by: &[u32]) -> TaskRow {
+        TaskRow {
+            number,
+            title: format!("Task {number:02}"),
+            status: Status::ReadyForAgent,
+            blocked_by: blocked_by.to_vec(),
+        }
+    }
+
+    fn row(step: &str, task: &str, attempt: u32, outcome: &str) -> RunRow {
+        RunRow {
+            step: step.to_owned(),
+            task: task.to_owned(),
+            attempt: attempt.to_string(),
+            outcome: outcome.to_owned(),
+            at: format!("2026-11-21 12:{attempt:02}"),
+        }
+    }
+
+    #[test]
+    fn a_workflow_reads_and_topologically_orders_its_steps() {
+        let dir = scratch_dir("workflow");
+        fs::write(
+            dir.join("workflow.toml"),
+            r#"
+schema = 1
+name = "implement"
+revision = 2
+
+[[step]]
+id = "review"
+kind = "gate"
+gate = "test"
+depends_on = ["code"]
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+per_task = true
+depends_on = ["analyze"]
+
+[[step]]
+id = "analyze"
+kind = "harness"
+skill = "analyze"
+produces = "spec.md"
+"#,
+        )
+        .expect("workflow.toml");
+
+        let mut note = None;
+        let workflow = read_workflow(&dir, &mut note).expect("the workflow reads");
+        assert_eq!(note, None);
+        assert_eq!(workflow.name, "implement");
+        let ids: Vec<&str> = topological_steps(&workflow)
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect();
+        assert_eq!(ids, ["analyze", "code", "review"]);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_missing_workflow_is_one_note_not_a_failure() {
+        let dir = scratch_dir("no-workflow");
+        let mut note = None;
+        let workflow = read_workflow(&dir, &mut note);
+        assert!(workflow.is_none());
+        assert!(
+            note.as_deref().is_some_and(|note| note.contains("missing")),
+            "{note:?}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn task_levels_follow_the_deepest_blocker() {
+        let tasks = vec![task(1, &[]), task(2, &[]), task(3, &[2]), task(4, &[3])];
+        assert_eq!(task_levels(&tasks), vec![vec![1, 2], vec![3], vec![4]]);
+
+        // A task with two blockers sits past the deeper one.
+        let diamond = vec![task(1, &[]), task(2, &[1]), task(3, &[1]), task(4, &[2, 3])];
+        assert_eq!(task_levels(&diamond), vec![vec![1], vec![2, 3], vec![4]]);
+    }
+
+    #[test]
+    fn log_groups_keep_oldest_first_inside_each_step_and_task() {
+        let rows = vec![
+            row("analyze", "-", 1, "done"),
+            row("code", "01", 1, "done"),
+            row("code", "02", 1, "running"),
+            row("code", "01", 2, "failed"),
+            row("analyze", "-", 2, "done"),
+        ];
+        let groups = group_log(&rows);
+        let keys: Vec<(&str, &str)> = groups
+            .iter()
+            .map(|group| (group.step.as_str(), group.task.as_str()))
+            .collect();
+        assert_eq!(keys, [("analyze", "-"), ("code", "01"), ("code", "02")]);
+        assert_eq!(
+            groups[0]
+                .rows
+                .iter()
+                .map(|row| row.attempt.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "2"]
+        );
+        assert_eq!(
+            groups[1]
+                .rows
+                .iter()
+                .map(|row| row.outcome.as_str())
+                .collect::<Vec<_>>(),
+            ["done", "failed"]
+        );
+    }
+
+    #[test]
+    fn the_detail_pane_keeps_the_newest_rows() {
+        let rows: Vec<RunRow> = (0..12)
+            .map(|attempt| row("code", "-", attempt, "done"))
+            .collect();
+        let recent = recent_rows(&rows, MAX_LOG_ROWS);
+        assert_eq!(recent.len(), MAX_LOG_ROWS);
+        assert_eq!(recent.first().map(|row| row.attempt.as_str()), Some("4"));
+        assert_eq!(recent.last().map(|row| row.attempt.as_str()), Some("11"));
     }
 }

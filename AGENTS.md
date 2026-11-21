@@ -13,8 +13,9 @@ repository is linked under `apps/`). This file adds only the app-specific facts.
 - `src/bin/warp-flow-cli.rs` — the headless driver (`run`, `status`, `answer`).
   It is the only way to start a run until the app's run screen hosts the
   engine, so keep it building and keep its argument tests.
-- `src/ui/` — the shell: repository rail, kanban board and run detail. The
-  run screen with the DAG is S3b.
+- `src/ui/` — the shell: repository rail, kanban board, run detail and the run
+  screen (`run.rs`: workflow step bands, task dependency strip, open question
+  and attempt history).
 - `app.toml`, `version.toml`, `rust-toolchain.toml`, `scripts/version.py` and
   `.githooks/pre-commit` follow the family's rules; do not hand-edit a version.
 
