@@ -39,7 +39,7 @@ A run has six screens, listed under the rail's `THIS RUN`:
 
 | Screen | What it is |
 | --- | --- |
-| Run | the workflow, the task strip, the question, the engine's log |
+| Run | the workflow, the task strip, the question, the engine's log, and the harness sessions each step recorded |
 | Artifacts | the issue folder's documents, edited in place and saved atomically |
 | Task & diff | one task's file and the diff its branch carries against `main` |
 | Workflow | the graph as rows, saved as a new revision the engine reads at its next step boundary |
