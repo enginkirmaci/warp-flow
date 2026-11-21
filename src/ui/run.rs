@@ -6,6 +6,8 @@
 //! for a `per_task` step. The states come from `run.md`'s log and the task
 //! files, through the scan, never from the filesystem during a frame.
 
+use std::path::{Path, PathBuf};
+
 use gpui::prelude::*;
 use gpui::{
     AnyElement, Context, Entity, FontWeight, KeyDownEvent, SharedString, Window, div, px, relative,
@@ -13,9 +15,11 @@ use gpui::{
 use warp_flow_core::artifact::Status;
 use warp_flow_core::graph::StepKind;
 use warpui_kit_core::controls::{self, BtnKind};
-use warpui_kit_core::{A11y, icon};
+use warpui_kit_core::tooltip::tooltip_text;
+use warpui_kit_core::{A11y, icon, motion};
 use warpui_kit_markdown::LiveEditorState;
 
+use crate::host::{AnswerOutcome, Phase};
 use crate::store::{
     self, LaneView, Question, Run, RunKey, StepState, StepView, TaskRow, outcome_state,
 };
@@ -37,9 +41,13 @@ impl FlowApp {
         self.selected_run = Some(key.clone());
         self.run_screen = Some(key);
         self.run_scroll = gpui::ScrollHandle::new();
+        self.run_log_scroll = gpui::ScrollHandle::new();
         self.run_question = None;
         self.run_multi.clear();
         self.run_answer_error = None;
+        self.run_action_error = None;
+        self.run_abandon_confirm = None;
+        self.run_issue = None;
         self.answer_field
             .update(cx, |state, cx| state.set_value("", window, cx));
         window.focus(&self.run_focus, cx);
@@ -52,6 +60,9 @@ impl FlowApp {
         self.run_question = None;
         self.run_multi.clear();
         self.run_answer_error = None;
+        self.run_action_error = None;
+        self.run_abandon_confirm = None;
+        self.run_issue = None;
         window.focus(&self.board_focus, cx);
         cx.notify();
     }
@@ -85,8 +96,21 @@ impl FlowApp {
             cx.notify();
             return;
         }
-        match store::answer_question(&question, &answer) {
-            Ok(()) => {
+        let Some(issue) = self.run_issue.clone() else {
+            self.run_answer_error =
+                Some("The run screen lost its issue folder; reopen the run.".to_owned());
+            cx.notify();
+            return;
+        };
+        // The host owns the one file the app writes, so the run screen and the
+        // door (S4b) share a writer and the engine owns every other transition.
+        // A run this window was driving to its question continues on the same
+        // click: the answer is what the engine waited for, and asking for a
+        // second press would be one act behind two buttons.
+        match self.host.answer(&issue, &question.path, &answer) {
+            Ok(AnswerOutcome::Resumed | AnswerOutcome::Recorded) => {
+                // Either way the file is written; the phase and the log say the
+                // rest, so the click needs no toast of its own.
                 self.run_answer_error = None;
                 self.run_multi.clear();
                 self.answer_field
@@ -98,6 +122,46 @@ impl FlowApp {
                 cx.notify();
             }
         }
+    }
+
+    // ---- driving the run -------------------------------------------------
+
+    /// Start a fresh run for the open screen's issue.
+    fn start_run(&mut self, issue: PathBuf, cx: &mut Context<Self>) {
+        match self.host.start(&issue) {
+            Ok(()) => self.run_action_error = None,
+            Err(error) => self.run_action_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// Ask the host to pause the open run at its next step boundary.
+    fn pause_run(&mut self, issue: PathBuf, cx: &mut Context<Self>) {
+        match self.host.pause(&issue) {
+            Ok(()) => self.run_action_error = None,
+            Err(error) => self.run_action_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// Continue the open run from its record, or take over a run another
+    /// process is driving: the same takeover `warp-flow-cli run` does.
+    fn resume_run(&mut self, issue: PathBuf, cx: &mut Context<Self>) {
+        match self.host.resume(&issue) {
+            Ok(()) => self.run_action_error = None,
+            Err(error) => self.run_action_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// Abandon the open run at its next step boundary, after the confirmation.
+    fn abandon_run(&mut self, issue: PathBuf, cx: &mut Context<Self>) {
+        self.run_abandon_confirm = None;
+        match self.host.abandon(&issue) {
+            Ok(()) => self.run_action_error = None,
+            Err(error) => self.run_action_error = Some(error),
+        }
+        cx.notify();
     }
 
     /// Tick or untick one `multi` choice.
@@ -117,6 +181,10 @@ impl FlowApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // The host keys its runs by the issue folder; every action below uses
+        // this one, which the scan resolved before the frame.
+        self.run_issue = Some(run.dir.clone());
+        let live_log = self.render_live_log(&run);
         let question = run.question.clone();
         let question_doc = question.as_ref().and_then(|question| {
             // Only the body is the editor's source; the path is not content.
@@ -145,6 +213,12 @@ impl FlowApp {
             }))
             .p(px(theme::scaled(theme::RUN_PADDING)));
 
+        if let Some(error) = &self.run_action_error {
+            body = body.child(action_error_line(error));
+        }
+        if let Some(log) = live_log {
+            body = body.child(log);
+        }
         if let Some(note) = &run.workflow_note {
             body = body.child(workflow_note(note));
         }
@@ -244,8 +318,283 @@ impl FlowApp {
                             .child(attempt_word(run.attempts)),
                     ),
             )
-            .child(status_pill(run))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .gap(px(8.))
+                    .child(status_pill(run))
+                    .child(self.render_run_actions(run, cx)),
+            )
             .into_any_element()
+    }
+
+    // ---- the head's action row ---------------------------------------------
+
+    /// The run's head actions, derived from the host's phase first and its
+    /// record second, because a run that is being driven is the host's to say.
+    ///
+    /// Terminal runs keep their buttons and disable them with the reason in the
+    /// tooltip; a start that is in flight shows the pause action instead.
+    fn render_run_actions(&self, run: &Run, cx: &mut Context<Self>) -> AnyElement {
+        let host_run = self.host_snapshot.run(&run.dir);
+        let phase = host_run.map(|host_run| host_run.phase);
+        let driving = phase.is_some_and(Phase::is_driving);
+        let terminal =
+            matches!(run.status.as_str(), "done" | "merged") || phase == Some(Phase::Done);
+        let has_record = run.has_run
+            || host_run
+                .and_then(|host_run| host_run.status.as_deref())
+                .is_some();
+        let question_open = run.question.is_some();
+        let record_status = host_run
+            .and_then(|host_run| host_run.status.clone())
+            .unwrap_or_else(|| run.status.clone());
+        let issue = run.dir.clone();
+
+        let mut row = div()
+            .id("flow-run-actions")
+            .debug_selector(|| "flow-run-actions".into())
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_end()
+            .gap(px(6.));
+
+        if driving {
+            // A start that is in flight disables both actions, with the reason
+            // in each tooltip; once the engine reports, they are live again.
+            let starting = phase == Some(Phase::Starting);
+            let (pause_enabled, pause_reason) = match phase {
+                Some(Phase::Pausing) => {
+                    (false, Some("The run is pausing at the next step boundary."))
+                }
+                Some(Phase::Starting) => (false, Some("The engine is starting.")),
+                _ => (true, None),
+            };
+            let pause_issue = issue.clone();
+            row = row.child(action_button(
+                "flow-run-pause",
+                "Pause",
+                pause_enabled,
+                pause_reason,
+                cx.listener(move |this, _, _, cx| this.pause_run(pause_issue.clone(), cx)),
+            ));
+            if self.run_abandon_confirm.as_ref() == Some(&run.key) {
+                row = row.child(self.render_abandon_confirm(&issue, cx));
+            } else {
+                let key = run.key.clone();
+                row = row.child(action_button(
+                    "flow-run-abandon",
+                    "Abandon",
+                    !starting,
+                    starting.then_some("The engine is starting."),
+                    cx.listener(move |this, _, _, cx| {
+                        this.run_abandon_confirm = Some(key.clone());
+                        cx.notify();
+                    }),
+                ));
+            }
+        } else if phase == Some(Phase::Paused) {
+            let resume_issue = issue.clone();
+            row = row.child(action_button(
+                "flow-run-resume",
+                "Resume",
+                true,
+                Some("Continue the paused run from its record."),
+                cx.listener(move |this, _, _, cx| this.resume_run(resume_issue.clone(), cx)),
+            ));
+        } else if phase == Some(Phase::Waiting) && question_open {
+            row = row.child(action_button(
+                "flow-run-resume",
+                "Resume",
+                false,
+                Some("Answer the open question first."),
+                nothing,
+            ));
+        } else if phase == Some(Phase::Waiting) || (phase.is_none() && record_status == "waiting") {
+            let resume_issue = issue.clone();
+            row = row.child(action_button(
+                "flow-run-resume",
+                "Resume",
+                !question_open,
+                question_open
+                    .then_some("Answer the open question first.")
+                    .or(Some("The question is answered; continue the run.")),
+                cx.listener(move |this, _, _, cx| this.resume_run(resume_issue.clone(), cx)),
+            ));
+        } else if phase == Some(Phase::Failed) && has_record {
+            let resume_issue = issue.clone();
+            row = row.child(action_button(
+                "flow-run-resume",
+                "Resume",
+                true,
+                Some("The engine stopped; resume to try again."),
+                cx.listener(move |this, _, _, cx| this.resume_run(resume_issue.clone(), cx)),
+            ));
+        } else if terminal {
+            row = row.child(action_button(
+                "flow-run-start",
+                "Start",
+                false,
+                Some("This run is done; there is nothing to start."),
+                nothing,
+            ));
+        } else if has_record && (record_status == "running" || record_status == "paused") {
+            // The takeover decision 17 describes: somebody else's run, or a
+            // paused one this window restarted under, is resumed by hand.
+            let reason = if record_status == "running" {
+                "Not driven by this window; Resume takes it over."
+            } else {
+                "Not driven by this window; Resume continues the paused run."
+            };
+            let resume_issue = issue.clone();
+            row = row.child(action_button(
+                "flow-run-resume",
+                "Resume",
+                true,
+                Some(reason),
+                cx.listener(move |this, _, _, cx| this.resume_run(resume_issue.clone(), cx)),
+            ));
+        } else if has_record && record_status == "blocked" {
+            let resume_issue = issue.clone();
+            row = row.child(action_button(
+                "flow-run-resume",
+                "Resume",
+                true,
+                Some("Continue the run from its record."),
+                cx.listener(move |this, _, _, cx| this.resume_run(resume_issue.clone(), cx)),
+            ));
+        } else {
+            let start_issue = issue.clone();
+            row = row.child(action_button(
+                "flow-run-start",
+                "Start",
+                true,
+                None,
+                cx.listener(move |this, _, _, cx| this.start_run(start_issue.clone(), cx)),
+            ));
+        }
+        row.into_any_element()
+    }
+
+    /// The one-step Abandon confirmation: a small inline row, no scrim.
+    fn render_abandon_confirm(&self, issue: &Path, cx: &mut Context<Self>) -> AnyElement {
+        let yes_issue = issue.to_path_buf();
+        div()
+            .id("flow-run-abandon-confirm")
+            .debug_selector(|| "flow-run-abandon-confirm".into())
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .child(
+                div()
+                    .text_size(px(theme::font_micro()))
+                    .text_color(theme::DANGER)
+                    .child("Abandon?"),
+            )
+            .child(action_button(
+                "flow-run-abandon-yes",
+                "Yes",
+                true,
+                None,
+                cx.listener(move |this, _, _, cx| {
+                    this.abandon_run(yes_issue.clone(), cx);
+                }),
+            ))
+            .child(action_button(
+                "flow-run-abandon-no",
+                "No",
+                true,
+                None,
+                cx.listener(|this, _, _, cx| {
+                    this.run_abandon_confirm = None;
+                    cx.notify();
+                }),
+            ))
+            .into_any_element()
+    }
+
+    // ---- the live engine log -----------------------------------------------
+
+    /// The engine's own log while this window has the run, newest last, with
+    /// the phase in a word so the motion is never the only signal.
+    fn render_live_log(&self, run: &Run) -> Option<AnyElement> {
+        let host_run = self.host_snapshot.run(&run.dir)?;
+        let phase = host_run.phase;
+        let color = phase_color(phase);
+        let mut head = div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(
+                div()
+                    .text_size(px(theme::font_row_meta()))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::text())
+                    .child("Engine log"),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .debug_selector(|| "flow-run-engine-phase".into())
+                    .font_family(theme::code_font())
+                    .text_size(px(theme::font_micro()))
+                    .text_color(color)
+                    .child(phase_word(phase)),
+            );
+        // One motion signal on this surface: the engine log's head carries the
+        // spinner, and only while the engine is moving.
+        if phase_moves(phase) {
+            head = head.child(motion::spinner(
+                "flow-run-engine-spinner",
+                "icons/icon-spinner.svg",
+                px(theme::icon_tiny()),
+                color,
+            ));
+        }
+
+        let mut lines = div()
+            .id("flow-run-engine-log-scroll")
+            .flex()
+            .flex_col()
+            .max_h(px(170.))
+            .overflow_y_scroll()
+            .track_scroll(&self.run_log_scroll);
+        if host_run.log.is_empty() {
+            lines = lines.child(quiet_line("The engine has not written a line yet."));
+        }
+        for (index, line) in host_run.log.iter().enumerate() {
+            let selector = format!("flow-run-engine-line-{index}");
+            lines = lines.child(
+                div()
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector.clone())
+                    .whitespace_nowrap()
+                    .font_family(theme::code_font())
+                    .text_size(px(theme::font_micro()))
+                    .text_color(theme::text_dim())
+                    .child(line.clone()),
+            );
+        }
+
+        Some(
+            div()
+                .id("flow-run-engine-log")
+                .debug_selector(|| "flow-run-engine-log".into())
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(theme::hairline())
+                .bg(theme::panel())
+                .p(px(12.))
+                .child(head)
+                .child(lines)
+                .into_any_element(),
+        )
     }
 
     // ---- the workflow graph, as step bands ---------------------------------
@@ -956,6 +1305,93 @@ fn probed(id: &'static str, element: AnyElement) -> AnyElement {
     div()
         .debug_selector(move || id.into())
         .child(element)
+        .into_any_element()
+}
+
+/// One head action: a quiet kit button under its own debug selector, with the
+/// reason a disabled button is disabled in its tooltip.
+fn action_button(
+    id: &'static str,
+    label: &str,
+    enabled: bool,
+    reason: Option<&str>,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    // A stateful wrapper is what carries a tooltip in this gpui rev; the kit
+    // button keeps the click, the wrapper names the control and its reason.
+    let mut wrapper = div()
+        .id(SharedString::from(id))
+        .debug_selector(move || id.into());
+    if let Some(reason) = reason {
+        wrapper = wrapper.tooltip(tooltip_text(reason.to_owned()));
+    }
+    wrapper
+        .child(controls::button(
+            format!("{id}-button"),
+            label.to_owned(),
+            BtnKind::Chip,
+            theme::accent(),
+            theme::font_control(),
+            enabled,
+            on_click,
+        ))
+        .into_any_element()
+}
+
+/// The action a disabled button never runs: the kit keeps the handler wired,
+/// so the caller's guard is this no-op.
+fn nothing(_: &gpui::ClickEvent, _: &mut Window, _: &mut gpui::App) {}
+
+/// The phase in one word, with an ellipsis where the engine is moving.
+fn phase_word(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Starting => "Starting…",
+        Phase::Running => "Running",
+        Phase::Pausing => "Pausing…",
+        Phase::Paused => "Paused",
+        Phase::Waiting => "Waiting on you",
+        Phase::Finishing => "Finishing…",
+        Phase::Done => "Done",
+        Phase::Blocked => "Blocked",
+        Phase::Abandoned => "Abandoned",
+        Phase::Failed => "Failed",
+    }
+}
+
+/// Whether the phase is a moving one, which is where the log head's spinner
+/// shows. A paused or waiting run is still, and reduced motion keeps the word.
+fn phase_moves(phase: Phase) -> bool {
+    matches!(
+        phase,
+        Phase::Starting | Phase::Running | Phase::Pausing | Phase::Finishing
+    )
+}
+
+/// The phase's colour, from the run screen's own state palette.
+fn phase_color(phase: Phase) -> gpui::Rgba {
+    match phase {
+        Phase::Starting | Phase::Running | Phase::Pausing => theme::accent_ink(),
+        Phase::Paused => theme::accent_ink(),
+        Phase::Waiting => theme::WARN,
+        Phase::Finishing => theme::text_muted(),
+        Phase::Done => theme::ADD,
+        Phase::Blocked | Phase::Abandoned | Phase::Failed => theme::DANGER,
+    }
+}
+
+/// One readable line for a start, resume, pause or abandon the host refused.
+fn action_error_line(error: &str) -> AnyElement {
+    div()
+        .id("flow-run-action-error-line")
+        .debug_selector(|| "flow-run-action-error".into())
+        .rounded(px(6.))
+        .bg(theme::tint(theme::DANGER))
+        .px(px(10.))
+        .py(px(8.))
+        .font_family(theme::code_font())
+        .text_size(px(theme::font_micro()))
+        .text_color(theme::DANGER)
+        .child(error.to_owned())
         .into_any_element()
 }
 

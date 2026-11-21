@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::artifact::{Document, FrontMatter, Issue, Status, Task};
+use crate::control::{Control, KeepGoing, Signal};
 use crate::gate::{Gate, GateOutcome};
 use crate::graph::{Step, StepKind, Workflow};
 use crate::harness::{Harness, StepOutcome, StepRequest};
@@ -91,6 +92,10 @@ pub enum RunStatus {
     Running,
     /// The run is paused on an open question.
     Waiting,
+    /// The run stopped at a step boundary because a person asked it to pause.
+    Paused,
+    /// The run stopped at a step boundary because a person abandoned it.
+    Abandoned,
     /// The run cannot continue; a repair budget ran out or no step can advance.
     Blocked,
     /// Every step finished.
@@ -103,6 +108,8 @@ impl RunStatus {
         match self {
             Self::Running => "running",
             Self::Waiting => "waiting",
+            Self::Paused => "paused",
+            Self::Abandoned => "abandoned",
             Self::Blocked => "blocked",
             Self::Done => "done",
         }
@@ -137,6 +144,11 @@ pub struct RunnerConfig<H> {
     pub repo: Option<Repo>,
     /// Whether the merge queue may push `main` after it merges.
     pub push: bool,
+    /// What tells the engine to pause or abandon at a step boundary.
+    ///
+    /// [`RunnerConfig::new`] installs [`KeepGoing`], so a caller that does not
+    /// care about control behaves exactly as it did before the seam existed.
+    pub control: Box<dyn Control>,
     /// The gates in `flow.toml`'s declaration order, for the merge queue.
     ///
     /// Empty means [`RunnerConfig::gates`]' own (name-sorted) order, which is
@@ -160,6 +172,7 @@ impl<H> RunnerConfig<H> {
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             repo: None,
             push: false,
+            control: Box::new(KeepGoing),
             merge_gates: Vec::new(),
             log: Box::new(NullLog),
         }
@@ -176,6 +189,7 @@ pub struct Runner<H> {
     workdir: PathBuf,
     repo: Option<Repo>,
     push: bool,
+    control: Box<dyn Control>,
     merge_gates: Vec<Gate>,
     log: Box<dyn LogSink>,
     status: RunStatus,
@@ -209,6 +223,7 @@ impl<H: Harness> Runner<H> {
             workdir,
             repo,
             push,
+            control,
             merge_gates,
             log,
         } = config;
@@ -254,6 +269,7 @@ impl<H: Harness> Runner<H> {
             workdir,
             repo,
             push,
+            control,
             merge_gates,
             log,
             status: RunStatus::Running,
@@ -324,6 +340,13 @@ impl<H: Harness> Runner<H> {
                     None
                 };
 
+                // The one control read of this boundary: before the step runs,
+                // never inside it. A pause therefore stops between two steps and
+                // leaves `run.md` saying what happened, not what was requested.
+                if let Some(status) = self.control_at_boundary(&step, task.as_ref())? {
+                    return Ok(status);
+                }
+
                 match self.run_step(&step, task.as_ref())? {
                     StepRun::Done => {}
                     StepRun::Waiting => {
@@ -379,6 +402,29 @@ impl<H: Harness> Runner<H> {
                 return Ok(RunStatus::Blocked);
             }
         }
+    }
+
+    /// Read the control seam at a step boundary.
+    ///
+    /// `None` means continue. A pause or an abandon records that status in
+    /// `run.md` and one log line naming the step that did not run, then stops
+    /// the loop. Nothing else is written: no question, no repair, no file.
+    fn control_at_boundary(
+        &mut self,
+        step: &Step,
+        task: Option<&Task>,
+    ) -> Result<Option<RunStatus>> {
+        let (status, verb) = match self.control.check() {
+            Signal::Continue => return Ok(None),
+            Signal::Pause => (RunStatus::Paused, "paused"),
+            Signal::Abandon => (RunStatus::Abandoned, "abandoned"),
+        };
+        self.status = status;
+        self.note = None;
+        self.write_run()?;
+        let line = format!("run {verb} at {}", step_label(step, task));
+        self.log_line(&line);
+        Ok(Some(status))
     }
 
     /// Reset the in-memory run and write the initial `run.md`.
@@ -1197,7 +1243,10 @@ fn require_git(output: &std::process::Output, action: &str, dir: &Path) -> Resul
 }
 
 /// An RFC 3339 UTC timestamp with second precision, with no date dependency.
-fn timestamp(now: SystemTime) -> String {
+///
+/// The app's host records when a run started and finished with it, so the app
+/// and `run.md` speak the same timestamp dialect.
+pub fn timestamp(now: SystemTime) -> String {
     let seconds = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let days = seconds.div_euclid(86_400);
     let seconds_of_day = seconds.rem_euclid(86_400);
@@ -1974,6 +2023,211 @@ kind = "question"
         assert!(
             !issue.join("questions/02.md").exists(),
             "no second question"
+        );
+    }
+
+    /// A control that hands out scripted signals, then keeps going.
+    struct ScriptedControl {
+        signals: std::collections::VecDeque<Signal>,
+    }
+
+    impl ScriptedControl {
+        fn new(signals: impl IntoIterator<Item = Signal>) -> Self {
+            Self {
+                signals: signals.into_iter().collect(),
+            }
+        }
+    }
+
+    impl Control for ScriptedControl {
+        fn check(&mut self) -> Signal {
+            self.signals.pop_front().unwrap_or(Signal::Continue)
+        }
+    }
+
+    /// Two sequential gate steps that both pass, so a run that is not
+    /// interrupted finishes.
+    const TWO_GATES: &str = r#"
+schema = 1
+name = "implement"
+revision = 1
+
+[[step]]
+id = "first"
+kind = "gate"
+gate = "check"
+
+[[step]]
+id = "second"
+kind = "gate"
+gate = "check"
+depends_on = ["first"]
+"#;
+
+    /// A runner over [`TWO_GATES`] with the control set to `control`.
+    fn two_gate_runner(issue: &Path, control: Box<dyn Control>) -> Runner<FakeHarness> {
+        let workflow = workflow(TWO_GATES);
+        let mut config = RunnerConfig::new(issue, workflow, FakeHarness::new());
+        config.gates.insert(
+            "check".to_owned(),
+            Gate {
+                name: "check".to_owned(),
+                command: "true".to_owned(),
+                cwd: PathBuf::from("."),
+                timeout: Duration::from_secs(5),
+            },
+        );
+        config.control = control;
+        config.log = Box::new(MemoryLog::new());
+        Runner::new(config).expect("runner")
+    }
+
+    #[test]
+    fn a_pause_stops_before_the_next_step_and_is_recorded() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let mut runner = two_gate_runner(
+            &issue,
+            Box::new(ScriptedControl::new([Signal::Continue, Signal::Pause])),
+        );
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Paused);
+        assert_eq!(runner.status(), RunStatus::Paused);
+
+        let document = run_md(&issue);
+        assert_eq!(document.front.get("status"), Some("paused"));
+        assert!(
+            document.body.contains("| first | - | 1 | passed |"),
+            "the step before the boundary ran: {}",
+            document.body
+        );
+        assert!(
+            !document.body.contains("| second |"),
+            "the step after the boundary did not run: {}",
+            document.body
+        );
+        assert!(
+            !document.body.contains("Run stopped:"),
+            "a pause is a status, not a stop note: {}",
+            document.body
+        );
+        let log = runner.harness().calls();
+        assert!(log.is_empty(), "gate steps open no harness session");
+        assert!(
+            !issue.join("questions").exists() && !issue.join("repairs").exists(),
+            "a pause writes nothing but the status"
+        );
+    }
+
+    #[test]
+    fn a_pause_logs_the_step_it_stopped_before() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let workflow = workflow(TWO_GATES);
+        let mut config = RunnerConfig::new(&issue, workflow, FakeHarness::new());
+        config.gates.insert(
+            "check".to_owned(),
+            Gate {
+                name: "check".to_owned(),
+                command: "true".to_owned(),
+                cwd: PathBuf::from("."),
+                timeout: Duration::from_secs(5),
+            },
+        );
+        config.control = Box::new(ScriptedControl::new([Signal::Continue, Signal::Pause]));
+        let log = MemoryLog::new();
+        config.log = Box::new(log.clone());
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Paused);
+        assert!(
+            log.lines()
+                .iter()
+                .any(|line| line == "run paused at second"),
+            "{:?}",
+            log.lines()
+        );
+    }
+
+    #[test]
+    fn an_abandon_stops_the_run_and_is_recorded() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let log = MemoryLog::new();
+        let workflow = workflow(TWO_GATES);
+        let mut config = RunnerConfig::new(&issue, workflow, FakeHarness::new());
+        config.gates.insert(
+            "check".to_owned(),
+            Gate {
+                name: "check".to_owned(),
+                command: "true".to_owned(),
+                cwd: PathBuf::from("."),
+                timeout: Duration::from_secs(5),
+            },
+        );
+        config.control = Box::new(ScriptedControl::new([Signal::Abandon]));
+        config.log = Box::new(log.clone());
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Abandoned);
+        assert_eq!(runner.status(), RunStatus::Abandoned);
+
+        let document = run_md(&issue);
+        assert_eq!(document.front.get("status"), Some("abandoned"));
+        assert!(
+            !document.body.contains("| first |") && !document.body.contains("| second |"),
+            "no step ran: {}",
+            document.body
+        );
+        assert!(
+            !issue.join("questions").exists() && !issue.join("repairs").exists(),
+            "an abandon writes nothing but the status"
+        );
+        assert!(
+            log.lines()
+                .iter()
+                .any(|line| line == "run abandoned at first"),
+            "{:?}",
+            log.lines()
+        );
+    }
+
+    #[test]
+    fn a_paused_run_resumes_like_one_waiting_on_a_question() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let mut runner = two_gate_runner(
+            &issue,
+            Box::new(ScriptedControl::new([Signal::Continue, Signal::Pause])),
+        );
+        let started = runner.started.clone();
+        assert_eq!(runner.run().expect("run"), RunStatus::Paused);
+
+        let mut resumed = two_gate_runner(&issue, Box::new(KeepGoing));
+        assert_eq!(resumed.run().expect("resumed run"), RunStatus::Done);
+
+        let document = run_md(&issue);
+        assert_eq!(document.front.get("status"), Some("done"));
+        assert_eq!(
+            document.front.get("started"),
+            Some(started.as_str()),
+            "the original start time survives the resume"
+        );
+        assert_eq!(
+            document.body.matches("| first | - |").count(),
+            1,
+            "the step before the pause was not run again: {}",
+            document.body
+        );
+        assert!(
+            document.body.contains("| second | - | 1 | passed |"),
+            "{}",
+            document.body
+        );
+        assert_eq!(
+            resumed.harness().calls().len(),
+            0,
+            "gate steps open no harness session"
         );
     }
 }

@@ -18,11 +18,13 @@
 
 pub mod artifact;
 pub mod config;
+pub mod control;
 pub mod door;
 pub mod gate;
 pub mod graph;
 pub mod harness;
 pub mod merge;
+pub mod prepare;
 pub mod run;
 pub mod worktree;
 
@@ -33,9 +35,11 @@ use std::path::Path;
 
 pub use artifact::{Document, FrontMatter, Issue, Status, Task};
 pub use config::{FlowConfig, MergeMode};
+pub use control::{Control, KeepGoing, SharedControl, Signal};
 pub use gate::{Gate, GateOutcome};
 pub use graph::{Step, StepKind, Workflow};
 pub use harness::{FakeHarness, Harness, Scripted, StepOutcome, StepRequest};
+pub use prepare::{Prepared, prepare};
 pub use run::{LogSink, MemoryLog, NullLog, RunStatus, Runner, RunnerConfig};
 
 /// The engine version, for the CLI and for `run.md`.

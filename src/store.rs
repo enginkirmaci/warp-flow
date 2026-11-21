@@ -136,8 +136,10 @@ impl Column {
             "needs-triage" | "needs-info" => Self::Triage,
             "ready-for-agent" | "ready-for-human" => Self::Ready,
             "running" => Self::Running,
-            "waiting" => Self::Waiting,
-            "blocked" | "wontfix" => Self::Blocked,
+            // A paused run is a person's to resume, which is what the Waiting
+            // column means; the run screen says the phase in a word.
+            "waiting" | "paused" => Self::Waiting,
+            "blocked" | "abandoned" | "wontfix" => Self::Blocked,
             "done" | "merged" => Self::Merged,
             _ => Self::Triage,
         }
@@ -267,6 +269,12 @@ pub struct Question {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Run {
     pub key: RunKey,
+    /// The issue folder, canonical so it compares with the host's snapshot
+    /// without a filesystem call in a frame.
+    pub dir: PathBuf,
+    /// Whether `run.md` exists, which tells a run that can only be resumed
+    /// from one that has never started.
+    pub has_run: bool,
     pub title: String,
     /// The raw status string, straight from `run.md` or `spec.md`.
     pub status: String,
@@ -429,6 +437,7 @@ fn is_issue_folder(dir: &Path) -> bool {
 }
 
 fn scan_run(dir: &Path, repo_path: &Path, repo_note: Option<&str>) -> Run {
+    let dir = &canonical_dir(dir);
     let id = folder_name(dir);
     // The repository's note (not a git checkout, an unreadable `.scratch/`) is
     // context for every run; an artifact problem belongs to this folder only.
@@ -492,6 +501,8 @@ fn scan_run(dir: &Path, repo_path: &Path, repo_note: Option<&str>) -> Run {
             repo: repo_path.to_path_buf(),
             id,
         },
+        dir: dir.to_path_buf(),
+        has_run: dir.join("run.md").is_file(),
         title,
         column: Column::from_status(&status, question.is_some()),
         status,
@@ -1065,18 +1076,6 @@ pub fn recent_rows(rows: &[RunRow], count: usize) -> &[RunRow] {
     &rows[start..]
 }
 
-/// Write an answer back into a question file: `answer:` set, `state: answered`,
-/// through core's atomic document write. Nothing else is touched — the engine
-/// owns every other transition.
-pub fn answer_question(question: &Question, answer: &str) -> Result<(), String> {
-    let mut document = Document::read(&question.path).map_err(|error| error.to_string())?;
-    document.front.set("answer", answer);
-    document.front.set("state", "answered");
-    document
-        .write_atomic(&question.path)
-        .map_err(|error| error.to_string())
-}
-
 fn synthesize_tasks(tasks: &[Task]) -> String {
     let mut markdown = String::from("# Tasks\n\n");
     if tasks.is_empty() {
@@ -1133,6 +1132,12 @@ fn folder_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// Resolve an issue folder's path once, during the scan. The run screen and the
+/// host compare this path, and neither may touch the filesystem inside a frame.
+fn canonical_dir(dir: &Path) -> PathBuf {
+    fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
 /// A path with the user's home abbreviated to `~`, as the rail shows it.
 pub fn display_path(path: &Path) -> String {
     let home = paths::home();
@@ -1155,8 +1160,18 @@ mod tests {
         assert_eq!(column("ready-for-agent"), Column::Ready);
         assert_eq!(column("ready-for-human"), Column::Ready);
         assert_eq!(column("running"), Column::Running);
+        assert_eq!(
+            column("paused"),
+            Column::Waiting,
+            "a paused run waits for the person who paused it"
+        );
         assert_eq!(column("waiting"), Column::Waiting);
         assert_eq!(column("blocked"), Column::Blocked);
+        assert_eq!(
+            column("abandoned"),
+            Column::Blocked,
+            "an abandoned run cannot continue without a person"
+        );
         assert_eq!(column("wontfix"), Column::Blocked);
         assert_eq!(column("done"), Column::Merged);
         assert_eq!(column("merged"), Column::Merged);

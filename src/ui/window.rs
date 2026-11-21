@@ -3,6 +3,7 @@
 //! arrow handler.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
@@ -15,6 +16,7 @@ use warpui_kit_core::{A11y, icon, motion, shell, tooltip::tooltip_text};
 use warpui_kit_markdown::LiveEditorState;
 
 use crate::app::Launch;
+use crate::host::{self, Host, HostSnapshot};
 use crate::store::{
     self, Column, MAX_LOG_ROWS, Question, Run, RunKey, RunRow, Snapshot, recent_rows,
 };
@@ -36,6 +38,10 @@ pub struct FlowApp {
     settings: store::Settings,
     pub(crate) snapshot: Snapshot,
     scanning: bool,
+    /// The engine host: one blocking run per repository, in memory.
+    pub(crate) host: Arc<Host>,
+    /// The host's in-memory snapshot, adopted only when it changes.
+    pub(crate) host_snapshot: HostSnapshot,
     /// `None` is the "All repos" row.
     selected_repo: Option<PathBuf>,
     /// The run whose detail pane is open.
@@ -61,6 +67,15 @@ pub struct FlowApp {
     pub(crate) run_answer_error: Option<String>,
     /// The single-line answer field a `text` (or unknown-kind) question uses.
     pub(crate) answer_field: Entity<InputState>,
+    /// Why the last start, resume, pause or abandon could not run, in the
+    /// engine's own words.
+    pub(crate) run_action_error: Option<String>,
+    /// The run whose Abandon is waiting for its one-step confirmation.
+    pub(crate) run_abandon_confirm: Option<RunKey>,
+    /// The issue folder the run screen is showing, for the host's calls.
+    pub(crate) run_issue: Option<PathBuf>,
+    /// The engine log panel's scrolling content.
+    pub(crate) run_log_scroll: ScrollHandle,
     window_title: String,
 }
 
@@ -68,6 +83,19 @@ impl FlowApp {
     /// Build the window, remember the launch's `--repo` arguments and start
     /// the background scan. The first snapshot lands after the first frame.
     pub fn new(launch: Launch, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::with_host(launch, Arc::new(Host::new()), window, cx)
+    }
+
+    /// Build the window over `host`. The app uses [`FlowApp::new`]; a headless
+    /// probe passes a host whose factory is a fake driver, so no probe reaches
+    /// warp-agent's door.
+    #[doc(hidden)]
+    pub fn with_host(
+        launch: Launch,
+        host: Arc<Host>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut settings = store::Settings::load();
         if settings.remember(&launch.repos) {
             settings.save();
@@ -83,6 +111,8 @@ impl FlowApp {
             settings,
             snapshot: Snapshot::default(),
             scanning: false,
+            host,
+            host_snapshot: HostSnapshot::default(),
             selected_repo: None,
             selected_run: None,
             cursor: None,
@@ -98,9 +128,22 @@ impl FlowApp {
             run_multi: Vec::new(),
             run_answer_error: None,
             answer_field,
+            run_action_error: None,
+            run_abandon_confirm: None,
+            run_issue: None,
+            run_log_scroll: ScrollHandle::new(),
             window_title: String::new(),
         };
         app.start_scan(cx);
+        app.start_host_poll(cx);
+        // A blocking engine on a background thread must be asked to stop when
+        // the window closes; dropping the host would leave the thread running.
+        cx.on_app_quit(|this, cx| {
+            let host = Arc::clone(&this.host);
+            cx.background_executor()
+                .spawn(async move { host.shutdown() })
+        })
+        .detach();
         app
     }
 
@@ -157,6 +200,37 @@ impl FlowApp {
         cx.notify();
     }
 
+    /// Copy the host's in-memory snapshot every [`host::POLL_INTERVAL`]. This
+    /// is a memory copy, not a scan: the filesystem stays on
+    /// [`store::POLL_INTERVAL`], and a frame never reads either.
+    fn start_host_poll(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(host::POLL_INTERVAL).await;
+                if this
+                    .update(cx, |this, cx| {
+                        let next = this.host.snapshot();
+                        this.adopt_host_snapshot(next, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Adopt a host snapshot only when it differs, the same rule the file scan
+    /// follows: an unchanged tick keeps the frame.
+    fn adopt_host_snapshot(&mut self, next: HostSnapshot, cx: &mut Context<Self>) {
+        if self.host_snapshot == next {
+            return;
+        }
+        self.host_snapshot = next;
+        cx.notify();
+    }
+
     /// Keep the filter, cursor and open run attached to things the new
     /// snapshot still holds.
     fn reconcile_selection(&mut self, cx: &mut Context<Self>) {
@@ -186,6 +260,9 @@ impl FlowApp {
             self.run_question = None;
             self.run_multi.clear();
             self.run_answer_error = None;
+            self.run_action_error = None;
+            self.run_abandon_confirm = None;
+            self.run_issue = None;
         }
     }
 
@@ -232,6 +309,9 @@ impl FlowApp {
         self.run_question = None;
         self.run_multi.clear();
         self.run_answer_error = None;
+        self.run_action_error = None;
+        self.run_abandon_confirm = None;
+        self.run_issue = None;
         self.detail_scroll = ScrollHandle::new();
         window.focus(&self.board_focus, cx);
         cx.notify();
@@ -243,14 +323,22 @@ impl FlowApp {
         self.run_question = None;
         self.run_multi.clear();
         self.run_answer_error = None;
+        self.run_action_error = None;
+        self.run_abandon_confirm = None;
+        self.run_issue = None;
         self.detail_spec = None;
         self.detail_tasks = None;
         cx.notify();
     }
 
     fn sync_window_title(&mut self, window: &mut Window) {
-        let activity = self.scanning.then_some("Scanning repositories");
-        let title = warpui_kit_core::activity::activity_title("Warp Flow", activity);
+        // One activity phrase for both the OS title and the chip: a driven run
+        // is the more telling work, and the scan is the fallback.
+        let activity = self
+            .host_snapshot
+            .driving_label()
+            .or_else(|| self.scanning.then(|| "Scanning repositories".to_owned()));
+        let title = warpui_kit_core::activity::activity_title("Warp Flow", activity.as_deref());
         if self.window_title != title {
             window.set_window_title(&title);
             self.window_title = title;
@@ -295,13 +383,18 @@ impl FlowApp {
                     .child(scope),
             )
             .child(div().flex_1());
-        if self.scanning {
+        // The same phrase the OS title carries, so the two cannot disagree.
+        let activity = self
+            .host_snapshot
+            .driving_label()
+            .or_else(|| self.scanning.then(|| "Scanning".to_owned()));
+        if let Some(activity) = activity {
             bar = bar.child(
                 div()
                     .id("flow-activity")
                     .debug_selector(|| "flow-activity".into())
                     .role(gpui::Role::Status)
-                    .aria_label("Scanning repositories")
+                    .aria_label(activity.clone())
                     .flex()
                     .items_center()
                     .gap(px(6.))
@@ -312,12 +405,12 @@ impl FlowApp {
                     .text_size(px(theme::font_meta()))
                     .text_color(theme::text_dim())
                     .child(motion::spinner(
-                        "flow-scan-spinner",
+                        "flow-activity-spinner",
                         "icons/icon-spinner.svg",
                         px(theme::icon_tiny()),
                         theme::accent_ink(),
                     ))
-                    .child("Scanning"),
+                    .child(activity),
             );
         }
         bar = bar
@@ -860,6 +953,12 @@ impl FlowApp {
     ) -> AnyElement {
         let is_open = self.selected_run.as_ref() == Some(&run.key);
         let is_cursor = cursor == Some(&run.key) && focused;
+        // A quiet mark for the one run this window is driving; the card's own
+        // look stays the run's, not the engine's.
+        let driving = self
+            .host_snapshot
+            .run(&run.dir)
+            .is_some_and(|host_run| host_run.is_driving());
         let border = if is_open || is_cursor {
             theme::accent()
         } else {
@@ -922,7 +1021,15 @@ impl FlowApp {
                     .gap(px(6.))
                     .child(status_pill(run))
                     .child(tag(run.step.clone()))
-                    .child(tag(attempt_word(run.attempts))),
+                    .child(tag(attempt_word(run.attempts)))
+                    .when(driving, |row| {
+                        let selector = format!("flow-driving-{}", run.key.id);
+                        row.child(
+                            div()
+                                .debug_selector(move || selector.clone())
+                                .child(tag("driving".to_owned())),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -1299,6 +1406,24 @@ impl FlowApp {
     pub fn run_focus_handle(&self) -> FocusHandle {
         self.run_focus.clone()
     }
+
+    /// The host snapshot the current frame renders.
+    #[doc(hidden)]
+    pub fn host_snapshot_for_probe(&self) -> &HostSnapshot {
+        &self.host_snapshot
+    }
+
+    /// The host, so a probe can inspect phases and logs directly.
+    #[doc(hidden)]
+    pub fn host_for_probe(&self) -> &Arc<Host> {
+        &self.host
+    }
+
+    /// Why the last run action could not run, as the run screen shows it.
+    #[doc(hidden)]
+    pub fn run_action_error_for_probe(&self) -> Option<&str> {
+        self.run_action_error.as_deref()
+    }
 }
 
 impl Render for FlowApp {
@@ -1356,10 +1481,15 @@ fn column_word(column: Column) -> &'static str {
 
 pub(crate) fn status_pill(run: &Run) -> AnyElement {
     let color = column_color(run.column);
-    let word = if run.question.is_some() {
-        "asking you"
+    // The lane's word is what the board sorts by; the record can say something
+    // sharper. A paused run sits in Waiting on you, but a person paused it —
+    // say so rather than telling them a question is open.
+    let word: String = if run.question.is_some() {
+        "asking you".to_owned()
+    } else if matches!(run.status.as_str(), "paused" | "abandoned") {
+        run.status.clone()
     } else {
-        column_word(run.column)
+        column_word(run.column).to_owned()
     };
     div()
         .flex()

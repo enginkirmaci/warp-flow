@@ -10,21 +10,20 @@
 //! ```
 //!
 //! `run` exits 0 when the run is done, 1 when it waits on a question, 2 when
-//! it blocks, and 3 on any error. There is no argument-parsing crate: the
-//! surface is three commands and two flags, and the parser below rejects
-//! unknown flags instead of guessing.
+//! it cannot continue (blocked, paused or abandoned), and 3 on any error.
+//! There is no argument-parsing crate: the surface is three commands and two
+//! flags, and the parser below rejects unknown flags instead of guessing.
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use warp_flow_core::artifact::{Document, Issue};
-use warp_flow_core::config::{FlowConfig, MergeMode};
+use warp_flow_core::artifact::Document;
+use warp_flow_core::config::MergeMode;
+use warp_flow_core::control::KeepGoing;
 use warp_flow_core::door::DoorHarness;
-use warp_flow_core::gate::Gate;
-use warp_flow_core::graph::{StepKind, Workflow};
-use warp_flow_core::run::{DEFAULT_MAX_ATTEMPTS, LogSink, RunStatus, Runner, RunnerConfig};
-use warp_flow_core::worktree::Repo;
+use warp_flow_core::graph::StepKind;
+use warp_flow_core::prepare::{Prepared, prepare};
+use warp_flow_core::run::{DEFAULT_MAX_ATTEMPTS, LogSink, RunStatus};
 
 /// The run finished every step.
 const EXIT_DONE: u8 = 0;
@@ -74,45 +73,36 @@ fn command_run(args: &[String]) -> Result<u8, String> {
     } = parse_run_args(args)?;
 
     // Everything a run needs is validated before the door is contacted, so a
-    // bad workflow or gate file cannot leave a session behind.
-    let repo = Repo::open(&issue).map_err(|error| error.to_string())?;
-    let flow = FlowConfig::read(repo.root.join("flow.toml")).map_err(|error| error.to_string())?;
-    let workflow_path = issue.join("workflow.toml");
-    let workflow = Workflow::read(&workflow_path).map_err(|error| error.to_string())?;
-    workflow.validate().map_err(|error| error.to_string())?;
-    let issue_state = Issue::open(&issue).map_err(|error| error.to_string())?;
-    check_gates(&workflow, &flow.gates())?;
-
-    let resume = issue.join("run.md").is_file();
+    // bad workflow or gate file cannot leave a session behind. The app's host
+    // prepares a run through the same core function.
+    let prepared = prepare(&issue).map_err(|error| error.to_string())?;
     if dry_run {
-        print_plan(&repo, &issue, &workflow, &flow, &issue_state, max_attempts);
+        print_plan(&prepared, max_attempts);
         return Ok(EXIT_DONE);
     }
+    prepared
+        .require_clean()
+        .map_err(|error| error.to_string())?;
 
     let harness = DoorHarness::local().map_err(|error| error.to_string())?;
-    let mut config = RunnerConfig::new(&issue, workflow, harness);
-    config.workdir = repo.root.clone();
-    config.repo = Some(repo);
-    config.push = flow.push();
-    config.gates = flow.gates();
-    config.merge_gates = flow.gates_in_order().to_vec();
+    let mut config = prepared.config(harness, Box::new(StderrLog), Box::new(KeepGoing));
     config.max_attempts = max_attempts;
-    config.log = Box::new(StderrLog);
-
-    let mut runner = if resume {
-        Runner::resume(config)
-    } else {
-        Runner::new(config)
-    }
-    .map_err(|error| error.to_string())?;
+    let mut runner = prepared.runner(config).map_err(|error| error.to_string())?;
 
     let status = runner.run().map_err(|error| error.to_string())?;
     println!("{status}");
+    Ok(exit_code(status))
+}
+
+/// Map the engine's final status onto the CLI's exit contract: `0` done, `1`
+/// waiting on a question, `2` cannot continue (blocked, paused or abandoned),
+/// and `3` when the engine returned without a final status.
+fn exit_code(status: RunStatus) -> u8 {
     match status {
-        RunStatus::Done => Ok(EXIT_DONE),
-        RunStatus::Waiting => Ok(EXIT_WAITING),
-        RunStatus::Blocked => Ok(EXIT_BLOCKED),
-        RunStatus::Running => Err("the engine returned while the run was still running".to_owned()),
+        RunStatus::Done => EXIT_DONE,
+        RunStatus::Waiting => EXIT_WAITING,
+        RunStatus::Blocked | RunStatus::Paused | RunStatus::Abandoned => EXIT_BLOCKED,
+        RunStatus::Running => EXIT_ERROR,
     }
 }
 
@@ -246,47 +236,19 @@ fn single_path(args: &[String], command: &str) -> Result<PathBuf, String> {
     ))
 }
 
-/// Reject a gate step whose name `flow.toml` does not define, before any run.
-fn check_gates(workflow: &Workflow, gates: &BTreeMap<String, Gate>) -> Result<(), String> {
-    for step in &workflow.steps {
-        if step.kind != StepKind::Gate {
-            continue;
-        }
-        let Some(name) = step.gate.as_deref() else {
-            continue;
-        };
-        if !gates.contains_key(name) {
-            return Err(format!(
-                "step `{}` runs gate `{name}`, which `flow.toml` does not define",
-                step.id
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Print what a run would do, without connecting to the door or writing a file.
-fn print_plan(
-    repo: &Repo,
-    issue: &Path,
-    workflow: &Workflow,
-    flow: &FlowConfig,
-    issue_state: &Issue,
-    max_attempts: u32,
-) {
+fn print_plan(prepared: &Prepared, max_attempts: u32) {
+    let repo = &prepared.repo;
+    let issue = &prepared.issue;
+    let workflow = &prepared.workflow;
+    let flow = &prepared.flow;
+    let issue_state = &prepared.state;
     println!("repo: {}", repo.root.display());
     println!("issue: {}", issue.display());
     println!("workflow: {} revision {}", workflow.name, workflow.revision);
     println!("merge: {} (push: {})", mode_name(flow.mode()), flow.push());
     println!("max attempts: {max_attempts}");
-    println!(
-        "resume: {}",
-        if issue.join("run.md").is_file() {
-            "yes"
-        } else {
-            "no"
-        }
-    );
+    println!("resume: {}", if prepared.resume() { "yes" } else { "no" });
 
     println!("gates:");
     for gate in flow.gates_in_order() {
@@ -420,5 +382,31 @@ mod tests {
                     | --- | --- | --- | --- | --- |\n\
                     | analyze | - | 1 | done | now |\n";
         assert_eq!(table_rows(body), vec!["| analyze | - | 1 | done | now |"]);
+    }
+
+    #[test]
+    fn the_exit_code_tells_a_waiting_run_from_one_that_cannot_continue() {
+        assert_eq!(exit_code(RunStatus::Done), EXIT_DONE);
+        assert_eq!(exit_code(RunStatus::Waiting), EXIT_WAITING);
+        assert_eq!(
+            exit_code(RunStatus::Blocked),
+            EXIT_BLOCKED,
+            "a blocked run cannot continue"
+        );
+        assert_eq!(
+            exit_code(RunStatus::Paused),
+            EXIT_BLOCKED,
+            "a run paused at a boundary cannot continue until it is resumed"
+        );
+        assert_eq!(
+            exit_code(RunStatus::Abandoned),
+            EXIT_BLOCKED,
+            "an abandoned run cannot continue"
+        );
+        assert_eq!(
+            exit_code(RunStatus::Running),
+            EXIT_ERROR,
+            "the engine returning mid-run is an error, not a result"
+        );
     }
 }

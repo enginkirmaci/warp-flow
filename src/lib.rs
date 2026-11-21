@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod assets;
+pub mod host;
 pub mod logging;
 pub mod paths;
 pub mod store;
