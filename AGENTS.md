@@ -20,9 +20,11 @@ repository is linked under `apps/`). This file adds only the app-specific facts.
   only durable state. No database, nothing that exists only in memory.
 - A step is a harness session; the engine decides from artifacts and gate exit
   codes, never from a model's opinion of itself.
-- The engine writes the issue folder, `run.md` and `questions/`; it never
-  force-pushes and never edits `main` directly except the `flow: issue <slug>`
-  commit at run start.
+- The engine writes the issue folder, `run.md` and `questions/`, and commits
+  that folder — only that folder, only on `main`, with hooks and signing off —
+  at three points: `flow: issue <slug>` at run start, `flow: record <slug>`
+  before a merge attempt, and `flow: resolve task NN` after a task lands. It
+  never force-pushes and never touches another path on `main`.
 - A dirty working tree is a refusal to start, not a warning.
 
 ## Tests

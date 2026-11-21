@@ -25,6 +25,12 @@ pub enum StepKind {
     Harness,
     /// A gate command checks a step's result.
     Gate,
+    /// The merge queue lands the task's branch into `main`.
+    ///
+    /// A merge step is always per task, and it carries no `skill` or `gate`:
+    /// the gates it runs come from the repository's `flow.toml`, not from the
+    /// workflow.
+    Merge,
     /// The run pauses on a question for a person.
     Question,
 }
@@ -94,8 +100,9 @@ impl Workflow {
     ///
     /// A graph is valid when it uses the supported schema, has at least one
     /// step, every id is unique and non-empty, every `depends_on` names a real
-    /// step, a harness step has a skill, a gate step names a gate, and there is
-    /// no cycle. The cycle is reported as the path that closes it.
+    /// step, a harness step has a skill, a gate step names a gate, a merge step
+    /// is per task and carries neither, and there is no cycle. The cycle is
+    /// reported as the path that closes it.
     pub fn validate(&self) -> Result<()> {
         if self.schema != SCHEMA {
             return Err(Error::Workflow(format!(
@@ -139,6 +146,26 @@ impl Workflow {
                     "gate step `{}` names no gate",
                     step.id
                 )));
+            }
+            if step.kind == StepKind::Merge {
+                if !step.per_task {
+                    return Err(Error::Workflow(format!(
+                        "merge step `{}` must be per_task, because a branch belongs to one task",
+                        step.id
+                    )));
+                }
+                if step.skill.is_some() {
+                    return Err(Error::Workflow(format!(
+                        "merge step `{}` carries no skill",
+                        step.id
+                    )));
+                }
+                if step.gate.is_some() {
+                    return Err(Error::Workflow(format!(
+                        "merge step `{}` names a gate; its gates come from flow.toml",
+                        step.id
+                    )));
+                }
             }
             for dependency in &step.depends_on {
                 if !by_id.contains_key(dependency.as_str()) {
@@ -297,6 +324,58 @@ per_task = true
         assert!(workflow.steps[2].per_task);
         assert!(!workflow.steps[0].per_task);
         assert_eq!(workflow.steps[0].produces.as_deref(), Some("spec.md"));
+    }
+
+    #[test]
+    fn a_merge_step_parses_and_validates() {
+        let workflow = parse(
+            r#"
+schema = 1
+name = "implement"
+revision = 1
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+per_task = true
+
+[[step]]
+id = "merge"
+kind = "merge"
+per_task = true
+depends_on = ["code"]
+"#,
+        );
+        workflow.validate().expect("a per-task merge step is valid");
+        assert_eq!(workflow.steps[1].kind, StepKind::Merge);
+        assert!(workflow.steps[1].per_task);
+    }
+
+    #[test]
+    fn a_merge_step_must_be_per_task() {
+        let mut merge = step("merge", StepKind::Merge, &[]);
+        merge.per_task = false;
+        let error = workflow(vec![merge]).validate().expect_err("not per_task");
+        assert!(error.to_string().contains("must be per_task"), "{error}");
+    }
+
+    #[test]
+    fn a_merge_step_carries_no_skill() {
+        let mut merge = step("merge", StepKind::Merge, &[]);
+        merge.per_task = true;
+        merge.skill = Some("merge".to_owned());
+        let error = workflow(vec![merge]).validate().expect_err("skill");
+        assert!(error.to_string().contains("carries no skill"), "{error}");
+    }
+
+    #[test]
+    fn a_merge_step_carries_no_gate() {
+        let mut merge = step("merge", StepKind::Merge, &[]);
+        merge.per_task = true;
+        merge.gate = Some("test".to_owned());
+        let error = workflow(vec![merge]).validate().expect_err("gate");
+        assert!(error.to_string().contains("names a gate"), "{error}");
     }
 
     #[test]

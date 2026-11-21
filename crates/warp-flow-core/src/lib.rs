@@ -17,6 +17,7 @@
 #![warn(missing_docs)]
 
 pub mod artifact;
+pub mod config;
 pub mod door;
 pub mod gate;
 pub mod graph;
@@ -31,6 +32,7 @@ mod test_support;
 use std::path::Path;
 
 pub use artifact::{Document, FrontMatter, Issue, Status, Task};
+pub use config::{FlowConfig, MergeMode};
 pub use gate::{Gate, GateOutcome};
 pub use graph::{Step, StepKind, Workflow};
 pub use harness::{FakeHarness, Harness, Scripted, StepOutcome, StepRequest};

@@ -1,27 +1,31 @@
 //! The engine loop: ready steps, attempts, repairs, questions and `run.md`.
 //!
-//! The runner is deliberately sequential in S1: it runs one step at a time,
-//! writes `run.md` after every attempt, and stops on the first question or on
-//! an exhausted repair budget. Concurrency across ready tasks is S2, but the
-//! scheduler here already honours task blockers and `per_task` steps, so the
-//! shape it parallelises is the final one.
+//! The runner is deliberately sequential: it runs one step at a time, writes
+//! `run.md` after every attempt, and stops on the first question or on an
+//! exhausted repair budget. Concurrency across ready tasks is a later step; the
+//! scheduler already honours task blockers and `per_task` steps.
 //!
-//! A task is finished only when its artifact says `**Status:** resolved`. The
-//! engine never guesses that a task is done from the steps that ran; it reads
-//! the folder at every step boundary (ADR-0009).
+//! When the config names a repository, a `per_task` step runs in that task's
+//! worktree and a `merge` step runs the merge queue. The merge step is the only
+//! place the engine writes `**Status:** resolved`; a task is otherwise finished
+//! only when its artifact says so, because the engine reads the folder at every
+//! step boundary (ADR-0009).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::artifact::{Document, FrontMatter, Issue, Task};
+use crate::artifact::{Document, FrontMatter, Issue, Status, Task};
 use crate::gate::{Gate, GateOutcome};
 use crate::graph::{Step, StepKind, Workflow};
 use crate::harness::{Harness, StepOutcome, StepRequest};
+use crate::merge::{MergeOutcome, MergeRequest};
+use crate::worktree::{Repo, TaskWorktree};
 use crate::{Error, Result};
 
 /// The attempt budget a run starts with; a repair is one more attempt.
@@ -125,6 +129,19 @@ pub struct RunnerConfig<H> {
     pub max_attempts: u32,
     /// The directory harness steps work in.
     pub workdir: PathBuf,
+    /// The repository the per-task worktrees and the merge queue operate on.
+    ///
+    /// With `None`, every step runs in `workdir` and a `merge` step cannot run;
+    /// that is the S1 behavior the engine's unit tests still use. With a
+    /// repository, a per-task step runs in the task's worktree.
+    pub repo: Option<Repo>,
+    /// Whether the merge queue may push `main` after it merges.
+    pub push: bool,
+    /// The gates in `flow.toml`'s declaration order, for the merge queue.
+    ///
+    /// Empty means [`RunnerConfig::gates`]' own (name-sorted) order, which is
+    /// the shape tests that configure gates by hand construct.
+    pub merge_gates: Vec<Gate>,
     /// Where the engine writes its log lines.
     pub log: Box<dyn LogSink>,
 }
@@ -141,6 +158,9 @@ impl<H> RunnerConfig<H> {
             harness,
             gates: BTreeMap::new(),
             max_attempts: DEFAULT_MAX_ATTEMPTS,
+            repo: None,
+            push: false,
+            merge_gates: Vec::new(),
             log: Box::new(NullLog),
         }
     }
@@ -154,8 +174,13 @@ pub struct Runner<H> {
     gates: BTreeMap<String, Gate>,
     max_attempts: u32,
     workdir: PathBuf,
+    repo: Option<Repo>,
+    push: bool,
+    merge_gates: Vec<Gate>,
     log: Box<dyn LogSink>,
     status: RunStatus,
+    /// Task worktrees already created or found, by task number.
+    worktrees: BTreeMap<u32, TaskWorktree>,
     /// Steps that have no outstanding work: every non-per-task step, and the
     /// per-task steps whose work is complete for every task (see `graph_done`).
     done: BTreeSet<String>,
@@ -167,6 +192,9 @@ pub struct Runner<H> {
     started: String,
     /// Why the run stopped, rendered into `run.md` when it is not `Done`.
     note: Option<String>,
+    /// Whether [`Runner::resume`] loaded an existing log; `run` continues it
+    /// instead of starting over.
+    resumed: bool,
 }
 
 impl<H: Harness> Runner<H> {
@@ -179,6 +207,9 @@ impl<H: Harness> Runner<H> {
             gates,
             max_attempts,
             workdir,
+            repo,
+            push,
+            merge_gates,
             log,
         } = config;
 
@@ -198,6 +229,12 @@ impl<H: Harness> Runner<H> {
                     )));
                 }
             }
+            if step.kind == StepKind::Merge && repo.is_none() {
+                return Err(Error::Run(format!(
+                    "step `{}` merges a task branch, but the runner has no repository",
+                    step.id
+                )));
+            }
         }
         if !issue.is_dir() {
             return Err(Error::malformed_file(
@@ -215,14 +252,31 @@ impl<H: Harness> Runner<H> {
             gates,
             max_attempts,
             workdir,
+            repo,
+            push,
+            merge_gates,
             log,
             status: RunStatus::Running,
+            worktrees: BTreeMap::new(),
             done: BTreeSet::new(),
             completed: BTreeMap::new(),
             rows: Vec::new(),
             started: timestamp(SystemTime::now()),
             note: None,
+            resumed: false,
         })
+    }
+
+    /// Open the issue folder and continue the run `run.md` records.
+    ///
+    /// The log table's rows are loaded in order: a `done`, `passed` or `merged`
+    /// row makes its step complete, and a later row for the same step and task
+    /// clears that again. A missing `run.md` is simply a fresh run. The
+    /// existing rows are kept and new rows are appended to them.
+    pub fn resume(config: RunnerConfig<H>) -> Result<Self> {
+        let mut runner = Self::new(config)?;
+        runner.load_run()?;
+        Ok(runner)
     }
 
     /// The run's current status; `Running` before [`Runner::run`] returns.
@@ -237,10 +291,18 @@ impl<H: Harness> Runner<H> {
 
     /// Drive the workflow until it finishes, pauses on a question or blocks.
     ///
-    /// S1 always starts a fresh run and rewrites `run.md`; resuming an existing
-    /// run from its artifacts comes with the CLI in S2.
+    /// A runner built by [`Runner::new`] starts a fresh run and rewrites
+    /// `run.md`; a runner built by [`Runner::resume`] continues the log it
+    /// loaded instead.
     pub fn run(&mut self) -> Result<RunStatus> {
-        self.start()?;
+        if !self.resumed {
+            self.start()?;
+        }
+        self.drive()
+    }
+
+    /// The run loop proper, without the fresh-run reset.
+    fn drive(&mut self) -> Result<RunStatus> {
         loop {
             let mut issue = Issue::open(&self.issue)?;
             let candidates = self.candidate_ids();
@@ -338,6 +400,60 @@ impl<H: Harness> Runner<H> {
         Ok(())
     }
 
+    /// Load `run.md`'s log table into the in-memory sets, keeping its rows.
+    ///
+    /// Rows are read in order because the last row for a step and task wins: a
+    /// step is complete only when its latest row is one of the successful
+    /// outcomes. A step or task the graph no longer has stays in the record but
+    /// contributes nothing to the sets.
+    fn load_run(&mut self) -> Result<()> {
+        let path = self.issue.join("run.md");
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                self.resumed = true;
+                return Ok(());
+            }
+            Err(error) => return Err(Error::io(&path, error)),
+        };
+        let document = Document::parse(&text).map_err(|error| error.at_path(&path))?;
+        if let Some(started) = document.front.get("started") {
+            self.started = started.to_owned();
+        }
+        self.done.clear();
+        self.completed.clear();
+        self.rows.clear();
+        for line in document.body.split_inclusive('\n') {
+            let Some(row) = LogRow::parse(line) else {
+                continue;
+            };
+            self.rows.push(row.line);
+            let Some(step) = self.workflow.step(&row.step) else {
+                continue;
+            };
+            let success = matches!(row.outcome.as_str(), "done" | "passed" | "merged");
+            if step.per_task {
+                let Some(number) = row.task else {
+                    continue;
+                };
+                let numbers = self.completed.entry(row.step).or_default();
+                if success {
+                    numbers.insert(number);
+                } else {
+                    numbers.remove(&number);
+                }
+            } else if row.task.is_none() {
+                if success {
+                    self.done.insert(row.step);
+                } else {
+                    self.done.remove(&row.step);
+                }
+            }
+        }
+        self.resumed = true;
+        Ok(())
+    }
+
     /// The steps that may run in this pass, in declaration order.
     ///
     /// A non-per-task step needs every dependency in the graph-done set. A
@@ -429,27 +545,40 @@ impl<H: Harness> Runner<H> {
     fn run_step(&mut self, step: &Step, task: Option<&Task>) -> Result<StepRun> {
         let label = step_label(step, task);
 
-        if step.kind == StepKind::Question {
-            let path = self.write_question(step, task)?;
-            self.record_row(step, task, 1, "waiting")?;
-            self.note = Some(format!("waiting on {}", path.display()));
-            let line = format!(
-                "{label}: question written to {}; waiting for an answer",
-                path.display()
-            );
-            self.log_line(&line);
-            return Ok(StepRun::Waiting);
+        match step.kind {
+            StepKind::Question => {
+                // A resumed run must not ask again what a person already
+                // answered; the answer is in the question file, not in run.md.
+                if let Some(path) = self.answered_question(step, task)? {
+                    self.record_row(step, task, 1, "done")?;
+                    let line = format!("{label}: answered by {}", path.display());
+                    self.log_line(&line);
+                    return Ok(StepRun::Done);
+                }
+                let path = self.write_question(step, task)?;
+                self.record_row(step, task, 1, "waiting")?;
+                self.note = Some(format!("waiting on {}", path.display()));
+                let line = format!(
+                    "{label}: question written to {}; waiting for an answer",
+                    path.display()
+                );
+                self.log_line(&line);
+                return Ok(StepRun::Waiting);
+            }
+            StepKind::Merge => return self.run_merge_step(step, task),
+            StepKind::Gate | StepKind::Harness => {}
         }
 
         let mut attempt = 1;
         loop {
             let failure = match step.kind {
-                StepKind::Gate => self.attempt_gate(step)?,
+                StepKind::Gate => self.attempt_gate(step, task)?,
                 StepKind::Harness => self.attempt_harness(step, task)?,
-                StepKind::Question => {
-                    return Err(Error::Run(
-                        "a question step reached the attempt loop".to_owned(),
-                    ));
+                StepKind::Question | StepKind::Merge => {
+                    return Err(Error::Run(format!(
+                        "step `{}` reached the attempt loop with kind {:?}",
+                        step.id, step.kind
+                    )));
                 }
             };
 
@@ -466,44 +595,67 @@ impl<H: Harness> Runner<H> {
                     return Ok(StepRun::Done);
                 }
                 Some(failure) => {
-                    self.record_row(step, task, attempt, failure.outcome)?;
-                    let repair = self.write_repair(step, task, attempt, &failure)?;
-                    if attempt >= self.max_attempts {
-                        self.note = Some(format!(
-                            "step `{}` failed after {attempt} attempt(s); last repair is {}",
-                            step.id,
-                            repair.display()
-                        ));
-                        let line = format!(
-                            "{label} attempt {attempt}: {}; attempt budget spent, repair {} written",
-                            failure.summary,
-                            repair.display()
-                        );
-                        self.log_line(&line);
+                    if self.register_failure(step, task, attempt, &failure)? {
                         return Ok(StepRun::Blocked);
                     }
-                    let line = format!(
-                        "{label} attempt {attempt}: {}; repair {} written, retrying",
-                        failure.summary,
-                        repair.display()
-                    );
-                    self.log_line(&line);
                     attempt += 1;
                 }
             }
         }
     }
 
-    /// Run the gate behind a gate step.
-    fn attempt_gate(&self, step: &Step) -> Result<Option<Failure>> {
+    /// Record a failed attempt and its repair; say whether the budget is spent.
+    fn register_failure(
+        &mut self,
+        step: &Step,
+        task: Option<&Task>,
+        attempt: u32,
+        failure: &Failure,
+    ) -> Result<bool> {
+        let label = step_label(step, task);
+        self.record_row(step, task, attempt, failure.outcome)?;
+        let repair = self.write_repair(step, task, attempt, failure)?;
+        if attempt >= self.max_attempts {
+            self.note = Some(format!(
+                "step `{}` failed after {attempt} attempt(s); last repair is {}",
+                step.id,
+                repair.display()
+            ));
+            let line = format!(
+                "{label} attempt {attempt}: {}; attempt budget spent, repair {} written",
+                failure.summary,
+                repair.display()
+            );
+            self.log_line(&line);
+            Ok(true)
+        } else {
+            let line = format!(
+                "{label} attempt {attempt}: {}; repair {} written, retrying",
+                failure.summary,
+                repair.display()
+            );
+            self.log_line(&line);
+            Ok(false)
+        }
+    }
+
+    /// Run the gate behind a gate step, in the task's worktree when it has one.
+    fn attempt_gate(&mut self, step: &Step, task: Option<&Task>) -> Result<Option<Failure>> {
         let name = step
             .gate
             .as_deref()
             .ok_or_else(|| Error::Run(format!("gate step `{}` names no gate", step.id)))?;
-        let gate = self
+        let mut gate = self
             .gates
             .get(name)
+            .cloned()
             .ok_or_else(|| Error::Run(format!("gate `{name}` is not configured")))?;
+        // `flow.toml` writes `cwd` relative to the tree the step measures: the
+        // task's worktree for a per-task step, the configured workdir otherwise.
+        if gate.cwd.is_relative() {
+            let workdir = self.step_workdir(step, task)?;
+            gate.cwd = workdir.join(&gate.cwd);
+        }
         match gate.run()? {
             GateOutcome::Passed { .. } => Ok(None),
             GateOutcome::Failed { code, tail, .. } => Ok(Some(Failure {
@@ -521,10 +673,11 @@ impl<H: Harness> Runner<H> {
 
     /// Hand a harness step to the harness.
     fn attempt_harness(&mut self, step: &Step, task: Option<&Task>) -> Result<Option<Failure>> {
+        let workdir = self.step_workdir(step, task)?;
         let request = StepRequest {
             step: step.clone(),
             issue: self.issue.clone(),
-            workdir: self.workdir.clone(),
+            workdir,
             prompt: self.prompt(step, task),
         };
         match self.harness.run(&request)? {
@@ -535,6 +688,237 @@ impl<H: Harness> Runner<H> {
                 detail: None,
             })),
         }
+    }
+
+    /// The newest answered question for this step and task, if one exists.
+    ///
+    /// A question file names the step that asked it; a per-task question also
+    /// names its task, so two tasks' answers never stand in for one another.
+    fn answered_question(&self, step: &Step, task: Option<&Task>) -> Result<Option<PathBuf>> {
+        let dir = self.issue.join("questions");
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(Error::io(&dir, error)),
+        };
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| Error::io(&dir, error))?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("md") {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        paths.reverse();
+
+        for path in paths {
+            let document = Document::read(&path)?;
+            if document.front.get("state") != Some("answered") {
+                continue;
+            }
+            if document.front.get("asked_by") != Some(step.id.as_str()) {
+                continue;
+            }
+            if let Some(task) = task {
+                let number = format!("{:02}", task.number);
+                let names_task = document.front.get("task") == Some(number.as_str())
+                    || document.body.contains(&format!("task {number}"));
+                if !names_task {
+                    continue;
+                }
+            }
+            return Ok(Some(path));
+        }
+        Ok(None)
+    }
+
+    /// The directory a step runs in: the task's worktree for a per-task step
+    /// once a repository is configured, the configured workdir otherwise.
+    fn step_workdir(&mut self, step: &Step, task: Option<&Task>) -> Result<PathBuf> {
+        match (step.per_task, task) {
+            (true, Some(task)) if self.repo.is_some() => Ok(self.worktree(task)?.path),
+            _ => Ok(self.workdir.clone()),
+        }
+    }
+
+    /// The task's worktree, created on first use and reused afterwards.
+    fn worktree(&mut self, task: &Task) -> Result<TaskWorktree> {
+        if let Some(existing) = self.worktrees.get(&task.number) {
+            return Ok(existing.clone());
+        }
+        let repo = self.repo.as_ref().ok_or_else(|| {
+            Error::Run("no repository is configured for task worktrees".to_owned())
+        })?;
+        let worktree = TaskWorktree::create(repo, task)?;
+        self.worktrees.insert(task.number, worktree.clone());
+        Ok(worktree)
+    }
+
+    /// Run the merge queue for one task and write `resolved` on success.
+    fn run_merge_step(&mut self, step: &Step, task: Option<&Task>) -> Result<StepRun> {
+        let task = task.ok_or_else(|| {
+            Error::Run(format!(
+                "merge step `{}` is per task but no task is ready for it",
+                step.id
+            ))
+        })?;
+        let repo = self.repo.clone().ok_or_else(|| {
+            Error::Run(format!(
+                "merge step `{}` needs a repository in the runner config",
+                step.id
+            ))
+        })?;
+        let worktree = self.worktree(task)?;
+        let label = step_label(step, Some(task));
+        let mut attempt = 1;
+
+        loop {
+            // The engine owns the issue folder, so whatever it wrote since the
+            // last merge (spec, tasks, run.md, a repair) is committed before the
+            // queue insists on a clean main checkout.
+            self.commit_issue(&format!("flow: record {}", self.issue_name()))?;
+
+            let outcome = crate::merge::merge(MergeRequest {
+                repo: repo.clone(),
+                worktree: worktree.clone(),
+                main: "main".to_owned(),
+                gates: self.merge_gates(),
+                push: self.push,
+            })?;
+
+            match outcome {
+                MergeOutcome::Merged { commit } => {
+                    self.record_row(step, Some(task), attempt, "merged")?;
+                    self.resolve_task(task.number)?;
+                    self.commit_issue(&format!("flow: resolve task {:02}", task.number))?;
+                    let line = format!("{label} attempt {attempt}: merged {commit}");
+                    self.log_line(&line);
+                    return Ok(StepRun::Done);
+                }
+                MergeOutcome::NothingToDo => {
+                    self.record_row(step, Some(task), attempt, "merged")?;
+                    self.resolve_task(task.number)?;
+                    self.commit_issue(&format!("flow: resolve task {:02}", task.number))?;
+                    let line =
+                        format!("{label} attempt {attempt}: branch already in main; task resolved");
+                    self.log_line(&line);
+                    return Ok(StepRun::Done);
+                }
+                MergeOutcome::Conflicted { files } => {
+                    let summary = if files.is_empty() {
+                        "the rebase or the merge conflicted".to_owned()
+                    } else {
+                        format!("the merge conflicted in: {}", files.join(", "))
+                    };
+                    let failure = Failure {
+                        outcome: "conflicted",
+                        summary,
+                        detail: (!files.is_empty()).then(|| files.join("\n")),
+                    };
+                    if self.register_failure(step, Some(task), attempt, &failure)? {
+                        return Ok(StepRun::Blocked);
+                    }
+                }
+                MergeOutcome::GateFailed { gate, tail } => {
+                    let failure = Failure {
+                        outcome: "gate-failed",
+                        summary: format!("gate `{gate}` failed on the rebased task branch"),
+                        detail: (!tail.is_empty()).then_some(tail),
+                    };
+                    if self.register_failure(step, Some(task), attempt, &failure)? {
+                        return Ok(StepRun::Blocked);
+                    }
+                }
+                MergeOutcome::DirtyMain => {
+                    self.record_row(step, Some(task), attempt, "dirty")?;
+                    let note = format!(
+                        "the main checkout is dirty; the merge queue refuses to merge task {:02} \
+                         until it is clean",
+                        task.number
+                    );
+                    self.note = Some(note.clone());
+                    self.log_line(&format!("{label} attempt {attempt}: {note}"));
+                    return Ok(StepRun::Blocked);
+                }
+            }
+            attempt += 1;
+        }
+    }
+
+    /// The gates the merge queue runs, in `flow.toml` order when it is known.
+    fn merge_gates(&self) -> Vec<Gate> {
+        if self.merge_gates.is_empty() {
+            self.gates.values().cloned().collect()
+        } else {
+            self.merge_gates.clone()
+        }
+    }
+
+    /// Write `resolved` on a task; the merge step is the only caller.
+    fn resolve_task(&self, number: u32) -> Result<()> {
+        let mut issue = Issue::open(&self.issue)?;
+        issue.set_status(number, Status::Resolved)
+    }
+
+    /// Commit the engine's own files under the issue folder to `main`.
+    ///
+    /// The merge queue refuses a dirty main checkout, while every step writes
+    /// the issue folder; committing those writes keeps the queue usable and
+    /// makes the run's record durable. Only the issue folder is committed, and
+    /// only when `HEAD` is on `main`: any other uncommitted change still makes
+    /// the queue refuse, which is the dirty-tree rule.
+    fn commit_issue(&self, message: &str) -> Result<()> {
+        let Some(repo) = self.repo.as_ref() else {
+            return Ok(());
+        };
+        // The CLI may be handed a relative issue path while the kit reports an
+        // absolute repository root; canonicalizing both makes the prefix check
+        // mean what it says without changing the paths the run reports.
+        let root = repo
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| repo.root.clone());
+        let issue = self
+            .issue
+            .canonicalize()
+            .unwrap_or_else(|_| self.issue.clone());
+        let Ok(relative) = issue.strip_prefix(&root) else {
+            return Ok(());
+        };
+        if relative.as_os_str().is_empty() {
+            return Ok(());
+        }
+
+        let head = git(&root, &["symbolic-ref", "--short", "-q", "HEAD"])?;
+        if !head.status.success() || String::from_utf8_lossy(&head.stdout).trim() != "main" {
+            return Ok(());
+        }
+
+        let relative = relative.to_string_lossy();
+        let status = git(&root, &["status", "--porcelain", "--", relative.as_ref()])?;
+        require_git(&status, "read the issue folder's status", &root)?;
+        if String::from_utf8_lossy(&status.stdout).trim().is_empty() {
+            return Ok(());
+        }
+
+        let added = git(&root, &["add", "-A", "--", relative.as_ref()])?;
+        require_git(&added, "stage the issue folder", &root)?;
+        let committed = git(
+            &root,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--no-verify",
+                "--quiet",
+                "-m",
+                message,
+                "--",
+                relative.as_ref(),
+            ],
+        )?;
+        require_git(&committed, "commit the issue folder", &root)
     }
 
     /// The prompt an engine session receives for one step.
@@ -578,6 +962,9 @@ impl<H: Harness> Runner<H> {
         front.set("kind", "approve");
         front.set("options", "yes, no");
         front.set("asked_by", step.id.clone());
+        if let Some(task) = task {
+            front.set("task", format!("{:02}", task.number));
+        }
         front.set("state", "open");
 
         let mut body = format!(
@@ -706,6 +1093,46 @@ struct Failure {
     detail: Option<String>,
 }
 
+/// One row of `run.md`'s log table, as resume reads it back.
+struct LogRow {
+    /// The row as it was written, with its line ending, so it can be kept.
+    line: String,
+    /// The step id in the first column.
+    step: String,
+    /// The task number in the second column, or `None` for `-`.
+    task: Option<u32>,
+    /// The outcome in the fourth column.
+    outcome: String,
+}
+
+impl LogRow {
+    /// Parse one `| Step | Task | Attempt | Outcome | At |` row.
+    ///
+    /// Anything that is not a five-column row — the header, the separator, or
+    /// prose around the table — is not a row and is skipped by the caller.
+    fn parse(line: &str) -> Option<Self> {
+        let trimmed = line.trim();
+        let inner = trimmed.strip_prefix('|')?.strip_suffix('|')?;
+        let cells: Vec<&str> = inner.split('|').map(str::trim).collect();
+        if cells.len() != 5 || cells[0].is_empty() || cells[0] == "Step" {
+            return None;
+        }
+        if cells[0].chars().all(|character| character == '-') {
+            return None;
+        }
+        let task = match cells[1] {
+            "-" | "" => None,
+            text => Some(text.parse::<u32>().ok()?),
+        };
+        Some(Self {
+            line: format!("{trimmed}\n"),
+            step: cells[0].to_owned(),
+            task,
+            outcome: cells[3].to_owned(),
+        })
+    }
+}
+
 /// The next free `NN.md` number in a questions or repairs directory.
 fn next_number(dir: &Path) -> Result<u32> {
     let mut next = 1;
@@ -738,6 +1165,35 @@ fn step_label(step: &Step, task: Option<&Task>) -> String {
         Some(task) => format!("{}/{:02}", step.id, task.number),
         None => step.id.clone(),
     }
+}
+
+/// Run one git command in `dir` with no terminal prompt.
+fn git(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| Error::Run(format!("could not run git in {}: {error}", dir.display())))
+}
+
+/// Turn a failed git invocation into an engine error with git's last line.
+fn require_git(output: &std::process::Output, action: &str, dir: &Path) -> Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let reason = stderr
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .unwrap_or("git failed");
+    Err(Error::Run(format!(
+        "git could not {action} in {}: {reason}",
+        dir.display()
+    )))
 }
 
 /// An RFC 3339 UTC timestamp with second precision, with no date dependency.
@@ -782,6 +1238,8 @@ mod tests {
     use crate::graph::Workflow;
     use crate::harness::{FakeHarness, Scripted};
     use crate::test_support::TempDir;
+    use crate::worktree::{Repo, TaskWorktree};
+    use std::process::Command;
     use std::time::Duration;
 
     fn workflow(text: &str) -> Workflow {
@@ -1139,5 +1597,383 @@ skill = "analyze"
         assert_eq!(timestamp(UNIX_EPOCH), "1970-01-01T00:00:00Z");
         let later = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         assert_eq!(timestamp(later), "2023-11-14T22:13:20Z");
+    }
+
+    /// A throwaway repository with `main`, one commit and a local identity.
+    fn repository(dir: &TempDir) -> PathBuf {
+        let root = dir.path().join("repo");
+        fs::create_dir(&root).expect("repository directory");
+        run_git(&root, &["init", "--initial-branch=main", "--quiet"]);
+        run_git(&root, &["config", "user.email", "engine@example.com"]);
+        run_git(&root, &["config", "user.name", "Engine Probe"]);
+        run_git(&root, &["config", "commit.gpgsign", "false"]);
+        fs::write(root.join("readme.md"), "probe\n").expect("readme");
+        run_git(&root, &["add", "readme.md"]);
+        run_git(&root, &["commit", "--quiet", "-m", "first"]);
+        root
+    }
+
+    /// Run one git command and return its stdout, failing the test on error.
+    fn run_git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?} in {} failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// An issue folder inside `root`, committed to `main`.
+    fn issue_in(root: &Path) -> PathBuf {
+        let issue = root.join(".scratch/demo");
+        fs::create_dir_all(issue.join("issues")).expect("issue folder");
+        fs::write(
+            issue.join("issues/01-first.md"),
+            task_text(1, "First task", "ready-for-agent"),
+        )
+        .expect("task file");
+        fs::write(issue.join("workflow.toml"), MERGE_WORKFLOW).expect("workflow");
+        run_git(root, &["add", "-A"]);
+        run_git(root, &["commit", "--quiet", "-m", "issue"]);
+        issue
+    }
+
+    const MERGE_WORKFLOW: &str = r#"
+schema = 1
+name = "implement"
+revision = 1
+
+[[step]]
+id = "analyze"
+kind = "harness"
+skill = "analyze"
+produces = "spec.md"
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+per_task = true
+depends_on = ["analyze"]
+
+[[step]]
+id = "merge"
+kind = "merge"
+per_task = true
+depends_on = ["code"]
+"#;
+
+    #[test]
+    fn a_merge_step_marks_the_task_resolved_and_the_run_is_done() {
+        let dir = TempDir::new();
+        let root = repository(&dir);
+        let issue = issue_in(&root);
+
+        let repo = Repo::open(&root).expect("repo opens");
+        let opened = Issue::open(&issue).expect("issue opens");
+        let worktree =
+            TaskWorktree::create(&repo, opened.task(1).expect("task 1")).expect("worktree created");
+        fs::write(worktree.path.join("feature.txt"), "done\n").expect("feature file");
+        run_git(&worktree.path, &["add", "feature.txt"]);
+        run_git(&worktree.path, &["commit", "--quiet", "-m", "task work"]);
+
+        let mut harness = FakeHarness::new();
+        harness.script(
+            "analyze",
+            Scripted::Done {
+                files: vec![(issue.join("spec.md"), "# Spec\n".to_owned())],
+                text: "analyzed".to_owned(),
+            },
+        );
+        harness.script(
+            "code",
+            Scripted::Done {
+                files: Vec::new(),
+                text: "coded".to_owned(),
+            },
+        );
+
+        let workflow = Workflow::parse(MERGE_WORKFLOW).expect("workflow parses");
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.workdir = root.clone();
+        config.repo = Some(repo);
+        config.gates.insert(
+            "test".to_owned(),
+            Gate {
+                name: "test".to_owned(),
+                command: "true".to_owned(),
+                cwd: PathBuf::from("."),
+                timeout: Duration::from_secs(5),
+            },
+        );
+        config.merge_gates = config.gates.values().cloned().collect();
+        config.max_attempts = 2;
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+
+        let document = run_md(&issue);
+        assert_eq!(document.front.get("status"), Some("done"));
+        assert!(
+            document.body.contains("| merge | 01 | 1 | merged |"),
+            "{}",
+            document.body
+        );
+        assert!(
+            document.body.contains("| code | 01 | 1 | done |"),
+            "{}",
+            document.body
+        );
+
+        let issue = Issue::open(&issue).expect("issue reopens");
+        assert_eq!(
+            issue.task(1).expect("task 1").status,
+            Status::Resolved,
+            "the merge step is the only writer of resolved"
+        );
+        assert!(root.join("feature.txt").is_file(), "the branch landed");
+        let merges = run_git(&root, &["log", "--merges", "--format=%s", "main"]);
+        assert!(merges.contains("flow: merge task 01"), "{merges}");
+
+        let calls = runner.harness().calls();
+        assert_eq!(calls.len(), 2, "analyze then code");
+        assert_eq!(calls[1].step.id, "code");
+        assert_eq!(calls[1].workdir, worktree.path);
+    }
+
+    /// A test harness that acts like a real coding session: it writes its work
+    /// into the workdir and commits it, so the branch has something to merge.
+    #[derive(Default)]
+    struct CommittingHarness {
+        calls: Vec<StepRequest>,
+    }
+
+    impl Harness for CommittingHarness {
+        fn run(&mut self, request: &StepRequest) -> Result<StepOutcome> {
+            self.calls.push(request.clone());
+            if request.step.per_task {
+                fs::write(request.workdir.join("feature.txt"), "done\n").expect("feature file");
+                run_git(&request.workdir, &["add", "feature.txt"]);
+                run_git(&request.workdir, &["commit", "--quiet", "-m", "task work"]);
+            }
+            Ok(StepOutcome::Done {
+                wrote: Vec::new(),
+                text: "done".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn the_engine_creates_a_worktree_on_first_use() {
+        let dir = TempDir::new();
+        let root = repository(&dir);
+        let issue = issue_in(&root);
+        let workflow = Workflow::parse(MERGE_WORKFLOW).expect("workflow parses");
+        let mut config = RunnerConfig::new(&issue, workflow, CommittingHarness::default());
+        config.workdir = root.clone();
+        config.repo = Some(Repo::open(&root).expect("repo opens"));
+        config.gates.insert(
+            "test".to_owned(),
+            Gate {
+                name: "test".to_owned(),
+                command: "true".to_owned(),
+                cwd: PathBuf::from("."),
+                timeout: Duration::from_secs(5),
+            },
+        );
+        config.max_attempts = 2;
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+
+        let worktrees: Vec<_> = fs::read_dir(root.join(".worktrees"))
+            .expect("the engine created .worktrees")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_dir())
+            .collect();
+        assert_eq!(worktrees.len(), 1, "one worktree for the one task");
+        assert!(root.join("feature.txt").is_file(), "the branch landed");
+
+        let calls = &runner.harness().calls;
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls[1].workdir.starts_with(root.join(".worktrees")),
+            "code ran in {}",
+            calls[1].workdir.display()
+        );
+    }
+
+    #[test]
+    fn resume_skips_a_step_with_a_done_row_and_keeps_the_row() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let workflow = workflow(
+            r#"
+schema = 1
+name = "implement"
+revision = 1
+
+[[step]]
+id = "analyze"
+kind = "harness"
+skill = "analyze"
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+depends_on = ["analyze"]
+"#,
+        );
+        fs::write(
+            issue.join("run.md"),
+            "---\nissue: demo\nworkflow: implement\nrevision: 1\nstatus: blocked\n\
+             started: 2026-01-01T00:00:00Z\nupdated: 2026-01-01T00:00:00Z\n---\n\n\
+             # Run: implement\n\n## Log\n\n| Step | Task | Attempt | Outcome | At |\n\
+             | --- | --- | --- | --- | --- |\n\
+             | analyze | - | 1 | done | 2026-01-01T00:00:00Z |\n",
+        )
+        .expect("run.md");
+        let mut harness = FakeHarness::new();
+        harness.script(
+            "code",
+            Scripted::Done {
+                files: Vec::new(),
+                text: "coded".to_owned(),
+            },
+        );
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.max_attempts = 2;
+        let mut runner = Runner::resume(config).expect("resume");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+        let calls = runner.harness().calls();
+        assert_eq!(calls.len(), 1, "analyze was not asked again");
+        assert_eq!(calls[0].step.id, "code");
+
+        let document = run_md(&issue);
+        assert_eq!(document.front.get("status"), Some("done"));
+        assert_eq!(
+            document.front.get("started"),
+            Some("2026-01-01T00:00:00Z"),
+            "the original start time survives"
+        );
+        let analyze = document
+            .body
+            .find("| analyze | - | 1 | done |")
+            .expect("the old row is kept");
+        let code = document
+            .body
+            .find("| code | - | 1 | done |")
+            .expect("the new row is appended");
+        assert!(analyze < code, "{}", document.body);
+        assert_eq!(document.body.matches("| analyze | - |").count(), 1);
+    }
+
+    #[test]
+    fn a_later_failed_row_makes_resume_run_the_step_again() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let workflow = workflow(
+            r#"
+schema = 1
+name = "implement"
+revision = 1
+
+[[step]]
+id = "analyze"
+kind = "harness"
+skill = "analyze"
+"#,
+        );
+        fs::write(
+            issue.join("run.md"),
+            "---\nissue: demo\nworkflow: implement\nrevision: 1\nstatus: blocked\n---\n\n\
+             # Run: implement\n\n## Log\n\n| Step | Task | Attempt | Outcome | At |\n\
+             | --- | --- | --- | --- | --- |\n\
+             | analyze | - | 1 | done | 2026-01-01T00:00:00Z |\n\
+             | analyze | - | 2 | blocked | 2026-01-01T00:01:00Z |\n",
+        )
+        .expect("run.md");
+        let mut harness = FakeHarness::new();
+        harness.script(
+            "analyze",
+            Scripted::Done {
+                files: Vec::new(),
+                text: "analyzed again".to_owned(),
+            },
+        );
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.max_attempts = 2;
+        let mut runner = Runner::resume(config).expect("resume");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+        let calls = runner.harness().calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].step.id, "analyze");
+        let document = run_md(&issue);
+        assert_eq!(
+            document.body.matches("| analyze | - |").count(),
+            3,
+            "the two old rows and the new one are all in the log: {}",
+            document.body
+        );
+    }
+
+    #[test]
+    fn resume_continues_past_an_answered_question() {
+        const QUESTION_WORKFLOW: &str = r#"
+schema = 1
+name = "implement"
+revision = 1
+
+[[step]]
+id = "approve-plan"
+kind = "question"
+"#;
+
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let workflow = workflow(QUESTION_WORKFLOW);
+        let mut config = RunnerConfig::new(&issue, workflow.clone(), FakeHarness::new());
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::new(config).expect("runner");
+        assert_eq!(runner.run().expect("first run"), RunStatus::Waiting);
+
+        // What the CLI's `answer` command writes into the question file.
+        let path = issue.join("questions/01.md");
+        let mut question = Document::read(&path).expect("question parses");
+        question.front.set("answer", "yes, go ahead");
+        question.front.set("state", "answered");
+        question.write_atomic(&path).expect("answer is written");
+
+        let mut config = RunnerConfig::new(&issue, workflow, FakeHarness::new());
+        config.log = Box::new(MemoryLog::new());
+        let mut resumed = Runner::resume(config).expect("resume");
+        assert_eq!(resumed.run().expect("resumed run"), RunStatus::Done);
+        assert!(
+            resumed.harness().calls().is_empty(),
+            "a question step opens no harness session"
+        );
+
+        let document = run_md(&issue);
+        assert_eq!(document.front.get("status"), Some("done"));
+        assert!(
+            document.body.contains("| approve-plan | - | 1 | done |"),
+            "{}",
+            document.body
+        );
+        assert!(
+            !issue.join("questions/02.md").exists(),
+            "no second question"
+        );
     }
 }
