@@ -202,6 +202,11 @@ pub struct Runner<H> {
     completed: BTreeMap<String, BTreeSet<u32>>,
     /// Ready-to-write rows of `run.md`'s log table, oldest first.
     rows: Vec<String>,
+    /// The step the engine is on, written into `run.md`'s `step:` at each step
+    /// start. Without it a run that is mid-step reads like one that has not
+    /// started the next step yet, which is what a screen without a live
+    /// session shows.
+    current_step: Option<String>,
     /// When this run started, as an RFC 3339 UTC timestamp.
     started: String,
     /// Why the run stopped, rendered into `run.md` when it is not `Done`.
@@ -277,6 +282,7 @@ impl<H: Harness> Runner<H> {
             done: BTreeSet::new(),
             completed: BTreeMap::new(),
             rows: Vec::new(),
+            current_step: None,
             started: timestamp(SystemTime::now()),
             note: None,
             resumed: false,
@@ -590,6 +596,11 @@ impl<H: Harness> Runner<H> {
     /// Run one step's attempts, writing rows and repairs, until it passes.
     fn run_step(&mut self, step: &Step, task: Option<&Task>) -> Result<StepRun> {
         let label = step_label(step, task);
+        // Record which step is running before the first attempt, so the run
+        // strip names it while its session works — a step can run for minutes
+        // and `run.md` otherwise only changes when it finishes.
+        self.current_step = Some(step.id.clone());
+        self.write_run()?;
 
         match step.kind {
             StepKind::Question => {
@@ -1113,6 +1124,9 @@ impl<H: Harness> Runner<H> {
         front.set("workflow", self.workflow.name.clone());
         front.set("revision", self.workflow.revision.to_string());
         front.set("status", self.status.as_str());
+        if let Some(step) = &self.current_step {
+            front.set("step", step.clone());
+        }
         front.set("started", self.started.clone());
         front.set("updated", timestamp(SystemTime::now()));
 
@@ -1312,6 +1326,7 @@ mod tests {
     use crate::test_support::TempDir;
     use crate::worktree::{Repo, TaskWorktree};
     use std::process::Command;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     fn workflow(text: &str) -> Workflow {
@@ -1339,6 +1354,77 @@ mod tests {
 
     fn run_md(issue: &Path) -> Document {
         Document::read(issue.join("run.md")).expect("run.md parses")
+    }
+
+    /// A harness that reads `run.md` when the engine calls it, so a test can
+    /// see what the record said while the step was running.
+    struct ReadingHarness {
+        issue: PathBuf,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Harness for ReadingHarness {
+        fn run(&mut self, _request: &StepRequest) -> Result<StepOutcome> {
+            let document = Document::read(self.issue.join("run.md"))?;
+            let status = document.front.get("status").unwrap_or("none");
+            let step = document.front.get("step").unwrap_or("none");
+            self.seen
+                .lock()
+                .expect("seen lock")
+                .push(format!("{status}/{step}"));
+            Ok(StepOutcome::Done {
+                wrote: Vec::new(),
+                text: "ok".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn run_md_names_the_step_while_it_runs() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let workflow = workflow(
+            r#"
+schema = 1
+name = "implement"
+revision = 1
+
+[[step]]
+id = "analyze"
+kind = "harness"
+skill = "analyze"
+
+[[step]]
+id = "split"
+kind = "harness"
+skill = "split"
+depends_on = ["analyze"]
+"#,
+        );
+        let mut config = RunnerConfig::new(
+            &issue,
+            workflow,
+            ReadingHarness {
+                issue: issue.clone(),
+                seen: Arc::clone(&seen),
+            },
+        );
+        config.workdir = dir.path().to_path_buf();
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+
+        assert_eq!(
+            *seen.lock().expect("seen lock"),
+            vec!["running/analyze".to_owned(), "running/split".to_owned()],
+            "each session is called while `run.md` names its step"
+        );
+        assert_eq!(
+            run_md(&issue).front.get("step"),
+            Some("split"),
+            "the finished record keeps the last step it ran"
+        );
     }
 
     #[test]

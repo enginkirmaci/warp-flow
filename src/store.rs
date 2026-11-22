@@ -1824,4 +1824,29 @@ produces = "spec.md"
             ["done", "failed"]
         );
     }
+
+    #[test]
+    fn the_step_run_md_names_is_the_running_one() {
+        let step = Step {
+            id: "split".to_owned(),
+            kind: StepKind::Harness,
+            skill: Some("split".to_owned()),
+            gate: None,
+            depends_on: Vec::new(),
+            produces: None,
+            per_task: false,
+        };
+        let rows = vec![row("analyze", "-", 1, "done")];
+
+        assert_eq!(
+            step_state(&step, None, &rows, &[], "running", "split"),
+            StepState::Running,
+            "a run mid-step names that step while its session works"
+        );
+        assert_eq!(
+            step_state(&step, None, &rows, &[], "blocked", "split"),
+            StepState::Idle,
+            "a stopped run shows no step as running"
+        );
+    }
 }
