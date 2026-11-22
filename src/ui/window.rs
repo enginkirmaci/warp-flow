@@ -795,10 +795,34 @@ impl FlowApp {
             window.focus(&self.board_focus, cx);
             return;
         }
+        self.adopt_repo(repo, cx);
+        window.focus(&self.board_focus, cx);
+    }
+
+    /// Take `repo` as the window's selected repository without a frame of its
+    /// own, keeping the cursor and the open run attached to what the filter
+    /// still holds.
+    ///
+    /// The repository list, the detail's head and the board's filter all read
+    /// this one value. The gates screen adds a folder to the settings without
+    /// a click on a row, so it calls this: a screen-level selection alone would
+    /// leave the head describing the folder before it.
+    pub(crate) fn adopt_repo(&mut self, repo: Option<PathBuf>, cx: &mut Context<Self>) {
         self.selected_repo = repo;
         let visible = self.visible_keys();
         self.cursor = visible.first().cloned();
-        if let Some(selected) = &self.selected_run
+        // In the Repos section the head and the tab under it read two values:
+        // the window's selection and the screen's own. Point the screen now,
+        // while `screen` still names the open tab, so a row clicked here moves
+        // the gate editor with the head it sits under.
+        if self.section == Section::Repos {
+            self.refresh_screens(cx);
+        }
+        // A filter that no longer holds the open run closes it — but that is
+        // the Runs section's detail; the Repos section's tab is not a run, and
+        // closing it here would leave the section with no screen to point.
+        if self.section == Section::Runs
+            && let Some(selected) = &self.selected_run
             && !self
                 .snapshot
                 .runs_for(self.selected_repo.as_deref())
@@ -806,7 +830,6 @@ impl FlowApp {
         {
             self.close_detail(cx);
         }
-        window.focus(&self.board_focus, cx);
         cx.notify();
     }
 

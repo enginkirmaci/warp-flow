@@ -768,7 +768,7 @@ impl GatesScreen {
         };
         self.settings.repos.push(path.clone());
         self.settings.save();
-        self.notify_window(cx);
+        self.notify_window(Some(path.clone()), cx);
         input.update(cx, |state, cx| state.set_value("", window, cx));
         self.add_note = Some(note);
         self.select_repository(path, cx);
@@ -803,7 +803,7 @@ impl GatesScreen {
         }
         self.settings.repos.push(path.clone());
         self.settings.save();
-        self.notify_window(cx);
+        self.notify_window(Some(path.clone()), cx);
         self.select_repository(path, cx);
         Ok(())
     }
@@ -831,9 +831,12 @@ impl GatesScreen {
     }
 
     /// Tell the window its settings changed, so it rescans with the new list
-    /// and repaints the rail. A screen built without a window (a probe) has
-    /// nobody to tell.
-    fn notify_window(&self, cx: &mut Context<Self>) {
+    /// and repaints the rail. `select` is the repository the screen moved to,
+    /// when it moved: the window's selected repository drives the list's row,
+    /// the detail's head and the board's filter, so a folder added here must
+    /// land there too or the head keeps naming the one before it. A screen
+    /// built without a window (a probe) has nobody to tell.
+    fn notify_window(&self, select: Option<PathBuf>, cx: &mut Context<Self>) {
         let Some(window) = self.window.clone() else {
             return;
         };
@@ -841,7 +844,16 @@ impl GatesScreen {
         // refuses an entity update from inside that entity's own update, which
         // is exactly the nesting a probe (or a future caller) can create
         cx.defer(move |cx| {
-            window.update(cx, |app, cx| app.reload_settings(cx)).ok();
+            window
+                .update(cx, |app, cx| {
+                    app.reload_settings(cx);
+                    // after the reload, so a repository the new settings no
+                    // longer hold is not adopted on the way in
+                    if let Some(repo) = select {
+                        app.adopt_repo(Some(repo), cx);
+                    }
+                })
+                .ok();
         });
     }
 
@@ -852,7 +864,7 @@ impl GatesScreen {
         }
         let removed = self.settings.repos.remove(index);
         self.settings.save();
-        self.notify_window(cx);
+        self.notify_window(None, cx);
         self.add_note = Some(Note::quiet(format!(
             "Removed {} from this window; the folder is untouched.",
             store::display_path(&removed)

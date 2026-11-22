@@ -144,13 +144,52 @@ fn a_repository_added_in_the_screen_reaches_the_board_at_once(cx: &mut TestAppCo
         .expect("the repository is added");
     settle(cx);
 
-    // the board, brought back by its rail row, has the new card
+    // the add also moved the window's selection, the way clicking the row
+    // would: the list's row, the detail's head and the board's filter are one
+    // value, and the board now shows the repository just added
+    let selected = handle
+        .read_with(cx, |app, _| {
+            app.selected_repo_for_probe().map(Path::to_path_buf)
+        })
+        .expect("the window is open");
+    assert_eq!(
+        selected.as_deref(),
+        Some(second.as_path()),
+        "the window selected the repository the screen added"
+    );
+
+    // a row clicked in the same list moves the gate editor with the head: the
+    // two views read one selection
+    click(cx, "flow-repo-repo-a");
+    let (selected, pointed) = handle
+        .read_with(cx, |app, cx| {
+            (
+                app.selected_repo_for_probe().map(Path::to_path_buf),
+                app.screens_for_probe()
+                    .gates_for_probe()
+                    .read(cx)
+                    .selected_for_probe()
+                    .map(Path::to_path_buf),
+            )
+        })
+        .expect("the window is open");
+    assert_eq!(selected.as_deref(), Some(first.as_path()));
+    assert_eq!(
+        pointed.as_deref(),
+        Some(first.as_path()),
+        "the gate editor reads the repository the row selected"
+    );
+    click(cx, "flow-repo-repo-b");
+
     click(cx, "flow-rail-runs");
     assert!(
         cx.debug_bounds("flow-card-repo-b-beta-run").is_some(),
         "the added repository's run is on the board"
     );
-    assert!(cx.debug_bounds("flow-card-repo-a-alpha-run").is_some());
+    assert!(
+        cx.debug_bounds("flow-card-repo-a-alpha-run").is_none(),
+        "the board is filtered to the repository the add selected"
+    );
     let scanned = handle
         .read_with(cx, |app, _| app.settings_for_probe().repos.len())
         .expect("the window is open");
