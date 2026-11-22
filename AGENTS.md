@@ -9,6 +9,12 @@ either way. This file adds only the app-specific facts.
 
 - `crates/warp-flow-core/` — the engine. No UI, no model client, no network of
   its own: it talks to warp-agent through the door.
+- `crates/warp-flow-core/skills/` — the skill documents, embedded with
+  `include_str!` and inlined whole into every harness prompt (`src/skill.rs`):
+  the door has no system-prompt channel, and a prompt naming a skill without
+  carrying it sends the session hunting the filesystem. A workflow naming a
+  document this build does not ship is refused during preparation, naming the
+  step and the shipped set; add a document here when a graph names one.
 - `src/main.rs` — the thin launcher for the desktop app; `src/lib.rs` is the
   probe boundary, and `src/store.rs` is the filesystem scan behind the board.
 - `src/host.rs` — the engine host: one blocking `Runner` per issue folder on a
@@ -58,7 +64,9 @@ withdraws the door and asks a blocking engine to stop.
 - Markdown under `.scratch/<feature-slug>/` in the *target* repository is the
   only durable state. No database, nothing that exists only in memory.
 - A step is a harness session; the engine decides from artifacts and gate exit
-  codes, never from a model's opinion of itself.
+  codes, never from a model's opinion of itself. The prompt is the skill
+  document plus the step's inputs; a step's time budget is a silence window
+  that progress resets, not a cap on the whole turn.
 - The engine writes the issue folder, `run.md` and `questions/`, and commits
   that folder — only that folder, only on `main`, with hooks and signing off —
   at three points: `flow: issue <slug>` at run start, `flow: record <slug>`

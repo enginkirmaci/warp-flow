@@ -27,6 +27,7 @@ pub mod harness;
 pub mod merge;
 pub mod prepare;
 pub mod run;
+pub mod skill;
 pub mod worktree;
 
 #[cfg(test)]

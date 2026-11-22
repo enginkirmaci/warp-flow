@@ -77,7 +77,7 @@ revision = 1
 [[step]]
 id = "work"
 kind = "harness"
-skill = "probe"
+skill = "code"
 
 [[step]]
 id = "check"

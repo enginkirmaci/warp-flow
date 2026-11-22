@@ -143,7 +143,7 @@ per_task = true
 [[step]]
 id = "merge"
 kind = "harness"
-skill = "merge"
+skill = "code"
 depends_on = ["test"]
 per_task = true
 "#;

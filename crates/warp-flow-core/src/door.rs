@@ -50,8 +50,24 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The cap on waiting for the push that names a freshly created session.
 const SESSION_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The cap on waiting for `session-status` `idle` after a prompt.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long a prompted session may go without pushing anything before it is
+/// treated as stuck.
+///
+/// Silence is the signal, not elapsed time: a working turn streams `part`,
+/// `message` and `tool` frames, so a session that is quiet for ten minutes is
+/// hung rather than thinking — long enough for one cold compile inside a tool
+/// call, which pushes nothing until it settles.
+///
+/// This was 90 s measured on an idle wait that only counted `session-status
+/// idle`, which killed every real analysis at the cap while it was still
+/// pushing frames.
+const IDLE_SILENCE: Duration = Duration::from_secs(600);
+
+/// The cap on one prompted turn, however busy the session looks.
+///
+/// A step is an agent session, so it is budgeted like the longest gate (the
+/// clippy gate here allows 1800 s) rather than like a request.
+const TURN_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// How long `local` waits for an endpoint file that is mid-write.
 const ENDPOINT_RETRY: Duration = Duration::from_secs(1);
@@ -442,23 +458,28 @@ impl Drop for DoorClient {
     }
 }
 
-/// How long [`DoorHarness`] waits for the two asynchronous halves of a step.
+/// How long [`DoorHarness`] waits for the asynchronous halves of a step.
 ///
-/// The defaults are the measured caps (20 s for the create push, 90 s for
-/// idle); tests shrink them so a timeout is observed without waiting.
+/// The defaults are the measured caps (20 s for the create push) and the two
+/// budgets a prompted turn gets: a silence window that progress resets, and a
+/// hard ceiling on the whole turn. Tests shrink them so a timeout is observed
+/// without waiting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DoorTimeouts {
     /// How long a freshly created session may take to be named in a push.
     pub session: Duration,
-    /// How long a prompted session may take to report `idle`.
+    /// How long a prompted session may go without a push before it is stuck.
     pub idle: Duration,
+    /// The cap on the whole prompted turn, however much it keeps pushing.
+    pub turn: Duration,
 }
 
 impl Default for DoorTimeouts {
     fn default() -> Self {
         Self {
             session: SESSION_TIMEOUT,
-            idle: IDLE_TIMEOUT,
+            idle: IDLE_SILENCE,
+            turn: TURN_TIMEOUT,
         }
     }
 }
@@ -570,11 +591,17 @@ impl DoorHarness {
                 record_session(request, &harness, &session, "failed", &recorded);
                 Ok(StepOutcome::Blocked { reason })
             }
-            Status::TimedOut => {
-                let reason = format!(
-                    "the session did not report idle within {:?}",
-                    self.timeouts.idle
-                );
+            Status::TimedOut(cap) => {
+                let reason = match cap {
+                    Timeout::Silence => format!(
+                        "the session reported no progress for {:?}",
+                        self.timeouts.idle
+                    ),
+                    Timeout::Turn => format!(
+                        "the session did not report idle within the {:?} turn ceiling",
+                        self.timeouts.turn
+                    ),
+                };
                 let mut interrupted = reason;
                 let interrupt = json!({
                     "harness": harness,
@@ -711,25 +738,46 @@ impl DoorHarness {
         )))
     }
 
-    /// Wait until the session reports `idle`, an error arrives, or the cap
-    /// expires. Identical frames are ignored: the backend broadcasts some
-    /// statuses twice, and a duplicate `busy` must not extend the wait.
+    /// Wait until the session reports `idle`, an error arrives, or a budget
+    /// expires.
+    ///
+    /// Two budgets, because a step is a working agent and not a request: the
+    /// silence window resets on every frame the session pushes, and only the
+    /// whole-turn ceiling is indifferent to progress. A session that streamed
+    /// `part` snapshots for the whole window used to be killed at a fixed
+    /// 90 s cap while it was still working; a session that says nothing gets
+    /// interruptable after the silence window instead.
+    ///
+    /// Identical `session-status` frames are ignored: the backend broadcasts
+    /// some statuses twice, and a duplicate `busy` is not progress. Other
+    /// frames are snapshots that change, so they are not collected — keeping
+    /// every one would grow without bound over a long turn.
     fn await_idle(&self, harness: &str, session: &str) -> Result<Status> {
-        let deadline = Instant::now() + self.timeouts.idle;
-        let mut seen: HashSet<String> = HashSet::new();
+        let started = Instant::now();
+        let mut last_progress = started;
+        let mut statuses: HashSet<String> = HashSet::new();
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Ok(Status::TimedOut);
+            let now = Instant::now();
+            if now.saturating_duration_since(started) >= self.timeouts.turn {
+                return Ok(Status::TimedOut(Timeout::Turn));
             }
-            let Some(event) = self.client.next_event(remaining) else {
+            let quiet = now.saturating_duration_since(last_progress);
+            if quiet >= self.timeouts.idle {
+                return Ok(Status::TimedOut(Timeout::Silence));
+            }
+            let wait = self.timeouts.idle.saturating_sub(quiet).min(
+                self.timeouts
+                    .turn
+                    .saturating_sub(now.saturating_duration_since(started)),
+            );
+            let Some(event) = self.client.next_event(wait) else {
                 if self.client.is_closed() {
                     return Err(Error::Harness(format!(
                         "the door connection closed while waiting for session `{session}`: {}",
                         self.client.closed_reason()
                     )));
                 }
-                return Ok(Status::TimedOut);
+                continue;
             };
             if !event.is_harness_event()
                 || event.harness() != Some(harness)
@@ -737,27 +785,34 @@ impl DoorHarness {
             {
                 continue;
             }
-            if !seen.insert(fingerprint(&event)) {
-                continue;
-            }
             match event.kind() {
-                Some("session-status") => match event.state() {
-                    Some("idle") => return Ok(Status::Idle),
-                    Some("error") => {
-                        return Ok(Status::Failed(format!(
-                            "the harness reported session status `error`{}",
-                            message_suffix(&event)
-                        )));
+                Some("session-status") => {
+                    if !statuses.insert(fingerprint(&event)) {
+                        continue;
                     }
-                    _ => {}
-                },
+                    last_progress = Instant::now();
+                    match event.state() {
+                        Some("idle") => return Ok(Status::Idle),
+                        Some("error") => {
+                            return Ok(Status::Failed(format!(
+                                "the harness reported session status `error`{}",
+                                message_suffix(&event)
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
                 Some("error") => {
                     return Ok(Status::Failed(format!(
                         "the harness reported an error{}",
                         message_suffix(&event)
                     )));
                 }
-                _ => {}
+                _ => {
+                    // A part snapshot, a message or a tool frame: the session
+                    // is alive, whatever the clock says.
+                    last_progress = Instant::now();
+                }
             }
         }
     }
@@ -824,8 +879,18 @@ enum Status {
     Idle,
     /// The harness reported an error instead of finishing.
     Failed(String),
-    /// The cap expired while the session was still working.
-    TimedOut,
+    /// A cap expired while the session had not finished.
+    TimedOut(Timeout),
+}
+
+/// Which budget a [`Status::TimedOut`] expired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Timeout {
+    /// No push at all for the silence window: the session is hung.
+    Silence,
+    /// The whole-turn ceiling expired: the session is still working, but the
+    /// step has taken as long as it may.
+    Turn,
 }
 
 /// The reader thread: route answers by id and pushes onto the event channel.
@@ -1239,5 +1304,24 @@ mod tests {
             "subscription": "two",
         }));
         assert_eq!(fingerprint(&first), fingerprint(&second));
+    }
+
+    #[test]
+    fn the_default_budgets_let_a_real_turn_finish() {
+        let timeouts = DoorTimeouts::default();
+        assert!(
+            timeouts.idle >= Duration::from_secs(300),
+            "the silence window must outlast one long model or tool call: {:?}",
+            timeouts.idle
+        );
+        assert!(
+            timeouts.turn >= Duration::from_secs(1800),
+            "a whole turn may not be killed at an analysis-sized cap: {:?}",
+            timeouts.turn
+        );
+        assert!(
+            timeouts.turn > timeouts.idle,
+            "the ceiling is the larger budget: {timeouts:?}"
+        );
     }
 }

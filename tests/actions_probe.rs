@@ -77,7 +77,7 @@ fn seed_repo(home: &Path, name: &str, with_workflow: bool) -> (PathBuf, PathBuf)
         fs::write(
             issue.join("workflow.toml"),
             "schema = 1\nname = \"probe\"\nrevision = 1\n\n[[step]]\n\
-             id = \"work\"\nkind = \"harness\"\nskill = \"probe\"\n",
+             id = \"work\"\nkind = \"harness\"\nskill = \"code\"\n",
         )
         .expect("workflow.toml");
     }

@@ -32,6 +32,14 @@ const HARNESS: &str = "dsh";
 const MODEL: &str = "opencode-go/deepseek-v4.1-flash";
 const PROMPT: &str = "Reply with exactly the word ok and nothing else.";
 
+/// How long a streaming turn keeps moving, and how often a snapshot lands.
+///
+/// The total (`STREAM_FRAMES * STREAM_INTERVAL`) is deliberately longer than
+/// the idle cap the probe hands the client, so a client that measures the
+/// whole turn rather than the silence gives up on a session that is working.
+const STREAM_FRAMES: u32 = 20;
+const STREAM_INTERVAL: Duration = Duration::from_millis(50);
+
 /// How the fake door ends a prompt.
 #[derive(Debug, Clone, Copy)]
 enum Mode {
@@ -39,6 +47,9 @@ enum Mode {
     RoundTrip,
     /// Push everything but never `idle`, so the client's cap expires.
     NeverIdle,
+    /// Keep streaming part snapshots for longer than the cap, then `idle`:
+    /// a working session, not a stuck one.
+    Streaming,
     /// Close the connection right after the welcome.
     CloseAfterAuth,
 }
@@ -259,6 +270,7 @@ fn serve(
             ("harness", Some("transcript")) => {
                 let text = match mode {
                     Mode::NeverIdle => "partial",
+                    Mode::Streaming => "streamed",
                     _ => "ok",
                 };
                 send(&mut writer, &transcript_answer(&id, &prompt, text))
@@ -412,6 +424,7 @@ fn pushes(
     )?;
     let text = match mode {
         Mode::NeverIdle => "partial",
+        Mode::Streaming => "streamed",
         _ => "ok",
     };
     push_event(
@@ -424,6 +437,24 @@ fn pushes(
         }),
         subscription,
     )?;
+    if matches!(mode, Mode::Streaming) {
+        // A working session keeps the part snapshot moving. The snapshots are
+        // all distinct, so the client cannot dedupe them away, and the turn
+        // outlives the cap it is measured against.
+        for step in 1..=STREAM_FRAMES {
+            thread::sleep(STREAM_INTERVAL);
+            push_event(
+                stream,
+                "part",
+                json!({
+                    "id": "dsh-1-1-t0",
+                    "message_id": "dsh-1-1",
+                    "payload": {"kind": "text", "text": format!("{text} {step}")},
+                }),
+                subscription,
+            )?;
+        }
+    }
     if matches!(mode, Mode::RoundTrip) {
         push_event(
             stream,
@@ -432,6 +463,14 @@ fn pushes(
             subscription,
         )?;
         duplicates.fetch_add(1, Ordering::SeqCst);
+        push_event(
+            stream,
+            "session-status",
+            json!({"state": "idle"}),
+            subscription,
+        )?;
+    }
+    if matches!(mode, Mode::Streaming) {
         push_event(
             stream,
             "session-status",
@@ -667,12 +706,49 @@ fn the_harness_subscribes_before_create_and_narrows_afterwards() {
 }
 
 #[test]
+fn a_session_that_keeps_streaming_past_the_cap_finishes() {
+    let fake = FakeDoor::start(Mode::Streaming);
+    let client = DoorClient::connect(fake.port(), TOKEN).expect("connect to the fake door");
+    // The turn outlives the silence window several times over while every
+    // single gap inside it stays far below it.
+    let timeouts = DoorTimeouts {
+        session: Duration::from_secs(2),
+        idle: Duration::from_millis(400),
+        turn: Duration::from_secs(30),
+    };
+    let mut harness = DoorHarness::with_timeouts(client, timeouts);
+
+    let outcome = harness
+        .run(&step_request(PROMPT))
+        .expect("a working session is not an engine error");
+
+    match outcome {
+        StepOutcome::Done { text, .. } => assert_eq!(
+            text, "streamed",
+            "the streamed turn finished and its transcript is the answer"
+        ),
+        StepOutcome::Blocked { reason } => {
+            panic!("a session that kept pushing part snapshots was treated as stuck: {reason}")
+        }
+    }
+
+    let records = fake.records();
+    assert!(
+        records
+            .iter()
+            .all(|record| record.method.as_deref() != Some("interrupt")),
+        "a working session must not be interrupted: {records:#?}"
+    );
+}
+
+#[test]
 fn a_session_that_never_idles_is_interrupted_and_reported_blocked() {
     let fake = FakeDoor::start(Mode::NeverIdle);
     let client = DoorClient::connect(fake.port(), TOKEN).expect("connect to the fake door");
     let timeouts = DoorTimeouts {
         session: Duration::from_secs(2),
         idle: Duration::from_millis(250),
+        turn: Duration::from_secs(30),
     };
     let mut harness = DoorHarness::with_timeouts(client, timeouts);
 
@@ -683,8 +759,8 @@ fn a_session_that_never_idles_is_interrupted_and_reported_blocked() {
     match outcome {
         StepOutcome::Blocked { reason } => {
             assert!(
-                reason.contains("idle"),
-                "the reason names the wait: {reason}"
+                reason.contains("no progress"),
+                "the reason names the silence that expired, not a total cap: {reason}"
             );
             assert!(
                 reason.contains("250"),

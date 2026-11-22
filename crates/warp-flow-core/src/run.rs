@@ -27,7 +27,7 @@ use crate::graph::{Step, StepKind, Workflow};
 use crate::harness::{Harness, StepOutcome, StepRequest};
 use crate::merge::{MergeOutcome, MergeRequest};
 use crate::worktree::{Repo, TaskWorktree};
-use crate::{Error, Result};
+use crate::{Error, Result, skill};
 
 /// The attempt budget a run starts with; a repair is one more attempt.
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
@@ -729,7 +729,7 @@ impl<H: Harness> Runner<H> {
             step: step.clone(),
             issue: self.issue.clone(),
             workdir,
-            prompt: self.prompt(step, task),
+            prompt: self.prompt(step, task)?,
             task: task.map(|task| task.number),
             attempt,
         };
@@ -975,7 +975,12 @@ impl<H: Harness> Runner<H> {
     }
 
     /// The prompt an engine session receives for one step.
-    fn prompt(&self, step: &Step, task: Option<&Task>) -> String {
+    ///
+    /// ADR-0008: the engine composes the step's **skill document** and its
+    /// inputs into the prompt. The document travels in the text because the
+    /// door has no system-prompt channel; a name alone would send the session
+    /// looking for a document nobody shipped.
+    fn prompt(&self, step: &Step, task: Option<&Task>) -> Result<String> {
         let mut prompt = format!(
             "Run step `{}` of workflow `{}` (revision {}) for issue `{}`.\n\
              The issue folder is {}.\n",
@@ -986,7 +991,18 @@ impl<H: Harness> Runner<H> {
             self.issue.display()
         );
         if let Some(skill) = &step.skill {
-            prompt.push_str(&format!("Follow the `{skill}` skill.\n"));
+            let document = skill::document(skill).ok_or_else(|| {
+                Error::Run(format!(
+                    "step `{}` names the skill `{skill}`, which this build does not ship; \
+                     it ships: {}",
+                    step.id,
+                    skill::shipped()
+                ))
+            })?;
+            prompt.push_str(&format!("Follow the `{skill}` skill below.\n"));
+            prompt.push('\n');
+            prompt.push_str(document.trim_end());
+            prompt.push('\n');
         }
         if let Some(produces) = &step.produces {
             prompt.push_str(&format!(
@@ -1002,7 +1018,7 @@ impl<H: Harness> Runner<H> {
             ));
         }
         prompt.push_str("\nWrite your files and report what you did.\n");
-        prompt
+        Ok(prompt)
     }
 
     /// Write an open question and return its path.
@@ -1323,6 +1339,44 @@ mod tests {
 
     fn run_md(issue: &Path) -> Document {
         Document::read(issue.join("run.md")).expect("run.md parses")
+    }
+
+    #[test]
+    fn the_prompt_carries_the_step_skill_document() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let mut harness = FakeHarness::new();
+        harness.script(
+            "analyze",
+            Scripted::Done {
+                files: vec![(issue.join("spec.md"), "# Spec\n".to_owned())],
+                text: "distilled".to_owned(),
+            },
+        );
+        let workflow = workflow(
+            r#"
+schema = 1
+name = "implement"
+revision = 1
+
+[[step]]
+id = "analyze"
+kind = "harness"
+skill = "analyze"
+produces = "spec.md"
+"#,
+        );
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.workdir = dir.path().to_path_buf();
+        let mut runner = Runner::new(config).expect("runner");
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+
+        let prompt = &runner.harness().calls()[0].prompt;
+        let document = crate::skill::document("analyze").expect("`analyze` is shipped");
+        assert!(
+            prompt.contains(document.trim_end()),
+            "the prompt must carry the whole `analyze` document, not only its name: {prompt}"
+        );
     }
 
     #[test]

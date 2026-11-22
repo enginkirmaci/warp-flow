@@ -30,7 +30,7 @@ use crate::graph::{StepKind, Workflow};
 use crate::harness::Harness;
 use crate::run::{LogSink, Runner, RunnerConfig};
 use crate::worktree::Repo;
-use crate::{Error, Result};
+use crate::{Error, Result, skill};
 
 /// Everything a run needs before it may contact a harness.
 ///
@@ -75,6 +75,7 @@ pub fn prepare(issue: &Path) -> Result<Prepared> {
     let state = Issue::open(issue)?;
     let gates = flow.gates();
     check_gates(&workflow, &gates)?;
+    check_skills(&workflow)?;
     Ok(Prepared {
         issue: issue.to_path_buf(),
         title: title_of(issue),
@@ -205,6 +206,29 @@ fn check_gates(workflow: &Workflow, gates: &BTreeMap<String, Gate>) -> Result<()
             return Err(Error::Run(format!(
                 "step `{}` runs gate `{name}`, which `flow.toml` does not define",
                 step.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Reject a harness step whose skill this build does not ship, before any run.
+///
+/// The prompt carries the skill document itself (ADR-0008), so a name without
+/// one is a misconfigured workflow, not a session's problem: catching it here
+/// names the step a person can fix instead of spending three attempts on a
+/// session that goes looking for the document and runs out of time.
+fn check_skills(workflow: &Workflow) -> Result<()> {
+    for step in &workflow.steps {
+        let Some(name) = step.skill.as_deref() else {
+            continue;
+        };
+        if skill::document(name).is_none() {
+            return Err(Error::Run(format!(
+                "step `{}` names the skill `{name}`, which this build does not ship; \
+                 it ships: {}",
+                step.id,
+                skill::shipped()
             )));
         }
     }
@@ -404,6 +428,31 @@ depends_on = ["check"]
         assert_eq!(config.merge_gates.len(), 1);
         assert_eq!(config.issue, issue);
         assert_eq!(config.max_attempts, crate::run::DEFAULT_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn a_workflow_naming_an_unshipped_skill_is_refused_before_a_harness() {
+        let dir = TempDir::new();
+        let (_root, issue) = fixture(&dir);
+        // The suite's own template names `analyze`; `repair` is a document the
+        // plan lists but this build does not ship yet.
+        fs::write(
+            issue.join("workflow.toml"),
+            WORKFLOW.replace(r#"skill = "code""#, r#"skill = "repair""#),
+        )
+        .expect("workflow.toml");
+
+        let error = prepare(&issue).expect_err("an unshipped skill is refused");
+        let text = error.to_string();
+        assert!(text.contains("`repair`"), "the name is quoted: {text}");
+        assert!(
+            text.contains("does not ship"),
+            "the refusal says what is wrong: {text}"
+        );
+        assert!(
+            text.contains("analyze, split, code, review"),
+            "the refusal names what is available: {text}"
+        );
     }
 
     #[test]
