@@ -235,8 +235,8 @@ impl FlowApp {
             .max_w(px(theme::scaled(shell::READING_WIDTH)))
             .mx_auto();
 
-        if let Some(error) = &self.run_action_error {
-            column = column.child(action_error_line(error));
+        for error in run_error_lines(self.run_action_error.as_deref(), host.as_ref()) {
+            column = column.child(action_error_line(&error));
         }
 
         let issue_on_top = question.is_none()
@@ -660,7 +660,7 @@ impl FlowApp {
                     .child(why),
             );
 
-        if let Some(line) = host_failure_line(host).or_else(|| failure_line(run)) {
+        if let Some(line) = host_failure_line(host).or_else(|| failure_line(run, failed)) {
             card = card.child(
                 div()
                     .mt(px(10.))
@@ -2301,9 +2301,30 @@ fn paused_note(host: Option<&RunSnapshot>) -> AnyElement {
         .into_any_element()
 }
 
-/// The last failing line the engine left: its own log first, then a failed
-/// session's transcript, then the newest failed attempt in `run.md`.
-fn failure_line(run: &Run) -> Option<String> {
+/// The last failing line the engine left: the repair record first, then a
+/// failed session's transcript, then the newest failed attempt in `run.md`.
+///
+/// The repair is first because it is the engine's own sentence about why the
+/// step stopped, and the only one that survives the app restarting — the card
+/// promises the repair file has the detail, so it must read it.
+fn failure_line(run: &Run, failed: Option<&StepView>) -> Option<String> {
+    let step = failed.map(|step| step.id.as_str());
+    let repair = run
+        .repairs
+        .iter()
+        .rev()
+        .find(|repair| step.is_none_or(|id| repair.step == id))
+        .and_then(|repair| {
+            repair
+                .summary
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(|reason| format!("{} attempt {}: {reason}", repair.step, repair.attempt))
+        });
+    if repair.is_some() {
+        return repair;
+    }
     let session_line = run
         .sessions
         .iter()
@@ -2314,7 +2335,7 @@ fn failure_line(run: &Run) -> Option<String> {
                 .text
                 .lines()
                 .rev()
-                .find(|line| !line.trim().is_empty())
+                .find(|line| !line.trim().is_empty() && !is_session_placeholder(line))
         })
         .map(|line| line.trim().to_owned());
     if session_line.is_some() {
@@ -2330,6 +2351,12 @@ fn failure_line(run: &Run) -> Option<String> {
                 row.step, row.task, row.attempt, row.outcome, row.at
             )
         })
+}
+
+/// The door writes this line into a session that left no text. It is a
+/// placeholder in the artifact, not a reason, so the card never quotes it.
+fn is_session_placeholder(line: &str) -> bool {
+    line.trim() == "_The session reported no text._"
 }
 
 /// The host log's newest failing line, when this window drove the run.
@@ -2510,8 +2537,29 @@ fn phase_color(phase: Phase) -> gpui::Rgba {
     }
 }
 
+/// The error lines the run body shows above its state card: the window's own
+/// refusal first, then the host worker's.
+///
+/// A worker that never reached the engine — the door is not published, the
+/// worker thread could not start — fails before it writes a log line, so the
+/// snapshot's error is the only trace of a `Retry gate` that did nothing. The
+/// same sentence twice is one line.
+fn run_error_lines(action_error: Option<&str>, host: Option<&RunSnapshot>) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for error in [action_error, host.and_then(|host| host.error.as_deref())]
+        .into_iter()
+        .flatten()
+    {
+        let error = error.trim();
+        if !error.is_empty() && !lines.iter().any(|line| line == error) {
+            lines.push(error.to_owned());
+        }
+    }
+    lines
+}
+
 /// One readable line for a start, resume, pause, retry or abandon the host
-/// refused.
+/// refused, or for a worker that failed before it could drive.
 fn action_error_line(error: &str) -> AnyElement {
     div()
         .id("flow-run-action-error-line")
@@ -2555,4 +2603,133 @@ fn workflow_note_row(note: &str) -> AnyElement {
         ))
         .child(div().flex_1().min_w_0().child(note.to_owned()))
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Column, Repair, Run, RunKey, Session};
+
+    /// A run record with the fields the failure line reads.
+    fn run() -> Run {
+        Run {
+            key: RunKey {
+                repo: std::path::PathBuf::from("/tmp/repo"),
+                id: "demo".to_owned(),
+            },
+            dir: std::path::PathBuf::from("/tmp/repo/.scratch/demo"),
+            has_run: true,
+            title: "Demo".to_owned(),
+            column: Column::Blocked,
+            status: "blocked".to_owned(),
+            step: "analyze".to_owned(),
+            workflow: "implement@1".to_owned(),
+            attempts: 3,
+            tasks_total: 0,
+            tasks_done: 0,
+            task_rows: Vec::new(),
+            task_levels: Vec::new(),
+            question: None,
+            open_questions: Vec::new(),
+            rows: Vec::new(),
+            graph: None,
+            workflow_path: None,
+            workflow_note: None,
+            steps: Vec::new(),
+            spec: String::new(),
+            tasks: String::new(),
+            sessions: Vec::new(),
+            repairs: Vec::new(),
+            note: None,
+            updated: None,
+        }
+    }
+
+    fn repair(step: &str, attempt: u32, summary: &str) -> Repair {
+        Repair {
+            step: step.to_owned(),
+            task: None,
+            attempt: attempt.to_string(),
+            of: "3".to_owned(),
+            outcome: "blocked".to_owned(),
+            at: format!("2026-11-22T10:3{attempt}:22Z"),
+            summary: summary.to_owned(),
+        }
+    }
+
+    fn timed_out_session(text: &str) -> Session {
+        Session {
+            session: "session-1".to_owned(),
+            harness: "dsh".to_owned(),
+            step: "analyze".to_owned(),
+            task: None,
+            attempt: "3".to_owned(),
+            status: "timed-out".to_owned(),
+            updated: "2026-11-22T10:33:22Z".to_owned(),
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_blocked_card_quotes_the_repair_not_the_session_placeholder() {
+        let mut run = run();
+        run.sessions = vec![timed_out_session("_The session reported no text._")];
+        run.repairs = vec![repair(
+            "analyze",
+            3,
+            "harness blocked: the session did not report idle within 300s",
+        )];
+
+        let line = failure_line(&run, None).expect("the repair names the reason");
+
+        assert!(
+            line.contains("analyze attempt 3:"),
+            "the line names the step and attempt: {line}"
+        );
+        assert!(
+            line.contains("did not report idle"),
+            "the line is the engine's own sentence: {line}"
+        );
+        assert!(
+            !line.contains("reported no text"),
+            "the session's placeholder is never a reason: {line}"
+        );
+    }
+
+    #[test]
+    fn the_placeholder_alone_leaves_no_failure_line() {
+        let mut run = run();
+        run.sessions = vec![timed_out_session("_The session reported no text._")];
+
+        assert!(
+            failure_line(&run, None).is_none(),
+            "a session that wrote no text is not a reason"
+        );
+    }
+
+    #[test]
+    fn every_error_the_window_and_the_worker_left_is_one_line_each() {
+        let snapshot = RunSnapshot {
+            issue: std::path::PathBuf::from("/tmp/repo/.scratch/demo"),
+            repo: std::path::PathBuf::from("/tmp/repo"),
+            title: "Demo".to_owned(),
+            phase: Phase::Failed,
+            status: None,
+            started: "2026-11-22T14:05:00Z".to_owned(),
+            finished: Some("2026-11-22T14:05:01Z".to_owned()),
+            error: Some("harness: the door is not published".to_owned()),
+            log: Vec::new(),
+        };
+
+        assert_eq!(
+            run_error_lines(None, Some(&snapshot)),
+            vec!["harness: the door is not published".to_owned()],
+            "a worker that never logged is still visible"
+        );
+        assert_eq!(
+            run_error_lines(Some("  "), Some(&snapshot)).len(),
+            1,
+            "blank action errors are not lines"
+        );
+    }
 }

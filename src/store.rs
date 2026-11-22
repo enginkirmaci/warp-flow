@@ -413,6 +413,8 @@ pub struct Run {
     pub tasks: String,
     /// The harness sessions the run's steps recorded, oldest first.
     pub sessions: Vec<Session>,
+    /// The repair records the engine wrote, oldest first.
+    pub repairs: Vec<Repair>,
     /// The first artifact problem found while scanning this folder.
     pub note: Option<String>,
     /// When the folder last changed: the age the run row and the run strip
@@ -467,6 +469,30 @@ pub struct Session {
     pub updated: String,
     /// The transcript's text.
     pub text: String,
+}
+
+/// One repair record in `repairs/<NN>.md`, oldest first on the run.
+///
+/// The engine writes one per failed attempt and its body is the reason the
+/// step stopped. That reason is the only one that outlives the app: the host's
+/// live log is per window, so a run opened after a restart has nothing else to
+/// say why it is blocked.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Repair {
+    /// The step that failed.
+    pub step: String,
+    /// The task, when the step is per task.
+    pub task: Option<String>,
+    /// The attempt number.
+    pub attempt: String,
+    /// The attempt budget that attempt was spent from.
+    pub of: String,
+    /// `blocked`, `failed` or `timed-out`.
+    pub outcome: String,
+    /// When it was written, RFC 3339 UTC.
+    pub at: String,
+    /// The body after the heading: the engine's one-line reason.
+    pub summary: String,
 }
 
 /// One configured repository.
@@ -728,6 +754,7 @@ fn scan_run(
     let tasks_total = task_rows.len();
     let task_levels = task_levels(&task_rows);
     let sessions = read_sessions(&dir.join("sessions"), &mut note);
+    let repairs = read_repairs(&dir.join("repairs"), &mut note);
     let steps = match &graph {
         Some(graph) => step_views(graph, &rows, &task_rows, &open_questions, &status, &step),
         None => log_steps(&rows, &open_questions),
@@ -760,6 +787,7 @@ fn scan_run(
         spec,
         tasks: tasks_markdown,
         sessions,
+        repairs,
         note,
         // the age a row shows: `run.md`'s own write, else the folder's
         updated: modified_at(&dir.join("run.md")).or_else(|| modified_at(dir)),
@@ -987,6 +1015,69 @@ fn read_sessions(dir: &Path, note: &mut Option<String>) -> Vec<Session> {
             .then_with(|| left.task.cmp(&right.task))
     });
     sessions
+}
+
+/// Every `repairs/<NN>.md` the engine wrote, oldest first.
+///
+/// One bad file is a note, not a failed scan. The order is the recorded `at`
+/// stamp (then the attempt number), because the file number is the engine's
+/// own sequence and a repair may be appended to a resumed run later.
+fn read_repairs(dir: &Path, note: &mut Option<String>) -> Vec<Repair> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            note.get_or_insert_with(|| format!("{}: {error}", dir.display()));
+            return Vec::new();
+        }
+    };
+    let mut repairs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                note.get_or_insert_with(|| format!("{}: {error}", path.display()));
+                continue;
+            }
+        };
+        let document = match Document::parse(&text) {
+            Ok(document) => document,
+            Err(error) => {
+                note.get_or_insert_with(|| format!("{}: {error}", path.display()));
+                continue;
+            }
+        };
+        // The body opens with the engine's own heading and then the reason;
+        // the reason is what a person reads on the blocked card.
+        let summary = document
+            .body
+            .lines()
+            .skip_while(|line| line.trim().is_empty() || line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_owned();
+        repairs.push(Repair {
+            step: document.front.get("step").unwrap_or("—").to_owned(),
+            task: document.front.get("task").map(str::to_owned),
+            attempt: document.front.get("attempt").unwrap_or("—").to_owned(),
+            of: document.front.get("of").unwrap_or("—").to_owned(),
+            outcome: document.front.get("outcome").unwrap_or("—").to_owned(),
+            at: document.front.get("at").unwrap_or("").to_owned(),
+            summary,
+        });
+    }
+    repairs.sort_by(|left, right| {
+        left.at
+            .cmp(&right.at)
+            .then_with(|| left.step.cmp(&right.step))
+            .then_with(|| left.attempt.cmp(&right.attempt))
+    });
+    repairs
 }
 
 /// `tasks.md` when the run has one, else a markdown summary of the task files.
@@ -1540,6 +1631,51 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("scratch dir");
         dir
+    }
+
+    #[test]
+    fn the_repairs_read_in_order_with_their_reason() {
+        let dir = scratch_dir("repairs");
+        let repairs = dir.join("repairs");
+        fs::create_dir_all(&repairs).expect("repairs dir");
+        fs::write(
+            repairs.join("01.md"),
+            "---\nstep: analyze\nattempt: 1\nof: 3\noutcome: blocked\n\
+             at: 2026-11-22T10:30:21Z\n---\n# Repair 01: analyze (attempt 1 of 3)\n\n\
+             harness blocked: the session did not report idle within 300s\n",
+        )
+        .expect("repair 01");
+        fs::write(
+            repairs.join("02.md"),
+            "---\nstep: analyze\nattempt: 2\nof: 3\noutcome: blocked\n\
+             at: 2026-11-22T10:31:52Z\n---\n# Repair 02: analyze (attempt 2 of 3)\n\n\
+             harness blocked: the session reported no progress for 300s\n",
+        )
+        .expect("repair 02");
+
+        let mut note = None;
+        let parsed = read_repairs(&repairs, &mut note);
+
+        assert_eq!(note, None);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].step, "analyze");
+        assert_eq!(parsed[0].attempt, "1");
+        assert_eq!(parsed[0].outcome, "blocked");
+        assert!(
+            parsed[0]
+                .summary
+                .starts_with("harness blocked: the session did not report idle"),
+            "the heading is stripped and the reason kept: {:?}",
+            parsed[0].summary
+        );
+        assert_eq!(parsed[1].attempt, "2");
+        assert!(
+            parsed[1].summary.contains("no progress"),
+            "the newest repair speaks for itself: {:?}",
+            parsed[1].summary
+        );
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn task(number: u32, blocked_by: &[u32]) -> TaskRow {

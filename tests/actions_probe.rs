@@ -338,6 +338,40 @@ fn start_pause_resume_done_follows_the_host_and_shows_the_live_log(cx: &mut Test
 }
 
 #[gpui_kit::gpui::test]
+fn a_worker_that_cannot_reach_the_door_says_so(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("door-down");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+
+    let (repo, issue) = seed_repo(&home, "repo-a", true);
+    // The worker never reaches the engine, so it writes no log line; the
+    // snapshot's own error is the only trace the run screen can show.
+    let host = Arc::new(Host::with_factory(|_| {
+        Err(warp_flow_core::Error::Harness(
+            "the door is not published: probe".to_owned(),
+        ))
+    }));
+    let (handle, page) = open_app(cx, vec![repo], host);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    open_run_screen(cx);
+    click(cx, "flow-run-start");
+    pump_until_phase(cx, &page, &issue, "the worker to fail", |phase| {
+        phase == Phase::Failed
+    });
+
+    assert!(
+        cx.debug_bounds("flow-run-action-error").is_some(),
+        "a worker that failed before driving leaves one readable line"
+    );
+
+    stop_host(cx, &page);
+    cleanup(home);
+}
+
+#[gpui_kit::gpui::test]
 fn abandon_asks_once_and_then_stops_at_a_boundary(cx: &mut TestAppContext) {
     let _guard = hold_home();
     let home = scratch_home("abandon");

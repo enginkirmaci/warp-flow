@@ -1255,6 +1255,7 @@ mod tests {
             spec: String::new(),
             tasks: String::new(),
             sessions: Vec::new(),
+            repairs: Vec::new(),
             note: None,
             updated: None,
         }
