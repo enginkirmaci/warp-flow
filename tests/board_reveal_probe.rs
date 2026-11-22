@@ -43,7 +43,7 @@ fn write_run(repo: &Path, id: &str, title: &str, status: &str) {
     )
     .expect("spec.md");
     std::fs::write(
-        issue.join("workflow.toml"),
+        warp_flow_core::layout::pinned_workflow(&issue),
         "schema = 1\nname = \"implement\"\nrevision = 1\n\n[[step]]\nid = \"code\"\n\
          kind = \"harness\"\nskill = \"code\"\nper_task = true\n",
     )

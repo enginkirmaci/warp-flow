@@ -37,6 +37,25 @@ section's detail holds the 320 run column — the board read downwards, one lane
 band per state the issue folders fall into — beside the open run. The `Repos`
 section holds the selected repository's gates and workflow template.
 
+## What a repository carries
+
+Two files belong to warp-flow rather than to the project, so they live in one
+folder of their own:
+
+```text
+<repo>/.flow/flow.toml       the gates and the merge policy
+<repo>/.flow/workflow.toml   the workflow template a run copies
+```
+
+`warp-flow-core`'s `layout` module owns both paths, so the engine and the app
+cannot disagree about where a file lives. A repository that has never been
+driven has no `.flow/` yet: the first save from `Repos › Gates` or
+`Repos › Workflow` creates the folder.
+
+An issue folder keeps its own pinned copy beside its other artifacts
+(`.scratch/<feature-slug>/workflow.toml`): that is the revision the run started
+on, and it is the issue folder's file, not the repository's.
+
 The run column's **New run** is the one screen action that creates an issue
 folder: a title and the request become `.scratch/<slug>/spec.md` (a title
 already in use gets `-2`, `-3`, …), the next scan lands the run in Triage, and
@@ -53,9 +72,9 @@ run puts its four tabs in the run's head:
 | Workflow | the revision the run uses, read-only: the template is edited in Repos › Workflow |
 
 `Repos` is the window a person edits: its `Gates` tab is the repository's
-`flow.toml` as a work list and one gate editor (run once, save, remove), and its
-`Workflow` tab is the step template with its revisions. `About` carries the
-installed family, the build and the license; `Settings` the reduce-motion
+`.flow/flow.toml` as a work list and one gate editor (run once, save, remove),
+and its `Workflow` tab is the step template with its revisions. `About` carries
+the installed family, the build and the license; `Settings` the reduce-motion
 switch, where the app keeps its files, the door's state and the version.
 
 The engine owns an issue folder while it drives a run: Artifacts refuses an

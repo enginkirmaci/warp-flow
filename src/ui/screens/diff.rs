@@ -7,7 +7,7 @@
 //! the conflict bar and the diff's 44 path bar over `warpui-kit-diff`.
 //!
 //! The screen is read-only. Git, the task file, the run's conflict record and
-//! the repository's `flow.toml` are read on the background executor when `show`
+//! the repository's `.flow/flow.toml` are read on the background executor when `show`
 //! hands the screen a new [`ScreenRun`] or the task cursor moves; a frame only
 //! reads loaded state. The picker owns its cursor and arrows in the screen's own
 //! [`FocusHandle`], never a window-level handler.
@@ -1203,7 +1203,7 @@ impl DiffScreen {
                     div().py(px(8.)).child(quiet_line(
                         self.gates_note
                             .as_deref()
-                            .unwrap_or("No gates in flow.toml yet."),
+                            .unwrap_or("No gates in .flow/flow.toml yet."),
                     )),
                 );
             }
@@ -1888,7 +1888,7 @@ fn read_gate_views(repo: &Path, run: &store::Run) -> GateRead {
     match read_gates(repo) {
         Ok(gates) if gates.is_empty() => GateRead {
             gates: Vec::new(),
-            note: Some("No gates in flow.toml yet.".to_owned()),
+            note: Some("No gates in .flow/flow.toml yet.".to_owned()),
         },
         Ok(gates) => GateRead {
             gates: gates

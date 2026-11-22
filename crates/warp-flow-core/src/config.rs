@@ -1,9 +1,10 @@
-//! The repository's gate file, `flow.toml`.
+//! The repository's gate file, `.flow/flow.toml`.
 //!
-//! Every repository warp-flow drives carries one at its root. It names the
-//! merge mode, whether the merge queue may push, and the gates the workflow
-//! steps and the merge queue run. A gate is only a shell command, a working
-//! directory and a timeout; nothing here is language-specific.
+//! Every repository warp-flow drives carries one in its `.flow/` folder (see
+//! [`crate::layout`]). It names the merge mode, whether the merge queue may
+//! push, and the gates the workflow steps and the merge queue run. A gate is
+//! only a shell command, a working directory and a timeout; nothing here is
+//! language-specific.
 //!
 //! The order the gates are declared in is the order the merge queue runs them,
 //! so the cheapest check can fail a task before the expensive one starts. A
@@ -98,7 +99,7 @@ impl MergeMode {
     }
 }
 
-/// A repository's `flow.toml`: its merge policy and its gates.
+/// A repository's `.flow/flow.toml`: its merge policy and its gates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowConfig {
     schema: u32,
@@ -199,7 +200,8 @@ impl FlowConfig {
         })
     }
 
-    /// Read and parse the `flow.toml` at `path`.
+    /// Read and parse the `flow.toml` at `path`, normally
+    /// [`crate::layout::flow_file`].
     ///
     /// # Errors
     ///
@@ -295,6 +297,14 @@ impl FlowConfig {
     pub fn write(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let text = self.to_toml()?;
+        // The file lives in `.flow/`, which a repository that has never been
+        // driven does not carry yet: writing the first document creates it.
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
+        }
         let name = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -675,7 +685,7 @@ timeout_secs = 900
     #[test]
     fn write_puts_the_document_on_disk_and_read_reads_it() {
         let dir = TempDir::new();
-        let path = dir.path().join("flow.toml");
+        let path = crate::layout::flow_file(dir.path());
         let config = sample();
         config.write(&path).expect("write");
 
@@ -683,8 +693,8 @@ timeout_secs = 900
         let read = FlowConfig::read(&path).expect("read back");
         assert_eq!(read.gates_in_order(), config.gates_in_order());
 
-        // The temporary file is gone: the folder holds the flow file alone.
-        let leftovers: Vec<String> = fs::read_dir(dir.path())
+        // The temporary file is gone: `.flow/` holds the flow file alone.
+        let leftovers: Vec<String> = fs::read_dir(crate::layout::dir(dir.path()))
             .expect("list the folder")
             .flatten()
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
@@ -694,9 +704,25 @@ timeout_secs = 900
     }
 
     #[test]
+    fn writing_the_first_document_creates_the_flow_folder() {
+        let dir = TempDir::new();
+        let path = crate::layout::flow_file(dir.path());
+        assert!(!crate::layout::dir(dir.path()).exists(), "nothing yet");
+
+        sample().write(&path).expect("write");
+
+        assert!(path.is_file(), "the document is where the layout says");
+        assert_eq!(
+            FlowConfig::read(&path).expect("read back").gates_in_order(),
+            sample().gates_in_order()
+        );
+    }
+
+    #[test]
     fn a_duplicate_name_is_refused_and_its_file_is_untouched() {
         let dir = TempDir::new();
-        let path = dir.path().join("flow.toml");
+        let path = crate::layout::flow_file(dir.path());
+        fs::create_dir_all(crate::layout::dir(dir.path())).expect("the .flow folder");
         fs::write(&path, "the person's file\n").expect("seed flow.toml");
 
         let mut config = FlowConfig::new(MergeMode::Local, false);

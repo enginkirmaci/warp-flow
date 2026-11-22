@@ -12,6 +12,13 @@ rules that still matter move into `README.md` or this file.
 
 - `crates/warp-flow-core/` — the engine. No UI, no model client, no network of
   its own: it talks to warp-agent through the door.
+- `crates/warp-flow-core/src/layout.rs` — the one place that knows where a
+  repository keeps warp-flow's files: `<repo>/.flow/flow.toml` (the gates) and
+  `<repo>/.flow/workflow.toml` (the template). Never build either path by hand
+  in the engine or the app; a reader and a writer that disagree about the
+  folder is the failure this module exists to prevent. An issue folder's pinned
+  copy is the exception and stays beside its other artifacts
+  (`.scratch/<slug>/workflow.toml`), because the issue folder is the protocol.
 - `crates/warp-flow-core/skills/` — the skill documents, embedded with
   `include_str!` and inlined whole into every harness prompt (`src/skill.rs`):
   the door has no system-prompt channel, and a prompt naming a skill without
@@ -117,4 +124,3 @@ build here uses the same kit sources as a build through
 breakpoints resolve to `kits/`, not to a `~/.cargo/git/checkouts` copy.
 `Cargo.toml` and `Cargo.lock` keep the pinned tag, so CI's `--locked` build is
 unaffected; delete the file to build against the tag again.
-

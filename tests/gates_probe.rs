@@ -1,5 +1,5 @@
 //! Headless probe for the Repos & gates screen: the repositories the window
-//! shows, the `flow.toml` gates of the selected one, editing and saving that
+//! shows, the `.flow/flow.toml` gates of the selected one, editing and saving that
 //! document, one-shot runs, and remembering a repository through the store.
 //!
 //! Every scenario runs under a scratch `HOME`, so the settings document lands
@@ -69,7 +69,7 @@ cwd = "."
 timeout_secs = 30
 "#;
 
-/// A throwaway repository with `flow.toml` and one issue folder to scan.
+/// A throwaway repository with `.flow/flow.toml` and one issue folder to scan.
 fn seed_repo(home: &Path, name: &str) -> PathBuf {
     let repo = home.join(name);
     let issue = repo.join(".scratch/demo");
@@ -79,7 +79,8 @@ fn seed_repo(home: &Path, name: &str) -> PathBuf {
         "---\nstatus: ready-for-agent\n---\n\n# A gated run\n\nBody.\n",
     )
     .expect("spec.md");
-    std::fs::write(repo.join("flow.toml"), TWO_GATES).expect("flow.toml");
+    std::fs::create_dir_all(warp_flow_core::layout::dir(&repo)).expect("the .flow folder");
+    std::fs::write(warp_flow_core::layout::flow_file(&repo), TWO_GATES).expect("flow.toml");
     git(&repo, &["init", "--quiet"]);
     repo
 }
@@ -175,7 +176,7 @@ fn set_field(cx: &mut VisualTestContext, name: &str, value: &str) {
 }
 
 fn flow_path(repo: &Path) -> PathBuf {
-    repo.join("flow.toml")
+    warp_flow_core::layout::flow_file(repo)
 }
 
 fn settings_json() -> serde_json::Value {

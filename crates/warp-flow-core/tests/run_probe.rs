@@ -15,6 +15,7 @@ use warp_flow_core::control::{Control, Signal};
 use warp_flow_core::gate::Gate;
 use warp_flow_core::graph::Workflow;
 use warp_flow_core::harness::{FakeHarness, Scripted};
+use warp_flow_core::layout;
 use warp_flow_core::run::{MemoryLog, RunStatus, Runner, RunnerConfig};
 
 /// A temp directory that removes itself. The engine has no dev-dependencies so
@@ -64,7 +65,7 @@ impl World {
         let issue = root.join(".scratch/warpflow-probe");
         fs::create_dir_all(issue.join("issues")).expect("issue folder");
         fs::write(issue.join("spec.md"), "# Spec\n").expect("spec");
-        fs::write(issue.join("workflow.toml"), workflow).expect("workflow.toml");
+        fs::write(layout::pinned_workflow(&issue), workflow).expect("workflow.toml");
         Self {
             _dir: dir,
             root,
@@ -84,7 +85,8 @@ impl World {
     }
 
     fn runner(&self, harness: FakeHarness) -> Runner<FakeHarness> {
-        let workflow = Workflow::read(self.issue.join("workflow.toml")).expect("workflow parses");
+        let workflow =
+            Workflow::read(layout::pinned_workflow(&self.issue)).expect("workflow parses");
         let mut config = RunnerConfig::new(&self.issue, workflow, harness);
         config.workdir = self.root.clone();
         config
@@ -264,7 +266,7 @@ per_task = true
         cwd: world.root.clone(),
         timeout: Duration::from_secs(5),
     };
-    let workflow = Workflow::read(world.issue.join("workflow.toml")).expect("workflow parses");
+    let workflow = Workflow::read(layout::pinned_workflow(&world.issue)).expect("workflow parses");
     let mut config = RunnerConfig::new(&world.issue, workflow, FakeHarness::new());
     config.gates.insert("guard".to_owned(), gate);
     config.max_attempts = 2;
@@ -363,7 +365,8 @@ fn a_resume_whose_control_already_says_abandon_runs_no_step() {
     // Abandon: the engine's first step-boundary check must see it and record
     // the abandon before the next step runs (decision 17's seam)
     let mut config = {
-        let workflow = Workflow::read(world.issue.join("workflow.toml")).expect("workflow parses");
+        let workflow =
+            Workflow::read(layout::pinned_workflow(&world.issue)).expect("workflow parses");
         let mut config = RunnerConfig::new(&world.issue, workflow, FakeHarness::new());
         config.workdir = world.root.clone();
         config

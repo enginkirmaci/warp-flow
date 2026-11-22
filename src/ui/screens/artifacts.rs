@@ -53,8 +53,8 @@ struct Tab {
     /// The rail row's one-line meaning.
     description: String,
     /// `spec.md` and the task files are a person's; `run.md` is the engine's
-    /// record, `workflow.toml` has its own editor, a question is answered on
-    /// the run screen.
+    /// record, the workflow has its own editor, a question is answered on the
+    /// run screen.
     editable: bool,
     /// Why the tab is read-only, shown in one line under the head.
     lock_note: Option<&'static str>,
@@ -911,9 +911,11 @@ fn read_folder(issue: &Path) -> ReadFolder {
                 .get_or_insert_with(|| format!("{}: {error}", path.display()));
         }
     };
-    for name in ["spec.md", "tasks.md", "run.md", "workflow.toml"] {
+    for name in ["spec.md", "tasks.md", "run.md"] {
         read_one(issue.join(name));
     }
+    // the run's pinned revision lives beside its other artifacts
+    read_one(warp_flow_core::layout::pinned_workflow(issue));
     for (dir, extension) in [("issues", "md"), ("questions", "md")] {
         let folder = issue.join(dir);
         let Ok(entries) = std::fs::read_dir(&folder) else {
@@ -984,12 +986,12 @@ fn tabs_for(read: &ReadFolder, run: Option<&ScreenRun>) -> Vec<Tab> {
             ),
         });
         tabs.push(Tab {
-            path: issue.join("workflow.toml"),
+            path: warp_flow_core::layout::pinned_workflow(issue),
             label: "Workflow file".to_owned(),
             description: "the revision this run reads".to_owned(),
             editable: false,
             lock_note: Some(
-                "Read-only here: `workflow.toml` is edited in Repos › Workflow, which appends the next revision on save.",
+                "Read-only here: `.flow/workflow.toml` is edited in Repos › Workflow, which appends the next revision on save.",
             ),
         });
     }

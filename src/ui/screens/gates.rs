@@ -6,12 +6,12 @@
 //! right column edits the selected gate: name, command, folder and timeout, one
 //! 36-high field each, with `Run once` beside `Save`.
 //!
-//! `flow.toml` is a person's file at the repository root: this screen writes it
-//! atomically through [`super::write_atomic_raw`] and never inside the issue
-//! folder. A row's trash only edits the working copy; `Save` is the write, so a
-//! removed row is not lost until then. The engine owns the repository while it
-//! drives a run, so a manual gate run waits for the run to reach a step
-//! boundary.
+//! `.flow/flow.toml` is a person's file in the repository's `.flow/` folder:
+//! this screen writes it atomically through [`super::write_atomic_raw`] and
+//! never inside the issue folder. A row's trash only edits the working copy;
+//! `Save` is the write, so a removed row is not lost until then. The engine owns
+//! the repository while it drives a run, so a manual gate run waits for the run
+//! to reach a step boundary.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +25,7 @@ use gpui::{
 use gpui_kit::component::input::InputState;
 use warp_flow_core::config::{FlowConfig, MergeMode};
 use warp_flow_core::gate::{self, Gate, GateReport};
+use warp_flow_core::layout;
 use warp_flow_core::worktree::Repo;
 use warpui_kit_core::controls::{self, BtnKind};
 use warpui_kit_core::{A11y, field, icon, list_nav, motion, scroll, shell, tooltip::tooltip_text};
@@ -449,9 +450,9 @@ impl GatesScreen {
 
     // ---- editing the document ---------------------------------------------
 
-    /// The selected repository's `flow.toml`.
+    /// The selected repository's `.flow/flow.toml`.
     fn flow_path(&self) -> Option<PathBuf> {
-        Some(self.selected.as_ref()?.join("flow.toml"))
+        Some(layout::flow_file(self.selected.as_ref()?))
     }
 
     /// The selected row, when the document has one.
@@ -521,7 +522,7 @@ impl GatesScreen {
                 return;
             }
         };
-        let path = repo.join("flow.toml");
+        let path = layout::flow_file(&repo);
         match write_atomic_raw(&path, &text) {
             Ok(()) => {
                 self.save_note = None;
@@ -1225,7 +1226,7 @@ impl GatesScreen {
                     );
             } else {
                 empty = empty.child(quiet_line(
-                    "The gates of the selected repository appear here once its flow.toml is read.",
+                    "The gates of the selected repository appear here once its .flow/flow.toml is read.",
                 ));
             }
             list = list.child(empty);
@@ -1597,7 +1598,7 @@ impl GatesScreen {
         match &self.load {
             Load::Idle => quiet_line(
                 "Add a repository in the list beside this pane; each one's gates live in its \
-                 flow.toml.",
+                 .flow/flow.toml.",
             ),
             Load::Loading => div()
                 .flex()
@@ -1616,12 +1617,12 @@ impl GatesScreen {
                 .flex_col()
                 .gap(px(10.))
                 .child(quiet_line(format!(
-                    "There is no flow.toml at {}.",
+                    "There is no flow.toml in {}.",
                     store::display_path(path)
                 )))
                 .child(quiet_line(
-                    "A repository starts with one test gate running cargo test; the file is \
-                     yours to edit once it exists.",
+                    "A repository starts with one test gate running cargo test, in its `.flow/` \
+                     folder; the file is yours to edit once it exists.",
                 ))
                 .child(action_button(
                     "flow-gates-create".to_owned(),
@@ -1878,7 +1879,7 @@ impl GatesScreen {
 /// disagree about which gates a repository has.
 #[doc(hidden)]
 pub fn read_gates(repo: &Path) -> std::result::Result<Vec<Gate>, String> {
-    let path = repo.join("flow.toml");
+    let path = layout::flow_file(repo);
     match std::fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(format!("could not read {}: {error}", path.display())),
@@ -1890,7 +1891,7 @@ pub fn read_gates(repo: &Path) -> std::result::Result<Vec<Gate>, String> {
 
 /// Read one repository's `flow.toml`, on the background executor.
 fn read_flow(repo: &Path) -> FlowRead {
-    let path = repo.join("flow.toml");
+    let path = layout::flow_file(repo);
     let result = match std::fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("could not read {}: {error}", path.display())),

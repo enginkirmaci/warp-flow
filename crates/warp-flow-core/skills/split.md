@@ -54,4 +54,4 @@ as `NN: title (blocked by …)`, one line each.
 
 - Never weaken an acceptance criterion to make a task smaller.
 - A task that cannot name where it lives is not a task yet; read more code.
-- Do not edit gates, `flow.toml` or `workflow.toml`.
+- Do not edit gates, `.flow/flow.toml` or `.flow/workflow.toml`.

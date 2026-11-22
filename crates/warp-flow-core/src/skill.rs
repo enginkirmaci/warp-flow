@@ -3,8 +3,8 @@
 //! ADR-0008 puts the judgement behind one boundary: the engine composes the
 //! step's **skill document** and its inputs into a prompt, and a harness
 //! session answers it. This module is the document half of that — the text
-//! `workflow.toml` names with `skill = "analyze"`, embedded in the binary so a
-//! run needs no installed set and a session never has to look for one.
+//! `.flow/workflow.toml` names with `skill = "analyze"`, embedded in the binary
+//! so a run needs no installed set and a session never has to look for one.
 //!
 //! A name a run names but this build does not ship is refused before the
 //! harness is contacted ([`crate::prepare`]), never sent to a session that

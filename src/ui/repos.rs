@@ -405,7 +405,7 @@ fn repo_row_frame(id: impl Into<gpui::ElementId>, selected: bool) -> gpui::State
 }
 
 /// The Repos section's second line: the repository's own path and how many gates
-/// its `flow.toml` defines. A repository row in that section is a place, not a
+/// its `.flow/flow.toml` defines. A repository row in that section is a place, not a
 /// run count, so it reads the way `Repos › Gates` will open.
 fn repo_facts_line(repo: &store::RepoView) -> AnyElement {
     let path = repo

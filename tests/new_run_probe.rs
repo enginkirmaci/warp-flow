@@ -44,8 +44,9 @@ fn seed_repo(home: &Path) -> PathBuf {
     git(&repo, &["config", "user.name", "UI Probe"]);
     git(&repo, &["config", "commit.gpgsign", "false"]);
     fs::write(repo.join("readme.md"), "probe\n").expect("readme");
+    fs::create_dir_all(warp_flow_core::layout::dir(&repo)).expect("the .flow folder");
     fs::write(
-        repo.join("flow.toml"),
+        warp_flow_core::layout::flow_file(&repo),
         "schema = 1\n\n[[gate]]\nname = \"check\"\ncommand = \"true\"\n",
     )
     .expect("flow.toml");

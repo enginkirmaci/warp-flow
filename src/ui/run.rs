@@ -2578,7 +2578,7 @@ fn action_error_line(error: &str) -> AnyElement {
         .into_any_element()
 }
 
-/// The workflow's one warning line: a missing or unreadable `workflow.toml`
+/// The workflow's one warning line: a missing or unreadable workflow file
 /// means the bands came from the log.
 fn workflow_note_row(note: &str) -> AnyElement {
     div()

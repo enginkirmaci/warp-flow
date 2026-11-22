@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use warp_flow_core::artifact::{Document, Issue, Status, Task};
 use warp_flow_core::graph::{Step, StepKind, Workflow};
+use warp_flow_core::layout;
 use warp_flow_core::worktree::Repo;
 use warpui_kit_platform::config::Store;
 use warpui_kit_platform::paths;
@@ -508,8 +509,8 @@ pub struct RepoView {
     pub dirty: bool,
     /// Why the repository or its `.scratch/` could not be read.
     pub note: Option<String>,
-    /// How many gates the repository's `flow.toml` defines. The Repos list
-    /// counts them the way a person reads the file, without opening it.
+    /// How many gates the repository's `.flow/flow.toml` defines. The Repos
+    /// list counts them the way a person reads the file, without opening it.
     pub gates: usize,
     pub runs: Vec<Run>,
 }
@@ -646,7 +647,7 @@ fn scan_repo(path: &Path) -> RepoView {
     let dirty = root.as_deref().is_some_and(git_dirty);
     // the repository's own gates, read once per scan: the Repos list shows the
     // count, and a bad file is a note on the rows rather than a failed scan
-    let gates = warp_flow_core::config::FlowConfig::read(scan_root.join("flow.toml"))
+    let gates = warp_flow_core::config::FlowConfig::read(layout::flow_file(&scan_root))
         .map(|config| config.gates_in_order().len())
         .unwrap_or(0);
 
@@ -688,7 +689,7 @@ fn is_issue_folder(dir: &Path) -> bool {
         || dir.join("issues").is_dir()
         || dir.join("questions").is_dir()
         || dir.join("repairs").is_dir()
-        || dir.join("workflow.toml").is_file()
+        || layout::pinned_workflow(dir).is_file()
 }
 
 fn scan_run(
@@ -852,7 +853,8 @@ fn workflow_name(document: Option<&DocView>) -> Option<String> {
     })
 }
 
-/// Read `<issue>/workflow.toml`. A missing or unreadable copy is a note and a
+/// Read the workflow a run uses: its own pinned copy, else the repository's
+/// `.flow/workflow.toml` template. A missing or unreadable file is a note and a
 /// log-only fallback, never a failed scan.
 fn read_workflow(
     dir: &Path,
@@ -862,11 +864,11 @@ fn read_workflow(
     // The run's own copy first: that is the revision it started on. A folder
     // that carries none reads the repository's template, which is what a run
     // started by hand or by the CLI uses.
-    let copy = dir.join("workflow.toml");
+    let copy = layout::pinned_workflow(dir);
     let path = if copy.is_file() {
         copy
     } else {
-        match root.map(|root| root.join("workflow.toml")) {
+        match root.map(layout::workflow_file) {
             Some(template) if template.is_file() => template,
             _ => copy,
         }
@@ -1701,7 +1703,7 @@ mod tests {
     fn a_workflow_reads_and_topologically_orders_its_steps() {
         let dir = scratch_dir("workflow");
         fs::write(
-            dir.join("workflow.toml"),
+            layout::pinned_workflow(&dir),
             r#"
 schema = 1
 name = "implement"
@@ -1732,7 +1734,7 @@ produces = "spec.md"
         let mut note = None;
         let (workflow, path) = read_workflow(&dir, None, &mut note).expect("the workflow reads");
         assert_eq!(note, None);
-        assert_eq!(path, dir.join("workflow.toml"));
+        assert_eq!(path, layout::pinned_workflow(&dir));
         assert_eq!(workflow.name, "implement");
         let ids: Vec<&str> = topological_steps(&workflow)
             .iter()
@@ -1757,13 +1759,15 @@ produces = "spec.md"
     }
 
     /// The Repos list counts a repository's gates without opening the file: the
-    /// scan reads `flow.toml` once and the row says how many steps will run.
+    /// scan reads `.flow/flow.toml` once and the row says how many steps will
+    /// run.
     #[test]
     fn a_repository_counts_the_gates_its_flow_file_defines() {
         let dir = scratch_dir("gates-count");
         fs::create_dir_all(dir.join(".scratch")).expect("scratch");
+        fs::create_dir_all(layout::dir(&dir)).expect("the .flow folder");
         fs::write(
-            dir.join("flow.toml"),
+            layout::flow_file(&dir),
             "schema = 1\n\n[merge]\nmode = \"local\"\npush = false\n\n\
              [[gate]]\nname = \"fmt\"\ncommand = \"cargo fmt --check\"\n\n\
              [[gate]]\nname = \"test\"\ncommand = \"cargo test\"\n",
@@ -1775,7 +1779,7 @@ produces = "spec.md"
         assert_eq!(snapshot.repos[0].gates, 2, "both gates are counted");
 
         // a repository with no flow.toml is a zero, not a failure
-        fs::remove_file(dir.join("flow.toml")).expect("remove flow.toml");
+        fs::remove_file(layout::flow_file(&dir)).expect("remove flow.toml");
         let snapshot = scan(std::slice::from_ref(&dir));
         assert_eq!(snapshot.repos[0].gates, 0);
 

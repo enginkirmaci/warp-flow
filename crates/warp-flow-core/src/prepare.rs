@@ -1,16 +1,17 @@
 //! One way to prepare a run from an issue folder.
 //!
 //! The CLI and the app's host start a run the same way: open the repository,
-//! read `flow.toml` and the issue's `workflow.toml`, check the gates the graph
-//! names, read the issue's tasks, and only then contact a harness. This module
-//! owns that sequence once so the two drivers cannot drift (S4a).
+//! read `.flow/flow.toml` and the issue's `workflow.toml`, check the gates the
+//! graph names, read the issue's tasks, and only then contact a harness. This
+//! module owns that sequence once so the two drivers cannot drift (S4a).
 //!
 //! A workflow's template belongs to the repository: `Repos › Workflow` edits
-//! `<repo>/workflow.toml` and appends a revision, and a run copies the template
-//! it starts on into its issue folder. The issue's copy is what a run reads, so
-//! a template edited mid-run never reaches a run that already started; when an
-//! issue folder carries no copy, preparation falls back to the repository's
-//! template, so a run started by hand or by the CLI reads the same graph.
+//! `<repo>/.flow/workflow.toml` and appends a revision, and a run copies the
+//! template it starts on into its issue folder. The issue's copy is what a run
+//! reads, so a template edited mid-run never reaches a run that already
+//! started; when an issue folder carries no copy, preparation falls back to the
+//! repository's template, so a run started by hand or by the CLI reads the same
+//! graph.
 //!
 //! A run also refuses to start on a working tree that is dirty outside the
 //! issue folder: the engine owns the issue folder and commits only that folder,
@@ -28,6 +29,7 @@ use crate::control::Control;
 use crate::gate::Gate;
 use crate::graph::{StepKind, Workflow};
 use crate::harness::Harness;
+use crate::layout;
 use crate::run::{LogSink, Runner, RunnerConfig};
 use crate::worktree::Repo;
 use crate::{Error, Result, skill};
@@ -68,7 +70,7 @@ pub fn prepare(issue: &Path) -> Result<Prepared> {
     // Everything a run needs is validated before the harness is contacted, so
     // a bad workflow or gate file cannot leave a session behind.
     let repo = Repo::open(issue)?;
-    let flow = FlowConfig::read(repo.root.join("flow.toml"))?;
+    let flow = FlowConfig::read(layout::flow_file(&repo.root))?;
     let workflow_path = resolve_workflow(issue, &repo.root);
     let workflow = Workflow::read(&workflow_path)?;
     workflow.validate()?;
@@ -95,11 +97,11 @@ pub fn prepare(issue: &Path) -> Result<Prepared> {
 /// `prepare` reports the issue's own path when neither exists: the error then
 /// names the file the run expected, which is the thing a person can fix.
 pub fn resolve_workflow(issue: &Path, repo_root: &Path) -> PathBuf {
-    let copy = issue.join("workflow.toml");
+    let copy = layout::pinned_workflow(issue);
     if copy.is_file() {
         return copy;
     }
-    let template = repo_root.join("workflow.toml");
+    let template = layout::workflow_file(repo_root);
     if template.is_file() {
         return template;
     }
@@ -119,7 +121,7 @@ impl Prepared {
     ///
     /// The graph's validation error, or the filesystem's.
     pub fn pin_workflow(&self) -> Result<()> {
-        let copy = self.issue.join("workflow.toml");
+        let copy = layout::pinned_workflow(&self.issue);
         if copy.is_file() {
             return Ok(());
         }
@@ -379,11 +381,12 @@ depends_on = ["check"]
         run_git(&root, &["config", "user.email", "engine@example.com"]);
         run_git(&root, &["config", "user.name", "Engine Probe"]);
         run_git(&root, &["config", "commit.gpgsign", "false"]);
-        fs::write(root.join("flow.toml"), FLOW).expect("flow.toml");
+        fs::create_dir_all(layout::dir(&root)).expect("the .flow folder");
+        fs::write(layout::flow_file(&root), FLOW).expect("flow.toml");
 
         let issue = root.join(".scratch/demo");
         fs::create_dir_all(issue.join("issues")).expect("issue folder");
-        fs::write(issue.join("workflow.toml"), WORKFLOW).expect("workflow.toml");
+        fs::write(layout::pinned_workflow(&issue), WORKFLOW).expect("workflow.toml");
         fs::write(
             issue.join("spec.md"),
             "---\nstatus: ready-for-agent\n---\n\n# Tidy the rail\n\nBody.\n",
@@ -437,7 +440,7 @@ depends_on = ["check"]
         // The suite's own template names `analyze`; `repair` is a document the
         // plan lists but this build does not ship yet.
         fs::write(
-            issue.join("workflow.toml"),
+            layout::pinned_workflow(&issue),
             WORKFLOW.replace(r#"skill = "code""#, r#"skill = "repair""#),
         )
         .expect("workflow.toml");
@@ -504,28 +507,31 @@ depends_on = ["check"]
         let dir = TempDir::new();
         let (root, issue) = fixture(&dir);
         // the template belongs to the repository; the issue folder carries none
-        fs::rename(issue.join("workflow.toml"), root.join("workflow.toml"))
-            .expect("the template moved to the repository");
+        fs::rename(
+            layout::pinned_workflow(&issue),
+            layout::workflow_file(&root),
+        )
+        .expect("the template moved to the repository");
         let prepared = prepare(&issue).expect("prepares");
-        assert_eq!(prepared.workflow_path, root.join("workflow.toml"));
+        assert_eq!(prepared.workflow_path, layout::workflow_file(&root));
         assert_eq!(prepared.workflow.name, "implement");
 
         // the run pins the revision it starts on: the copy lands in its folder
         prepared.pin_workflow().expect("pins");
-        assert!(issue.join("workflow.toml").is_file());
-        let pinned = Workflow::read(issue.join("workflow.toml")).expect("the copy reads");
+        assert!(layout::pinned_workflow(&issue).is_file());
+        let pinned = Workflow::read(layout::pinned_workflow(&issue)).expect("the copy reads");
         assert_eq!(pinned.revision, prepared.workflow.revision);
 
         // and a folder that already carries one keeps it
         fs::write(
-            issue.join("workflow.toml"),
+            layout::pinned_workflow(&issue),
             WORKFLOW.replace("revision = 1", "revision = 7"),
         )
         .expect("a newer copy");
         let prepared = prepare(&issue).expect("prepares");
-        assert_eq!(prepared.workflow_path, issue.join("workflow.toml"));
+        assert_eq!(prepared.workflow_path, layout::pinned_workflow(&issue));
         prepared.pin_workflow().expect("pins nothing");
-        let kept = Workflow::read(issue.join("workflow.toml")).expect("the copy reads");
+        let kept = Workflow::read(layout::pinned_workflow(&issue)).expect("the copy reads");
         assert_eq!(kept.revision, 7, "the pinned copy is the run's own");
     }
 
@@ -533,7 +539,7 @@ depends_on = ["check"]
     fn a_missing_workflow_is_a_preparation_error() {
         let dir = TempDir::new();
         let (_root, issue) = fixture(&dir);
-        fs::remove_file(issue.join("workflow.toml")).expect("remove workflow");
+        fs::remove_file(layout::pinned_workflow(&issue)).expect("remove workflow");
         let error = prepare(&issue).expect_err("no workflow");
         assert!(error.to_string().contains("workflow.toml"), "{error}");
     }
@@ -543,7 +549,7 @@ depends_on = ["check"]
         let dir = TempDir::new();
         let (root, issue) = fixture(&dir);
         fs::write(
-            issue.join("workflow.toml"),
+            layout::pinned_workflow(&issue),
             "schema = 1\nname = \"implement\"\nrevision = 1\n\n[[step]]\n\
              id = \"check\"\nkind = \"gate\"\ngate = \"missing\"\n",
         )
@@ -565,7 +571,7 @@ depends_on = ["check"]
         let dir = TempDir::new();
         let (_root, issue) = fixture(&dir);
         fs::write(
-            issue.join("workflow.toml"),
+            layout::pinned_workflow(&issue),
             "schema = 1\nname = \"implement\"\nrevision = 1\n\n[[step]]\n\
              id = \"one\"\nkind = \"harness\"\nskill = \"code\"\ndepends_on = [\"two\"]\n\n\
              [[step]]\nid = \"two\"\nkind = \"harness\"\nskill = \"code\"\n\
@@ -581,7 +587,7 @@ depends_on = ["check"]
         let dir = TempDir::new();
         let (root, issue) = fixture(&dir);
         fs::write(
-            root.join("flow.toml"),
+            layout::flow_file(&root),
             r#"
 schema = 1
 
@@ -596,12 +602,12 @@ command = "true"
         )
         .expect("flow.toml");
         fs::write(
-            issue.join("workflow.toml"),
+            layout::pinned_workflow(&issue),
             "schema = 1\nname = \"implement\"\nrevision = 1\n\n[[step]]\n\
              id = \"check\"\nkind = \"gate\"\ngate = \"zeta\"\n",
         )
         .expect("workflow.toml");
-        run_git(&root, &["add", "flow.toml"]);
+        run_git(&root, &["add", ".flow"]);
         run_git(&root, &["add", ".scratch"]);
         run_git(&root, &["commit", "--quiet", "-m", "reorder"]);
 

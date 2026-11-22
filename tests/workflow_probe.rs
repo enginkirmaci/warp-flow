@@ -72,9 +72,11 @@ fn seed_repo(home: &Path, workflow: Option<&str>) -> (PathBuf, PathBuf) {
     )
     .expect("spec.md");
     if let Some(workflow) = workflow {
-        std::fs::write(issue.join("workflow.toml"), workflow).expect("workflow.toml");
+        std::fs::write(warp_flow_core::layout::pinned_workflow(&issue), workflow)
+            .expect("workflow.toml");
     }
-    std::fs::write(repo.join("flow.toml"), "schema = 1\n").expect("flow.toml");
+    std::fs::create_dir_all(warp_flow_core::layout::dir(&repo)).expect("the .flow folder");
+    std::fs::write(warp_flow_core::layout::flow_file(&repo), "schema = 1\n").expect("flow.toml");
     for args in [
         vec!["init", "--initial-branch=main", "--quiet"],
         vec!["config", "user.email", "probe@example.com"],
@@ -186,7 +188,8 @@ fn the_editor_loads_saves_a_new_revision_and_refuses_a_cycle(cx: &mut TestAppCon
 
     // save writes the file as the next revision
     click(cx, "flow-workflow-save");
-    let on_disk = Workflow::read(issue.join("workflow.toml")).expect("the editor wrote the file");
+    let on_disk = Workflow::read(warp_flow_core::layout::pinned_workflow(&issue))
+        .expect("the editor wrote the file");
     assert_eq!(on_disk.revision, 5, "a change appends a revision");
     assert_eq!(on_disk.steps.len(), 4);
     assert_eq!(on_disk.steps[1].id, "step-4");
@@ -208,7 +211,8 @@ fn the_editor_loads_saves_a_new_revision_and_refuses_a_cycle(cx: &mut TestAppCon
         cx.debug_bounds("flow-workflow-error").is_some(),
         "the cycle is refused in one line"
     );
-    let after = Workflow::read(issue.join("workflow.toml")).expect("the file is untouched");
+    let after = Workflow::read(warp_flow_core::layout::pinned_workflow(&issue))
+        .expect("the file is untouched");
     assert_eq!(
         after.revision, on_disk.revision,
         "a refused save writes nothing"
@@ -236,12 +240,13 @@ fn a_run_with_no_workflow_starts_from_the_shipped_shape(cx: &mut TestAppContext)
         .expect("a graph is offered");
     assert_eq!(graph.steps.len(), 1);
     assert_eq!(graph.steps[0].id, "analyze");
-    assert!(!issue.join("workflow.toml").is_file());
+    assert!(!warp_flow_core::layout::pinned_workflow(&issue).is_file());
 
     // saving with no file creates it
     click(cx, "flow-workflow-add");
     click(cx, "flow-workflow-save");
-    let on_disk = Workflow::read(issue.join("workflow.toml")).expect("the editor created the file");
+    let on_disk = Workflow::read(warp_flow_core::layout::pinned_workflow(&issue))
+        .expect("the editor created the file");
     assert_eq!(on_disk.steps.len(), 2);
     assert_eq!(on_disk.revision, 2, "a fresh graph starts at revision 1");
 
@@ -249,7 +254,7 @@ fn a_run_with_no_workflow_starts_from_the_shipped_shape(cx: &mut TestAppContext)
 }
 
 /// The repository's template is the editor's file: `Repos › Workflow` writes
-/// `<repo>/workflow.toml`, appends a revision, and never touches an issue
+/// `<repo>/.flow/workflow.toml`, appends a revision, and never touches an issue
 /// folder's copy.
 #[gpui_kit::gpui::test]
 fn the_repository_template_is_what_the_repos_tab_edits(cx: &mut TestAppContext) {
@@ -259,8 +264,10 @@ fn the_repository_template_is_what_the_repos_tab_edits(cx: &mut TestAppContext) 
     cx.update(theme::apply_kit_theme);
     // the issue folder carries no copy: the template is the repository's own
     let (repo, issue) = seed_repo(&home, Some(WORKFLOW));
-    std::fs::remove_file(issue.join("workflow.toml")).expect("the issue copy is gone");
-    std::fs::write(repo.join("workflow.toml"), WORKFLOW).expect("the repository template");
+    std::fs::remove_file(warp_flow_core::layout::pinned_workflow(&issue))
+        .expect("the issue copy is gone");
+    std::fs::write(warp_flow_core::layout::workflow_file(&repo), WORKFLOW)
+        .expect("the repository template");
 
     let host = Arc::new(Host::new());
     let handle = cx.open_window(size(px(1200.), px(860.)), |_window, cx| {
@@ -295,10 +302,11 @@ fn the_repository_template_is_what_the_repos_tab_edits(cx: &mut TestAppContext) 
         })
         .expect("the window is open");
     settle(cx);
-    let saved = Workflow::read(repo.join("workflow.toml")).expect("the template reads");
+    let saved =
+        Workflow::read(warp_flow_core::layout::workflow_file(&repo)).expect("the template reads");
     assert_eq!(saved.revision, 5, "a save appends one revision");
     assert!(
-        !issue.join("workflow.toml").exists(),
+        !warp_flow_core::layout::pinned_workflow(&issue).exists(),
         "the editor never writes an issue folder"
     );
 

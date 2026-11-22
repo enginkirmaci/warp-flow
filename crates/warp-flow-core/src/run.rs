@@ -149,7 +149,7 @@ pub struct RunnerConfig<H> {
     /// [`RunnerConfig::new`] installs [`KeepGoing`], so a caller that does not
     /// care about control behaves exactly as it did before the seam existed.
     pub control: Box<dyn Control>,
-    /// The gates in `flow.toml`'s declaration order, for the merge queue.
+    /// The gates in `.flow/flow.toml`'s declaration order, for the merge queue.
     ///
     /// Empty means [`RunnerConfig::gates`]' own (name-sorted) order, which is
     /// the shape tests that configure gates by hand construct.
@@ -709,6 +709,8 @@ impl<H: Harness> Runner<H> {
             .ok_or_else(|| Error::Run(format!("gate `{name}` is not configured")))?;
         // `flow.toml` writes `cwd` relative to the tree the step measures: the
         // task's worktree for a per-task step, the configured workdir otherwise.
+        // The file's own folder (`.flow/`) is not part of that: a gate measures
+        // the repository, never the folder its configuration lives in.
         if gate.cwd.is_relative() {
             let workdir = self.step_workdir(step, task)?;
             gate.cwd = workdir.join(&gate.cwd);
@@ -921,7 +923,8 @@ impl<H: Harness> Runner<H> {
         }
     }
 
-    /// The gates the merge queue runs, in `flow.toml` order when it is known.
+    /// The gates the merge queue runs, in `.flow/flow.toml` order when it is
+    /// known.
     fn merge_gates(&self) -> Vec<Gate> {
         if self.merge_gates.is_empty() {
             self.gates.values().cloned().collect()
@@ -1846,7 +1849,7 @@ skill = "analyze"
             task_text(1, "First task", "ready-for-agent"),
         )
         .expect("task file");
-        fs::write(issue.join("workflow.toml"), MERGE_WORKFLOW).expect("workflow");
+        fs::write(crate::layout::pinned_workflow(&issue), MERGE_WORKFLOW).expect("workflow");
         run_git(root, &["add", "-A"]);
         run_git(root, &["commit", "--quiet", "-m", "issue"]);
         issue

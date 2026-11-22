@@ -1,8 +1,8 @@
 //! Probe: the first end-to-end chain, against a real throwaway repository.
 //!
 //! A workflow with `analyze`, a per-task `code` harness step and a per-task
-//! `merge` step, a real `flow.toml` gate (`true`), and two tasks where 02 is
-//! blocked by 01. The proof is what survives on disk: two task worktrees, both
+//! `merge` step, a real `.flow/flow.toml` gate (`true`), and two tasks where 02
+//! is blocked by 01. The proof is what survives on disk: two task worktrees, both
 //! branches merged into `main` with `--no-ff` merge commits, both task files
 //! `resolved`, and `run.md` `done`. A second probe makes the second task's
 //! branch conflict with `main` and asserts the run blocks with a repair record
@@ -22,6 +22,7 @@ use warp_flow_core::artifact::{Document, Issue, Status};
 use warp_flow_core::config::FlowConfig;
 use warp_flow_core::graph::Workflow;
 use warp_flow_core::harness::{FakeHarness, Scripted};
+use warp_flow_core::layout;
 use warp_flow_core::run::{MemoryLog, RunStatus, Runner, RunnerConfig};
 use warp_flow_core::worktree::{Repo, TaskWorktree};
 
@@ -160,8 +161,9 @@ impl Fixture {
 
     /// Write the workflow and the gate file, then commit everything.
     fn write_config(&self) {
-        fs::write(self.issue.join("workflow.toml"), WORKFLOW).expect("workflow.toml");
-        fs::write(self.root.join("flow.toml"), FLOW).expect("flow.toml");
+        fs::write(layout::pinned_workflow(&self.issue), WORKFLOW).expect("workflow.toml");
+        fs::create_dir_all(layout::dir(&self.root)).expect("the .flow folder");
+        fs::write(layout::flow_file(&self.root), FLOW).expect("flow.toml");
     }
 
     /// Write one task file and return its path.
@@ -174,7 +176,7 @@ impl Fixture {
         path
     }
 
-    /// Commit the issue folder and `flow.toml`, leaving `main` clean.
+    /// Commit the issue folder and `.flow/`, leaving `main` clean.
     fn commit_fixture(&self) {
         self.git(&self.root, &["add", "-A"]);
         self.git(&self.root, &["commit", "--quiet", "-m", "fixture"]);
@@ -190,8 +192,9 @@ impl Fixture {
 
     /// The runner the CLI builds: the repository, the flow config, a real gate.
     fn runner(&self, harness: FakeHarness, max_attempts: u32) -> Runner<FakeHarness> {
-        let workflow = Workflow::read(self.issue.join("workflow.toml")).expect("workflow parses");
-        let flow = FlowConfig::read(self.root.join("flow.toml")).expect("flow.toml parses");
+        let workflow =
+            Workflow::read(layout::pinned_workflow(&self.issue)).expect("workflow parses");
+        let flow = FlowConfig::read(layout::flow_file(&self.root)).expect("flow.toml parses");
         let mut config = RunnerConfig::new(&self.issue, workflow, harness);
         config.workdir = self.root.clone();
         config.repo = Some(self.repo());
@@ -443,7 +446,7 @@ fn the_flow_config_parses_the_real_flow_file() {
     let fixture = Fixture::new();
     fixture.write_config();
     fixture.commit_fixture();
-    let flow = FlowConfig::read(fixture.root.join("flow.toml")).expect("flow parses");
+    let flow = FlowConfig::read(layout::flow_file(&fixture.root)).expect("flow parses");
     let gate = flow.gates().remove("test").expect("test gate");
     assert_eq!(gate.command, "true");
     assert_eq!(gate.cwd, PathBuf::from("."));

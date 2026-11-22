@@ -129,12 +129,14 @@ impl Fixture {
         run_git(&repo, &["config", "user.email", "engine@example.com"]);
         run_git(&repo, &["config", "user.name", "Engine Probe"]);
         run_git(&repo, &["config", "commit.gpgsign", "false"]);
-        fs::write(repo.join("flow.toml"), FLOW).expect("flow.toml");
+        fs::create_dir_all(warp_flow_core::layout::dir(&repo)).expect("the .flow folder");
+        fs::write(warp_flow_core::layout::flow_file(&repo), FLOW).expect("flow.toml");
         fs::write(repo.join("readme.md"), "probe\n").expect("readme");
 
         let issue = repo.join(".scratch/demo");
         fs::create_dir_all(issue.join("issues")).expect("issue folder");
-        fs::write(issue.join("workflow.toml"), workflow).expect("workflow.toml");
+        fs::write(warp_flow_core::layout::pinned_workflow(&issue), workflow)
+            .expect("workflow.toml");
         fs::write(
             issue.join("spec.md"),
             "---\nstatus: ready-for-agent\n---\n\n# Probe run\n\nBody.\n",
@@ -162,7 +164,8 @@ impl Fixture {
     fn add_issue(&self, id: &str, workflow: &str) -> PathBuf {
         let issue = self.repo.join(".scratch").join(id);
         fs::create_dir_all(issue.join("issues")).expect("issue folder");
-        fs::write(issue.join("workflow.toml"), workflow).expect("workflow.toml");
+        fs::write(warp_flow_core::layout::pinned_workflow(&issue), workflow)
+            .expect("workflow.toml");
         fs::write(
             issue.join("spec.md"),
             "---\nstatus: ready-for-agent\n---\n\n# Second run\n\nBody.\n",

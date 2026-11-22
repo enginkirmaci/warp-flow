@@ -44,7 +44,7 @@ Then report what you wrote in one short paragraph.
 
 ## Rules
 
-- Do not edit source files, gates, `workflow.toml` or `run.md`.
+- Do not edit source files, gates, `.flow/workflow.toml` or `run.md`.
 - Do not create tasks; `split` does that from your spec.
 - If the issue already carries a spec with acceptance criteria, do not rewrite
   it from scratch: check it against the code, correct what is wrong, and say in

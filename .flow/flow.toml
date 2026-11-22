@@ -1,4 +1,4 @@
-# warp-flow's gate file.
+# warp-flow's gate file, in the `.flow/` folder every driven repository carries.
 #
 # The three commands are this repository's own CI checks: formatting, clippy
 # with warnings denied, then the tests. A workflow's gate step names them one

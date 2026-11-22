@@ -1,6 +1,6 @@
 [package]
 name = "warp-flow"
-version = "0.1.41"
+version = "0.1.42"
 edition = "2024"
 description = "warp-flow — workflow engine for the warp-suite"
 license = "GPL-3.0"

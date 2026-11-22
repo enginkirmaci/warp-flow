@@ -1,10 +1,11 @@
 //! The declarative workflow: a TOML graph of steps (ADR-0010).
 //!
-//! A workflow is copied into the issue folder at run start; once revisions
-//! land (S2) the engine reads that copy again at every step boundary. S1's
-//! runner holds one validated graph for the whole run. This module owns the
-//! shape, the validation and the "what can run next" question; the engine loop
-//! is in [`crate::run`].
+//! A repository's template lives at `.flow/workflow.toml` ([`crate::layout`])
+//! and is copied into the issue folder at run start; once revisions land (S2)
+//! the engine reads that copy again at every step boundary. S1's runner holds
+//! one validated graph for the whole run. This module owns the shape, the
+//! validation and the "what can run next" question; the engine loop is in
+//! [`crate::run`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -110,7 +111,9 @@ impl Workflow {
     ///
     /// The engine re-reads `workflow.toml` at every step boundary (ADR-0010),
     /// so a half-written file could land in a running step's lap: the document
-    /// goes to a temporary file and is renamed into place.
+    /// goes to a temporary file and is renamed into place. The parent folder is
+    /// created when it is missing, so the first save into a repository's
+    /// `.flow/` needs no separate step.
     ///
     /// # Errors
     ///
@@ -529,7 +532,7 @@ depends_on = ["code"]
     #[test]
     fn saving_bumps_the_revision_and_a_no_op_save_does_not() {
         let dir = crate::test_support::TempDir::new();
-        let path = dir.path().join("workflow.toml");
+        let path = crate::layout::workflow_file(dir.path());
         let graph = workflow(vec![step("analyze", StepKind::Harness, &[])]);
         graph.write(&path).expect("write");
 

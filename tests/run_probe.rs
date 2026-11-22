@@ -84,7 +84,7 @@ fn seed_run(repo: &Path, id: &str, status: &str, step: &str, rows: &[(&str, &str
 fn seed_workflow(repo: &Path, id: &str, steps: &str) {
     let dir = issue_dir(repo, id);
     std::fs::write(
-        dir.join("workflow.toml"),
+        warp_flow_core::layout::pinned_workflow(&dir),
         format!("schema = 1\nname = \"implement\"\nrevision = 3\n\n{steps}"),
     )
     .expect("workflow.toml");

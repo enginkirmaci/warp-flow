@@ -60,8 +60,9 @@ fn seed_repo(home: &Path, name: &str, with_workflow: bool) -> (PathBuf, PathBuf)
     run_git(&repo, &["config", "user.name", "UI Probe"]);
     run_git(&repo, &["config", "commit.gpgsign", "false"]);
     fs::write(repo.join("readme.md"), "probe\n").expect("readme");
+    fs::create_dir_all(warp_flow_core::layout::dir(&repo)).expect("the .flow folder");
     fs::write(
-        repo.join("flow.toml"),
+        warp_flow_core::layout::flow_file(&repo),
         "schema = 1\n\n[[gate]]\nname = \"check\"\ncommand = \"true\"\n",
     )
     .expect("flow.toml");
@@ -75,7 +76,7 @@ fn seed_repo(home: &Path, name: &str, with_workflow: bool) -> (PathBuf, PathBuf)
     .expect("spec.md");
     if with_workflow {
         fs::write(
-            issue.join("workflow.toml"),
+            warp_flow_core::layout::pinned_workflow(&issue),
             "schema = 1\nname = \"probe\"\nrevision = 1\n\n[[step]]\n\
              id = \"work\"\nkind = \"harness\"\nskill = \"code\"\n",
         )

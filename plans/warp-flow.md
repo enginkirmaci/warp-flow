@@ -43,7 +43,7 @@ artifact, question, approval, repair.
    Parallelism is across ready tasks, not inside one.
 7. **Gates are discovered, then approved.** An agent reads the repository
    (markers, build files, CI if there is any) and proposes commands; a person
-   approves them; the result is written to `flow.toml` and committed. A gate is
+   approves them; the result is written to `.flow/flow.toml` and committed. A gate is
    a shell command, a working directory, a timeout and an exit-code meaning —
    nothing language-specific. No `ci.yml` is required.
 8. **Tests are written by the code step.** The gate still runs the
@@ -51,7 +51,7 @@ artifact, question, approval, repair.
    An existing test may change only with a reason tied to the spec, and deleting
    one, skipping one or weakening an assertion needs a person's answer.
 9. **Merge is local and serial.** Rebase onto `main`, run the gates on the
-   rebased result, `--no-ff` merge, push only if `flow.toml` says so. A conflict
+   rebased result, `--no-ff` merge, push only if `.flow/flow.toml` says so. A conflict
    is repaired on the task branch (never on `main`) for at most two attempts,
    then it becomes a question. No force-push, ever.
    A task branch with no commits of its own is a failed attempt, never a
@@ -96,9 +96,9 @@ artifact, question, approval, repair.
     exception bought nothing the shared build did not already give, and it left
     this app as the only one that could not be opened from its own repository.
 17. **The app may edit a run's files, but the engine owns them while it
-    drives.** The screens write `spec.md`, the task files, `workflow.toml` and
-    `flow.toml` — the issue folder is a person's working surface, not a
-    read-only record — through one atomic writer (a temp file and a rename),
+    drives.** The screens write `spec.md`, the task files, `.flow/workflow.toml`
+    and `.flow/flow.toml` — the issue folder is a person's working surface, not
+    a read-only record — through one atomic writer (a temp file and a rename),
     because the engine and the two-second scan read those files at undefined
     moments. What differs is the permission: while this window drives a run, the
     artifacts screen is read-only with the reason on screen (the engine may be
@@ -162,10 +162,10 @@ a non-reserved key (e.g. `session`) in the `create` reply, and give attached
 harnesses the same event pump — neither blocks S2.
 
 
-## The gate file (`flow.toml`)
+## The gate file (`.flow/flow.toml`)
 
-Every repository warp-flow drives carries one at its root, written once by the
-gate-discovery step and approved by a person:
+Every repository warp-flow drives carries one in its `.flow/` folder, written
+once by the gate-discovery step and approved by a person:
 
 ```toml
 schema = 1
@@ -222,7 +222,7 @@ filled primary per surface.
   timeout; **S2b (done)** per-task worktrees through the kit and the merge
   queue — dirty `main` refused, rebase, gates on the rebased tree, `--no-ff`,
   conflict aborts, no force-push. **S2c (done)** the CLI (`run`, `answer`,
-  `status`, `--dry-run`), `flow.toml` loading, a `merge` step kind, resuming
+  `status`, `--dry-run`), `.flow/flow.toml` loading, a `merge` step kind, resuming
   from `run.md`, and an end-to-end probe that drives a real throwaway
   repository to merged, resolved tasks.
 - **S3 — the app shell.** **S3a (done)** the shell over the issue folders: a
@@ -268,7 +268,7 @@ filled primary per surface.
   patch through the kit's renderer, from `core::diff`), **Workflow** (the graph
   as rows with an inspector, validated and saved as a new revision through
   `Workflow::write`/`save`), **Repos & gates** (the window's repositories with
-  add/remove, and `flow.toml`'s gates edited, validated and runnable once
+  add/remove, and `.flow/flow.toml`'s gates edited, validated and runnable once
   through `FlowConfig::write` and `gate::run_once`) and **Settings** (reduced
   motion persisted beside the repositories, the folders, the door's state, the
   version). The screens are entities behind `ui::screens`' one seam, so each
@@ -303,7 +303,7 @@ never spends a session's turn looking for it.
 ## Next
 
 S2 — the full chain on a real repository, CLI only: the door client (built on
-the measured contract above), per-task worktrees, real gates from `flow.toml`,
+the measured contract above), per-task worktrees, real gates from `.flow/flow.toml`,
 answering questions and resuming from `run.md`, and the merge queue. S1 left
 these deliberately: concurrent ready tasks within the per-repo budget,
 re-reading `workflow.toml` at each step boundary, richer question kinds, repairs

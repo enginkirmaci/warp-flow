@@ -25,6 +25,7 @@ use gpui::{
 };
 use gpui_kit::component::input::{InputEvent, InputState};
 use warp_flow_core::graph::{Step, StepKind, Workflow};
+use warp_flow_core::layout;
 use warpui_kit_core::A11y;
 use warpui_kit_core::controls::{self, BtnKind};
 use warpui_kit_core::field;
@@ -244,7 +245,7 @@ impl WorkflowScreen {
             if path.is_file() {
                 format!("{error}")
             } else {
-                "The repository has no workflow.toml; the shipped shape is below, and \
+                "The repository has no .flow/workflow.toml; the shipped shape is below, and \
                  Save writes the first revision."
                     .to_owned()
             }
@@ -276,14 +277,14 @@ impl WorkflowScreen {
     /// read-only tab — the copy that run reads.
     fn path(&self) -> Option<PathBuf> {
         if let Some(repo) = &self.repo {
-            return Some(repo.join("workflow.toml"));
+            return Some(layout::workflow_file(repo));
         }
         let run = self.run.as_ref()?;
         Some(
             run.run
                 .workflow_path
                 .clone()
-                .unwrap_or_else(|| run.issue().join("workflow.toml")),
+                .unwrap_or_else(|| layout::pinned_workflow(run.issue())),
         )
     }
 

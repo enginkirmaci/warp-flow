@@ -29,7 +29,8 @@ directory; `main` is not yours to touch.
   branch.
 - Never weaken, skip or delete an existing test to make a change pass. If a
   test genuinely must change, say why in the commit body and in your report.
-- Never edit gates, `flow.toml`, `workflow.toml`, `spec.md` or the task files.
+- Never edit gates, `.flow/flow.toml`, `.flow/workflow.toml`, `spec.md` or the
+  task files.
 - If the task cannot be done as specified, stop and report exactly what blocks
   it. Do not invent scope to fill the gap.
 

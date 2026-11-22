@@ -253,7 +253,18 @@ pub fn write_artifact(
 }
 
 /// Write `text` to `path` through a temporary file and a rename.
+///
+/// The parent folder is created when it is missing: a repository's `.flow/`
+/// does not exist until the first save, and the first save is exactly when a
+/// person expects the file to appear.
 pub(crate) fn write_atomic_raw(path: &Path, text: &str) -> Result<(), String> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    }
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
