@@ -54,47 +54,6 @@ pub enum Screen {
     Settings,
 }
 
-impl Screen {
-    /// Every screen, in the rail's order.
-    pub const ALL: [Self; 6] = [
-        Self::Run,
-        Self::Artifacts,
-        Self::Diff,
-        Self::Workflow,
-        Self::Gates,
-        Self::Settings,
-    ];
-
-    /// The stable key a debug selector and a click handler use.
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Run => "run",
-            Self::Artifacts => "artifacts",
-            Self::Diff => "diff",
-            Self::Workflow => "workflow",
-            Self::Gates => "gates",
-            Self::Settings => "settings",
-        }
-    }
-
-    /// The word the rail's screen list shows.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Run => "Run",
-            Self::Artifacts => "Artifacts",
-            Self::Diff => "Task & diff",
-            Self::Workflow => "Workflow",
-            Self::Gates => "Repos & gates",
-            Self::Settings => "Settings",
-        }
-    }
-
-    /// The screen for `key`, when it names one.
-    pub fn from_key(key: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|screen| screen.key() == key)
-    }
-}
-
 /// One run, as a screen sees it: the scan's reading of the issue folder plus
 /// whether an engine is driving it right now.
 ///

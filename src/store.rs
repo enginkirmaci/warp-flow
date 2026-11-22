@@ -23,10 +23,6 @@ use crate::paths::AppPaths;
 /// How often the UI re-reads the engine's files while the app runs.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// How many of `run.md`'s newest log rows the detail pane keeps. The run
-/// screen renders every row through [`group_log`].
-pub const MAX_LOG_ROWS: usize = 8;
-
 /// `~/.warp/flow/settings.json`: the remembered repositories. The platform
 /// store adds `schema_version`; this is the whole typed document.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1389,12 +1385,6 @@ pub fn group_log(rows: &[RunRow]) -> Vec<LogGroup> {
     groups
 }
 
-/// The newest `count` rows, still oldest first — the detail pane's short log.
-pub fn recent_rows(rows: &[RunRow], count: usize) -> &[RunRow] {
-    let start = rows.len().saturating_sub(count);
-    &rows[start..]
-}
-
 fn synthesize_tasks(tasks: &[Task]) -> String {
     let mut markdown = String::from("# Tasks\n\n");
     if tasks.is_empty() {
@@ -1697,16 +1687,5 @@ produces = "spec.md"
                 .collect::<Vec<_>>(),
             ["done", "failed"]
         );
-    }
-
-    #[test]
-    fn the_detail_pane_keeps_the_newest_rows() {
-        let rows: Vec<RunRow> = (0..12)
-            .map(|attempt| row("code", "-", attempt, "done"))
-            .collect();
-        let recent = recent_rows(&rows, MAX_LOG_ROWS);
-        assert_eq!(recent.len(), MAX_LOG_ROWS);
-        assert_eq!(recent.first().map(|row| row.attempt.as_str()), Some("4"));
-        assert_eq!(recent.last().map(|row| row.attempt.as_str()), Some("11"));
     }
 }

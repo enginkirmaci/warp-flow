@@ -516,7 +516,7 @@ impl FlowApp {
             } else {
                 "Abandon"
             },
-            Some("icons/icon-x.svg"),
+            Some("icons/icon-close.svg"),
             armed,
             cx.listener(move |this, _, _, cx| {
                 if this.run_abandon_confirm.as_ref() == Some(&key) {
@@ -628,7 +628,7 @@ impl FlowApp {
                     .items_center()
                     .gap(px(8.))
                     .child(icon(
-                        "icons/icon-x.svg",
+                        "icons/icon-close.svg",
                         px(theme::icon_small()),
                         theme::DANGER,
                     ))
@@ -2194,7 +2194,7 @@ fn state_icon(state: StepState) -> &'static str {
     match state {
         StepState::Done => "icons/icon-check.svg",
         StepState::Running => "icons/icon-arc.svg",
-        StepState::Failed => "icons/icon-x.svg",
+        StepState::Failed => "icons/icon-close.svg",
         StepState::Waiting => "icons/icon-shield.svg",
         StepState::Idle => "icons/icon-clock.svg",
     }

@@ -96,11 +96,6 @@ impl Section {
             Self::Settings => Some(Screen::Settings),
         }
     }
-
-    /// Whether this section is one of the two pinned to the rail's foot.
-    pub fn is_foot(self) -> bool {
-        matches!(self, Self::About | Self::Settings)
-    }
 }
 
 /// The open run's four tabs. The design's run pane: what the engine is doing,

@@ -52,9 +52,6 @@ pub fn ok_bg() -> gpui::Hsla {
 /// The title bar's height, from the shared shell.
 pub const TITLEBAR_H: f32 = warpui_kit_core::shell::TITLE_BAR_HEIGHT;
 
-/// The rail: the family's 76, not a second list.
-pub const RAIL_WIDTH: f32 = warpui_kit_core::shell::RAIL_WIDTH;
-
 /// The list pane's width when nothing has been dragged: 432, the design's.
 pub const LIST_WIDTH: f32 = warpui_kit_core::shell::LIST_WIDTH;
 
@@ -97,27 +94,6 @@ pub const PILL_HEIGHT: f32 = 22.;
 
 /// The mark a selected row carries down its left edge (a tab's is the shell's).
 pub const ROW_MARK: f32 = 3.;
-
-/// One board column's width (the prototype's 238).
-pub const BOARD_COLUMN_WIDTH: f32 = 238.;
-
-/// The narrowest a board column may get before the board scrolls sideways.
-pub const BOARD_COLUMN_MIN_WIDTH: f32 = 188.;
-
-/// The gap between board columns and between cards.
-pub const BOARD_GAP: f32 = 12.;
-
-/// The board's padding.
-pub const BOARD_PADDING: f32 = 20.;
-
-/// The detail pane's width when a run is open.
-pub const DETAIL_WIDTH: f32 = 460.;
-
-/// The detail pane's inner padding.
-pub const DETAIL_PADDING: f32 = 20.;
-
-/// The run screen's inner padding.
-pub const RUN_PADDING: f32 = 24.;
 
 /// The gap between the run screen's sections.
 pub const RUN_GAP: f32 = 16.;
