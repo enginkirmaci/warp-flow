@@ -1,0 +1,33 @@
+# warp-flow's gate file.
+#
+# The three commands are this repository's own CI checks: formatting, clippy
+# with warnings denied, then the tests. A workflow's gate step names them one
+# at a time, and the merge queue runs them in this order: the cheapest check
+# fails a task before the expensive one starts.
+#
+# `warp-flow-core` is a path dependency, not a workspace member (the suite
+# requires app manifests without `[workspace]`), so each check names it in a
+# second command; `--all` alone does not reach it.
+schema = 1
+
+[merge]
+mode = "local"
+push = false
+
+[[gate]]
+name = "fmt"
+command = "cargo fmt --all --check && cargo fmt --all --manifest-path crates/warp-flow-core/Cargo.toml --check"
+cwd = "."
+timeout_secs = 300
+
+[[gate]]
+name = "clippy"
+command = "cargo clippy --locked --all-targets -- -D warnings && cargo clippy --locked --all-targets -p warp-flow-core -- -D warnings"
+cwd = "."
+timeout_secs = 1800
+
+[[gate]]
+name = "test"
+command = "cargo test --locked && cargo test --locked -p warp-flow-core"
+cwd = "."
+timeout_secs = 1800
