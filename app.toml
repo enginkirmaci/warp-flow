@@ -2,6 +2,7 @@
 [app]
 package = "warp-flow"
 icon_prefix = "warpflow"
+scalable_svg = "packaging/linux/icons/warpflow.svg"
 notes = """
 Workflow engine for the suite. Takes a request, distils it into an issue,
 splits it into tasks and drives code, review, gates and merge through harness

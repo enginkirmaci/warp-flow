@@ -8,14 +8,8 @@
       <feDropShadow dx="0" dy="2" stdDeviation="2.2" flood-color="#000000" flood-opacity="0.24"/>
     </filter>
   </defs>
-  <g filter="url(#s)">
-    <!-- the flow: one node where a request arrives, two where it lands -->
-    <g stroke="url(#g)" stroke-width="11" stroke-linecap="round">
-      <path d="M46 58 84 39"/>
-      <path d="M46 70 84 89"/>
-    </g>
-    <circle cx="35" cy="64" r="14" fill="url(#g)"/>
-    <circle cx="95" cy="36" r="14" fill="url(#g)"/>
-    <circle cx="95" cy="92" r="14" fill="#777A7D"/>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" filter="url(#s)">
+    <path d="M26 32 L58 64 L26 96" stroke="url(#g)" stroke-width="20"/>
+    <path d="M80 44 L100 64 L80 84" stroke="#2878F0" stroke-width="14"/>
   </g>
 </svg>
