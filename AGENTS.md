@@ -5,7 +5,7 @@ The suite's conventions apply: read
 `warp-suite` and `apps/warp-flow` is the link to it, so the same path works
 either way. This file adds only the app-specific facts.
 
-Design plans live in `plans/`: a plan is deleted when its work lands, and the
+Design plans live in `docs/plans/`: a plan is deleted when its work lands, and the
 rules that still matter move into `README.md` or this file.
 
 ## Shape

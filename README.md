@@ -5,56 +5,49 @@ distil it into an issue, split it into tasks, write each task in its own
 worktree, review it, run the repository's gates, and merge it.
 
 Every step that needs judgement is a coding-agent session on
-[warp-agent](https://github.com/enginkirmaci/warp-agent)'s door; the engine
+[Warp Agent](https://github.com/enginkirmaci/warp-agent)'s door; the engine
 itself never calls a model. The record lives in the target repository as
 markdown under `.scratch/<feature-slug>/`.
 
-The design, its decisions and the build order are in
-[`plans/warp-flow.md`](plans/warp-flow.md); the engine's ADRs are in
-[`docs/adr/`](docs/adr/), and the family's contract decisions stay in
-[warp-suite](https://github.com/enginkirmaci/warp-suite/tree/main/docs/adr).
+Part of the [warp suite](https://github.com/enginkirmaci/warp-suite). Rust and
+GPUI.
 
 ## Install
 
-Released from [github.com/enginkirmaci/warp-flow](https://github.com/enginkirmaci/warp-flow):
-the Linux tarball, the Windows portable zip and the per-user Windows installer.
-The suite's release bundles it with the rest of the apps
-(`warp-suite`'s `suite.toml` pins the tag); installing the bundle is the normal
-way to get it on a desktop.
+The normal way is the suite bundle, which installs every warp app at once:
 
-## Build
+- **Linux** — download `warp-suite-<version>-linux.tar.gz` from the
+  [suite release](https://github.com/enginkirmaci/warp-suite/releases), extract
+  it, and run `./install.sh`. Binaries go to `~/.local/bin`, desktop entries
+  and icons to `~/.local/share`; everything is per-user, no root needed.
+- **Windows** — download `warp-suite-<version>-windows-x64.zip`, extract it,
+  and run `install.cmd`. It installs under
+  `%LOCALAPPDATA%\Programs\warp-suite` with a Start Menu folder. The same ZIP
+  is portable: run the executables under `apps\` without installing.
+
+warp-flow also ships on its own: the Linux tarball and the Windows portable zip
+and installer are on
+[this repository's releases](https://github.com/enginkirmaci/warp-flow/releases).
+
+## Run
 
 ```sh
+cargo run -- --repo <path>     # the desktop app (repeat --repo per repository)
 cargo test -p warp-flow-core   # the engine
 cargo test -p warp-flow        # the desktop app's headless probes
-cargo run -- --repo <path>     # the desktop app (repeat --repo per repository)
 cargo run --bin warp-flow-cli -- run <issue-dir>   # drive a run from a terminal
 ```
 
-The app is the process that drives a run, and it wears the suite's one shell:
-a 76 rail of sections, the 432 repository list, then the detail. The `Runs`
+The first build fetches GPUI from the zed git repository and takes a while. It
+needs the usual Wayland/Vulkan development packages.
+
+## What it does
+
+The app is the process that drives a run, and it wears the suite's one shell: a
+76 rail of sections, the 432 repository list, then the detail. The `Runs`
 section's detail holds the 320 run column — the board read downwards, one lane
 band per state the issue folders fall into — beside the open run. The `Repos`
 section holds the selected repository's gates and workflow template.
-
-## What a repository carries
-
-Two files belong to warp-flow rather than to the project, so they live in one
-folder of their own:
-
-```text
-<repo>/.flow/flow.toml       the gates and the merge policy
-<repo>/.flow/workflow.toml   the workflow template a run copies
-```
-
-`warp-flow-core`'s `layout` module owns both paths, so the engine and the app
-cannot disagree about where a file lives. A repository that has never been
-driven has no `.flow/` yet: the first save from `Repos › Gates` or
-`Repos › Workflow` creates the folder.
-
-An issue folder keeps its own pinned copy beside its other artifacts
-(`.scratch/<feature-slug>/workflow.toml`): that is the revision the run started
-on, and it is the issue folder's file, not the repository's.
 
 The run column's **New run** is the one screen action that creates an issue
 folder: a title and the request become `.scratch/<slug>/spec.md` (a title
@@ -85,6 +78,25 @@ save — it is read at step boundaries, and it validates before writing.
 `answer`, `--dry-run`); it is a second binary of this package, not a separate
 package, and it is the way to run a flow on a machine with no window.
 
+## What a repository carries
+
+Two files belong to warp-flow rather than to the project, so they live in one
+folder of their own:
+
+```text
+<repo>/.flow/flow.toml       the gates and the merge policy
+<repo>/.flow/workflow.toml   the workflow template a run copies
+```
+
+`warp-flow-core`'s `layout` module owns both paths, so the engine and the app
+cannot disagree about where a file lives. A repository that has never been
+driven has no `.flow/` yet: the first save from `Repos › Gates` or
+`Repos › Workflow` creates the folder.
+
+An issue folder keeps its own pinned copy beside its other artifacts
+(`.scratch/<feature-slug>/workflow.toml`): that is the revision the run started
+on, and it is the issue folder's file, not the repository's.
+
 ## The door
 
 The app publishes a loopback door the way its siblings do
@@ -96,5 +108,48 @@ and the live runs), `run` (one issue folder's detail and phase), `answer`,
 board notification to re-ask `runs`). `ping` reports the app and the version.
 
 There is no start verb: starting a run is the app's own action. The contract is
-in `warp-suite`'s [cross-app contracts](https://github.com/enginkirmaci/warp-suite#cross-app-contracts),
-and warp-agent's Flow surface is its first client.
+in `warp-suite`'s
+[cross-app contracts](https://github.com/enginkirmaci/warp-suite#cross-app-contracts),
+and Warp Agent's Flow surface is its first client.
+
+## Where it keeps its files
+
+| Path | What |
+| --- | --- |
+| `~/.warp/flow/settings.json` | the remembered repositories |
+| `~/.warp/flow/ipc.port`, `ipc.token` | the door endpoint |
+| `~/.warp/logs/` | the suite's shared rolling logs |
+| `<repo>/.flow/` | the repository's gates and workflow template |
+| `<repo>/.scratch/<slug>/` | one run's record |
+
+## Siblings
+
+| App | What it adds |
+| --- | --- |
+| [warp-agent](https://github.com/enginkirmaci/warp-agent) | the harness every step runs on |
+| [warp-station](https://github.com/enginkirmaci/warp-station) | the repository workbench |
+| [warp-notes](https://github.com/enginkirmaci/warp-notes) | per-repo markdown notes |
+| [warp-pomodoro](https://github.com/enginkirmaci/warp-pomodoro) | the focus timer |
+| [warp-snapit](https://github.com/enginkirmaci/warp-snapit) | the Windows zone snapper |
+
+## Design
+
+The design, its decisions and the build order are in
+[`docs/plans/warp-flow.md`](docs/plans/warp-flow.md); the engine's ADRs are in
+[`docs/adr/`](docs/adr/), and the family's contract decisions stay in
+[warp-suite](https://github.com/enginkirmaci/warp-suite/tree/main/docs/adr).
+
+## Build and package
+
+```sh
+cargo build --release
+```
+
+The `release` workflow packages this repository alone: on Linux it stages the
+binary, the desktop entry and the hicolor icons into a tarball; on Windows it
+writes the portable zip and the Inno Setup installer. The assets stay here
+under `packaging/`.
+
+## License
+
+GPL-3.0. See [LICENSE](LICENSE).

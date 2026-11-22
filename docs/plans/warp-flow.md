@@ -11,7 +11,7 @@ branch. Every step that needs judgement is a harness session; the engine itself
 never calls a model. When the run needs a person it writes a question and
 waits.
 
-**Vocabulary** lives in [`GLOSSARY.md`](../GLOSSARY.md#warp-flow): request,
+**Vocabulary** lives in [`GLOSSARY.md`](../../GLOSSARY.md#warp-flow): request,
 issue, task, blocker, step, workflow, revision, run, attempt, gate, skill,
 artifact, question, approval, repair.
 
@@ -21,16 +21,16 @@ artifact, question, approval, repair.
    `warp-flow` is a desktop app in the suite, with its own UI and its own door
    ([ADR-0012](https://github.com/enginkirmaci/warp-suite/blob/main/docs/adr/0012-warp-flow-publishes-a-door-of-its-own.md)).
 2. **The engine never calls a model**
-   ([ADR-0008](../docs/adr/0008-the-engine-never-calls-a-model.md)). Every
+   ([ADR-0008](../../docs/adr/0008-the-engine-never-calls-a-model.md)). Every
    thinking step is a harness session driven over warp-agent's door
-   ([ADR-0011](../docs/adr/0011-warp-flow-reaches-harnesses-through-the-door.md)).
+   ([ADR-0011](../../docs/adr/0011-warp-flow-reaches-harnesses-through-the-door.md)).
 3. **The issue folder is the protocol**
-   ([ADR-0009](../docs/adr/0009-the-issue-folder-is-the-protocol.md)):
+   ([ADR-0009](../../docs/adr/0009-the-issue-folder-is-the-protocol.md)):
    `.scratch/<feature-slug>/` holds `spec.md`, `issues/<NN>-<slug>.md`,
    `workflow.toml`, `run.md`, `questions/<NN>.md` and `repairs/<NN>.md`. The
    engine advances by parsing them; there is no database.
 4. **Workflows are declarative and revisable**
-   ([ADR-0010](../docs/adr/0010-workflows-are-declarative-and-revisable.md)).
+   ([ADR-0010](../../docs/adr/0010-workflows-are-declarative-and-revisable.md)).
    A run copies the default graph into the issue folder and reads it at each
    step boundary, so a change — by a person or by the engine — lands on the next
    step and never inside a running session. Every change appends a revision.
