@@ -1,6 +1,6 @@
 [package]
 name = "warp-flow"
-version = "0.1.26"
+version = "0.1.28"
 edition = "2024"
 description = "warp-flow — workflow engine for the warp-suite"
 license = "GPL-3.0"
@@ -17,12 +17,12 @@ default-run = "warp-flow"
 
 [dependencies]
 # kit line: pinned by tag, patched to kits/ by warp-suite's local build
-warpui-kit-core = { git = "https://github.com/enginkirmaci/warp-suite", tag = "kits-v0.2.112", package = "warpui-kit-core" }
-warpui-kit-markdown = { git = "https://github.com/enginkirmaci/warp-suite", tag = "kits-v0.2.112", package = "warpui-kit-markdown", features = ["all-languages"] }
+warpui-kit-core = { git = "https://github.com/enginkirmaci/warp-suite", tag = "kits-v0.2.135", package = "warpui-kit-core" }
+warpui-kit-markdown = { git = "https://github.com/enginkirmaci/warp-suite", tag = "kits-v0.2.135", package = "warpui-kit-markdown", features = ["all-languages"] }
 # the task & diff screen draws patches with the family's renderer; the markdown
 # kit pulls it in too, but a transitive dependency cannot be named in code
-warpui-kit-diff = { git = "https://github.com/enginkirmaci/warp-suite", tag = "kits-v0.2.112", package = "warpui-kit-diff", features = ["all-languages"] }
-warpui-kit-platform = { git = "https://github.com/enginkirmaci/warp-suite", tag = "kits-v0.2.112", package = "warpui-kit-platform" }
+warpui-kit-diff = { git = "https://github.com/enginkirmaci/warp-suite", tag = "kits-v0.2.135", package = "warpui-kit-diff", features = ["all-languages"] }
+warpui-kit-platform = { git = "https://github.com/enginkirmaci/warp-suite", tag = "kits-v0.2.135", package = "warpui-kit-platform" }
 
 # the gpui stack, pinned here because the app builds standalone
 gpui = { package = "gpui-pre", version = "=0.3.11" }
@@ -49,7 +49,7 @@ tracing-appender = "0.2"
 gpui-kit = { version = "0.9", features = ["test-support"] }
 
 [build-dependencies]
-warpui-kit-build = { git = "https://github.com/enginkirmaci/warp-suite", tag = "kits-v0.2.112", package = "warpui-kit-build" }
+warpui-kit-build = { git = "https://github.com/enginkirmaci/warp-suite", tag = "kits-v0.2.135", package = "warpui-kit-build" }
 
 [profile.release]
 lto = "thin"

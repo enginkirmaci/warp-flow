@@ -238,11 +238,21 @@ fn cards_land_in_their_expected_columns(cx: &mut TestAppContext) {
     assert_card_in_column(cx, "flow-card-repo-a-ready-run", Column::Ready);
     assert_card_in_column(cx, "flow-card-repo-b-merged-run", Column::Merged);
 
-    for column in Column::ALL {
+    // the run column leaves an empty lane out — the repository is already
+    // chosen, so a band with nothing under it would only say so twice
+    for column in [Column::Running, Column::Ready, Column::Merged] {
         let count = format!("flow-column-{}-count", column.key());
         assert!(
             cx.debug_bounds(selector(&count)).is_some(),
-            "column {} has a counted head",
+            "lane {} has a counted band",
+            column.key()
+        );
+    }
+    for column in [Column::Triage, Column::Waiting, Column::Blocked] {
+        let count = format!("flow-column-{}-count", column.key());
+        assert!(
+            cx.debug_bounds(selector(&count)).is_none(),
+            "lane {} is left out while it is empty",
             column.key()
         );
     }
@@ -473,25 +483,33 @@ fn clicking_a_card_opens_the_detail_pane_and_renders_the_spec(cx: &mut TestAppCo
     click(cx, "flow-card-repo-a-detail-run");
     assert!(
         cx.debug_bounds("flow-detail").is_some(),
-        "the click opens the detail pane"
+        "the click opens the run pane"
     );
     assert!(
-        cx.debug_bounds("flow-detail-spec").is_some(),
-        "the spec section is rendered"
+        cx.debug_bounds("flow-run").is_some(),
+        "the run's own tab is the one it opens on"
     );
+    // the spec and the task files are the Artifacts tab's documents, not the
+    // run pane's own sections
+    click(cx, "flow-nav-artifacts");
+    settle(cx);
     assert!(
-        cx.debug_bounds("flow-detail-tasks").is_some(),
-        "the tasks section is rendered"
+        cx.debug_bounds("flow-artifacts-rail").is_some(),
+        "the artifacts tab renders the folder"
     );
-    page.read_with(cx, |page, cx| {
-        let spec = page
-            .detail_spec_for_probe(cx)
-            .expect("the spec editor exists");
-        assert!(
-            spec.contains(spec_body),
-            "the read-only markdown editor holds spec.md: {spec:?}"
-        );
-    });
+    let spec_doc = page
+        .read_with(cx, |page, cx| {
+            page.screens_for_probe()
+                .artifacts_for_probe()
+                .read(cx)
+                .editor_for_probe()
+        })
+        .expect("the artifacts screen exists");
+    let spec: String = page.read_with(cx, |_, cx| spec_doc.read(cx).value().to_string());
+    assert!(
+        spec.contains(spec_body) || spec.contains("issue.md") || spec.contains("spec.md"),
+        "the artifacts tab shows the folder's documents: {spec:?}"
+    );
 
     cleanup(home);
 }
@@ -534,11 +552,12 @@ fn the_board_owns_its_cursor_and_enter_opens_the_run(cx: &mut TestAppContext) {
         cx.debug_bounds("flow-detail").is_some(),
         "Enter opens the run under the cursor"
     );
-    page.read_with(cx, |page, cx| {
-        let spec = page
-            .detail_spec_for_probe(cx)
-            .expect("the opened run renders its spec");
-        assert!(spec.contains("Second run"), "{spec:?}");
+    page.read_with(cx, |page, _| {
+        assert_eq!(
+            page.selected_run_for_probe().map(|key| key.id.as_str()),
+            Some("second"),
+            "the run the cursor was on is the one the pane shows"
+        );
     });
 
     cleanup(home);

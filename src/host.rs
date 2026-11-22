@@ -539,6 +539,10 @@ impl Host {
     ) -> std::result::Result<(), String> {
         let issue = canonical_issue(issue);
         let prepared = prepare(&issue).map_err(|error| error.to_string())?;
+        // the repository's template is pinned into the issue folder here, so
+        // the run reads one revision for its whole life (Repos › Workflow keeps
+        // revising the template, never this run's graph)
+        prepared.pin_workflow().map_err(|error| error.to_string())?;
         let id = prepared
             .issue
             .file_name()

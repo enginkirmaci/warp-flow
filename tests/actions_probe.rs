@@ -249,7 +249,6 @@ fn phase_of(
 /// Open the run screen for the one run in the repository.
 fn open_run_screen(cx: &mut VisualTestContext) {
     click(cx, "flow-card-repo-a-demo");
-    click(cx, "flow-detail-open-run");
     assert!(
         cx.debug_bounds("flow-run").is_some(),
         "the run screen is open"

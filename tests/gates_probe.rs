@@ -115,6 +115,7 @@ fn screen_run(repo: &Path) -> ScreenRun {
         run: Arc::new(run),
         repo: repo.to_path_buf(),
         driving: false,
+        read_only: false,
     }
 }
 
@@ -205,15 +206,22 @@ fn the_selected_repository_and_its_gates_render(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("flow-gates-card").is_some());
     assert!(cx.debug_bounds("flow-gates-list").is_some());
 
-    // both gates of the file are rows, with all four fields drawn
+    // both gates of the file are rows; the one editor shows the selected
+    // row's four fields, so a probe selects a row before it reads them
     for index in 0..2 {
-        for field in ["gate", "name", "command", "cwd", "timeout", "run", "remove"] {
-            let name = format!("flow-gates-{field}-{index}");
-            assert!(
-                cx.debug_bounds(selector(&name)).is_some(),
-                "{name} is drawn"
-            );
-        }
+        let name = format!("flow-gates-gate-{index}");
+        assert!(
+            cx.debug_bounds(selector(&name)).is_some(),
+            "{name} is drawn"
+        );
+    }
+    click(&mut cx, "flow-gates-select-0");
+    for field in ["name", "command", "cwd", "timeout", "run", "remove"] {
+        let name = format!("flow-gates-{field}-0");
+        assert!(
+            cx.debug_bounds(selector(&name)).is_some(),
+            "{name} is drawn for the selected row"
+        );
     }
     let gates = screen.read_with(&cx, |screen, app| screen.gates_for_probe(app));
     assert_eq!(gates.len(), 2, "one row per gate");
@@ -322,7 +330,8 @@ fn a_duplicate_gate_name_is_refused_and_the_file_stays(cx: &mut TestAppContext) 
     settings.repos.push(repo.clone());
     let (mut cx, screen) = open_screen(cx, &repo, settings);
 
-    // the second gate takes the first one's name
+    // the second gate takes the first one's name: select it, then edit it
+    click(&mut cx, "flow-gates-select-1");
     set_field(&mut cx, "flow-gates-name-1", "fmt");
     click(&mut cx, "flow-gates-save");
 
@@ -408,6 +417,7 @@ fn run_once_reports_both_exit_codes(cx: &mut TestAppContext) {
     );
 
     // a failing command, with its output tail under the word
+    click(&mut cx, "flow-gates-select-1");
     click(&mut cx, "flow-gates-run-1");
     assert!(
         cx.debug_bounds("flow-gates-report-1").is_some(),

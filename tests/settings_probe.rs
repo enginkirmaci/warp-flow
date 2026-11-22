@@ -83,6 +83,8 @@ fn the_settings_rows_and_the_motion_switch(cx: &mut TestAppContext) {
     let settings = Settings {
         repos: vec![PathBuf::from("/tmp/some-repository")],
         reduce_motion: false,
+        favorites: Vec::new(),
+        list_width: None,
     };
     settings.save();
     assert!(!warpui_kit_core::motion::reduced());

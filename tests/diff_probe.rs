@@ -96,6 +96,7 @@ fn screen_run(repo: &Path) -> ScreenRun {
         run: Arc::new(run),
         repo: repo.to_path_buf(),
         driving: false,
+        read_only: false,
     }
 }
 

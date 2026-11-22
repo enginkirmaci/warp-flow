@@ -110,8 +110,8 @@ fn the_board_reveals_the_card_under_the_cursor(cx: &mut TestAppContext) {
     let home = scratch_home("reveal");
     cx.update(gpui_kit::init);
     cx.update(theme::apply_kit_theme);
-    // two repositories side by side make the board wider than the window; many
-    // runs in one lane make it taller
+    // the run column is a fixed 320 wide, so only its height scrolls; many runs
+    // in two repositories make it taller than the window
     let first = seed_repo(&home, "repo-a", 12);
     let second = seed_repo(&home, "repo-b", 2);
 
@@ -127,14 +127,15 @@ fn the_board_reveals_the_card_under_the_cursor(cx: &mut TestAppContext) {
             (offset, viewport, app.board_max_offset_for_probe())
         })
         .expect("the window is open");
-    assert_eq!(offset, Point::default(), "the board starts at its origin");
-    assert!(
-        max.x > px(0.),
-        "six lanes do not fit the window, so the board scrolls sideways: {max:?}"
+    assert_eq!(offset, Point::default(), "the column starts at its origin");
+    assert_eq!(
+        max.x,
+        px(0.),
+        "the run column is a fixed 320 and never scrolls sideways: {max:?}"
     );
     assert!(
         max.y > px(0.),
-        "the lane is taller than the window: {max:?}"
+        "the lanes are taller than the column: {max:?}"
     );
     assert!(viewport.size.width > px(0.) && viewport.size.height > px(0.));
 

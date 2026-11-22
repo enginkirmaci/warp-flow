@@ -4,8 +4,10 @@
 //! The design's settings page is a flat list of rows — label and description on
 //! the left, the control on the right, a hairline between them, no cards — so
 //! this screen uses the kit's row vocabulary rather than the run screen's
-//! sections. What belongs to a *repository* (gates, merge policy) is the Repos &
-//! gates screen's, and the row that says so is here on purpose.
+//! sections. It holds only what `~/.warp/flow/settings.json` persists: the one
+//! switch here is the shared motion choice. What belongs to a *repository* —
+//! its gates and its workflow template — is the Repos section's, and the head
+//! says so on purpose.
 
 use gpui::prelude::*;
 use gpui::{
@@ -21,6 +23,52 @@ use crate::theme;
 
 use super::ScreenRun;
 
+/// The settings page's groups. The section's list holds one row per group —
+/// the design's "rail + list + detail" applies to Settings too — and the detail
+/// shows the selected group's rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SettingsGroup {
+    /// Type, palette and motion.
+    #[default]
+    Appearance,
+    /// The door, and the run it drives.
+    Engine,
+    /// Where the app keeps its files, and this build.
+    Files,
+}
+
+impl SettingsGroup {
+    /// Every group, in the list's order.
+    pub const ALL: [Self; 3] = [Self::Appearance, Self::Engine, Self::Files];
+
+    /// A stable key for debug selectors and state.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Appearance => "appearance",
+            Self::Engine => "engine",
+            Self::Files => "files",
+        }
+    }
+
+    /// The row's word, and the detail's title.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Appearance => "Appearance",
+            Self::Engine => "Engine",
+            Self::Files => "Files",
+        }
+    }
+
+    /// The row's second line.
+    pub fn blurb(self) -> &'static str {
+        match self {
+            Self::Appearance => "Text size, palette and motion.",
+            Self::Engine => "The door warp-agent reads, and the runs this window drives.",
+            Self::Files => "Where the settings and logs live, and this build.",
+        }
+    }
+}
+
 /// This app's own settings: reduced motion, and anything else that is the
 /// window's rather than a repository's.
 pub struct SettingsScreen {
@@ -30,6 +78,9 @@ pub struct SettingsScreen {
     /// sits in a run's rail, so it accepts it and keeps the identity for the
     /// head.
     run: Option<ScreenRun>,
+    /// The group the section's list selected. `None` draws the whole page,
+    /// which is what a screen built outside the shell shows.
+    group: Option<SettingsGroup>,
     /// The door's live port, read on every `show`: `None` is "not published".
     door_port: Option<u16>,
     scroll: ScrollHandle,
@@ -47,6 +98,7 @@ impl SettingsScreen {
         Self {
             settings,
             run: None,
+            group: None,
             door_port: door::read_endpoint().map(|(port, _token)| port),
             scroll: ScrollHandle::new(),
             focus: cx.focus_handle(),
@@ -61,6 +113,17 @@ impl SettingsScreen {
         cx.notify();
     }
 
+    /// Show one group, as the settings list selects it. The door's state is
+    /// re-read because it changes without this screen.
+    pub fn show_group(&mut self, group: SettingsGroup, cx: &mut Context<Self>) {
+        self.door_port = door::read_endpoint().map(|(port, _token)| port);
+        if self.group == Some(group) {
+            return;
+        }
+        self.group = Some(group);
+        cx.notify();
+    }
+
     /// The switch: take effect at once, then persist.
     fn set_reduce_motion(&mut self, on: bool, cx: &mut Context<Self>) {
         self.settings.reduce_motion = on;
@@ -71,6 +134,31 @@ impl SettingsScreen {
     }
 
     // ---- rows --------------------------------------------------------------
+
+    /// The type ladder: the family's four steps, applied at once.
+    fn text_size_row(&self) -> AnyElement {
+        kit::row_with_desc(
+            "settings-row-text-size",
+            "Text size",
+            "Small, Normal, Large or Larger. Every text step, padding and icon follows it, and \
+             the floor of 12 px holds at every size.",
+            warpui_kit_core::text_size_control(),
+            true,
+        )
+    }
+
+    /// The palette: one segment per ramp, applied at once, shared with the rest
+    /// of the family through `~/.warp/ui.json`.
+    fn palette_row(&self) -> AnyElement {
+        kit::row_with_desc(
+            "settings-row-palette",
+            "Palette",
+            "Copper, Plum, Pine, Blue or Gray. The accent follows the ramp, and every app in \
+             the suite reads the same choice at its next start.",
+            warpui_kit_core::palette_control(),
+            false,
+        )
+    }
 
     fn motion_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
         kit::switch_row_with_desc(
@@ -159,13 +247,29 @@ impl Render for SettingsScreen {
         // The kit's rows need the document's state, so they are built here; a
         // screen with no run still draws, which is what the rail's Settings row
         // opens on a bare launch.
-        let rows = vec![
-            self.motion_row(cx),
-            self.folder_row(),
-            self.logs_row(),
-            self.door_row(),
-            self.version_row(),
-        ];
+        // one group at a time in the shell's settings list; the whole page when
+        // a probe builds this screen on its own
+        let appearance = self
+            .group
+            .is_none_or(|group| group == SettingsGroup::Appearance);
+        let engine = self
+            .group
+            .is_none_or(|group| group == SettingsGroup::Engine);
+        let files = self.group.is_none_or(|group| group == SettingsGroup::Files);
+        let mut rows = Vec::new();
+        if appearance {
+            rows.push(self.text_size_row());
+            rows.push(self.palette_row());
+            rows.push(self.motion_row(cx));
+        }
+        if engine {
+            rows.push(self.door_row());
+        }
+        if files {
+            rows.push(self.folder_row());
+            rows.push(self.logs_row());
+            rows.push(self.version_row());
+        }
         let head = div()
             .flex_shrink_0()
             .border_b_1()
@@ -183,16 +287,20 @@ impl Render for SettingsScreen {
                             .text_size(px(theme::font_screen_title()))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::text())
-                            .child("Settings"),
+                            .child(self.group.map_or("Settings", SettingsGroup::label)),
                     )
                     .child(
                         div()
                             .text_size(px(theme::font_meta()))
                             .text_color(theme::text_dim())
-                            .child(
-                                "This window's own knobs. Repositories and gates belong to \
-                                 the run's Repos & gates screen.",
-                            ),
+                            .child(match self.group {
+                                Some(group) => group.blurb(),
+                                None => {
+                                    "How this window draws, where it keeps its files and whether \
+                                     its door is up. Repositories, gates and workflow templates \
+                                     belong to Repos."
+                                }
+                            }),
                     ),
             );
         let body = div()

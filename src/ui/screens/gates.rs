@@ -1,16 +1,17 @@
-//! Repos & gates: the repositories this window shows and their gates.
+//! Repos › Gates: the repository work list and one gate editor.
 //!
-//! One scrolling column with two sections: the remembered repositories, and
-//! the `flow.toml` gates of the selected one. A gate row is editable in place —
-//! name, command, working directory and timeout are the file's four fields —
-//! and `Run once` executes it on the background executor, so a command, a
-//! working directory and a timeout are checked against reality before a run
-//! depends on them.
+//! The left column is the work list: the remembered repositories (how a folder
+//! enters the app), then the selected repository's gates, one row each — its
+//! number, its name, its command in the code face and its last outcome. The
+//! right column edits the selected gate: name, command, folder and timeout, one
+//! 36-high field each, with `Run once` beside `Save`.
 //!
 //! `flow.toml` is a person's file at the repository root: this screen writes it
 //! atomically through [`super::write_atomic_raw`] and never inside the issue
-//! folder. The engine owns the repository while it drives a run, so a manual
-//! gate run waits for the run to reach a step boundary.
+//! folder. A row's trash only edits the working copy; `Save` is the write, so a
+//! removed row is not lost until then. The engine owns the repository while it
+//! drives a run, so a manual gate run waits for the run to reach a step
+//! boundary.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,7 +27,7 @@ use warp_flow_core::config::{FlowConfig, MergeMode};
 use warp_flow_core::gate::{self, Gate, GateReport};
 use warp_flow_core::worktree::Repo;
 use warpui_kit_core::controls::{self, BtnKind};
-use warpui_kit_core::{A11y, field, list_nav, motion, scroll, tooltip::tooltip_text};
+use warpui_kit_core::{A11y, field, icon, list_nav, motion, scroll, shell, tooltip::tooltip_text};
 
 use crate::host::{Host, Phase};
 use crate::store;
@@ -34,6 +35,31 @@ use crate::theme;
 use crate::ui::window::{FlowApp, repo_label};
 
 use super::{ScreenRun, write_atomic_raw};
+
+/// The work list's width: the design's 320, never resizable.
+const LIST_WIDTH: f32 = 320.;
+
+/// One gate row in the work list.
+const GATE_ROW_HEIGHT: f32 = 58.;
+
+/// One remembered repository in the work list's head band.
+const REPO_ROW_HEIGHT: f32 = 36.;
+
+/// The most the repository band may take before it scrolls: the gate list
+/// always keeps the rest of the column.
+const REPO_BAND_MAX_HEIGHT: f32 = 240.;
+
+/// The gates list's head: `Gates`, the count and `Add gate`.
+const LIST_HEAD_HEIGHT: f32 = 40.;
+
+/// One editable field's row: a 36-high field with air above and below.
+const FIELD_ROW_HEIGHT: f32 = 48.;
+
+/// The label column of an editor row.
+const LABEL_WIDTH: f32 = 112.;
+
+/// The glyph an empty state draws.
+const EMPTY_GLYPH: f32 = 28.;
 
 /// The name of the one gate a fresh `flow.toml` starts with.
 const DEFAULT_GATE_NAME: &str = "test";
@@ -45,13 +71,16 @@ const DEFAULT_GATE_COMMAND: &str = "cargo test";
 /// The timeout the starting gate gets, in whole seconds.
 const DEFAULT_GATE_TIMEOUT_SECS: u64 = 900;
 
-/// The most a gate's output tail may take on the page, so twenty lines of a
-/// noisy check do not push the next gate off screen.
-const TAIL_MAX_HEIGHT: f32 = 150.;
+/// The command a row added from the list starts with: the repository's own
+/// check, so the new row is already runnable.
+const ADDED_GATE_COMMAND: &str = "cargo test";
 
-/// The gates list's own height before it scrolls, so a repository with many
-/// gates keeps the page's head and repository list in view.
-const GATE_LIST_MAX_HEIGHT: f32 = 560.;
+/// The timeout a row added from the list starts with.
+const ADDED_GATE_TIMEOUT_SECS: u64 = 300;
+
+/// The most a gate's output tail may take on the page, so twenty lines of a
+/// noisy check do not push the next field off screen.
+const TAIL_MAX_HEIGHT: f32 = 150.;
 
 /// What the screen has read of the selected repository's `flow.toml`.
 enum Load {
@@ -110,6 +139,50 @@ enum GateRun {
     Done(Result<GateReport, String>),
 }
 
+/// What a gate's last `Run once` says, in the one word a row and a pill use.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// No `Run once` from this window yet.
+    NotRun,
+    /// The background executor is running it.
+    Running,
+    /// It finished and passed.
+    Passed,
+    /// It finished and failed, or could not start.
+    Failed,
+}
+
+impl Outcome {
+    /// The word a state pill shows.
+    fn word(self) -> &'static str {
+        match self {
+            Self::NotRun => "not run yet",
+            Self::Running => "Running",
+            Self::Passed => "last run passed",
+            Self::Failed => "last run failed",
+        }
+    }
+
+    /// The glyph the row's right edge carries.
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::NotRun | Self::Running => "icons/icon-clock.svg",
+            Self::Passed => "icons/icon-check.svg",
+            Self::Failed => "icons/icon-close.svg",
+        }
+    }
+
+    /// The ink the glyph and the pill's word take.
+    fn hue(self) -> gpui::Rgba {
+        match self {
+            Self::NotRun => theme::text_muted(),
+            Self::Running => theme::BEHIND,
+            Self::Passed => theme::ADD,
+            Self::Failed => theme::DANGER,
+        }
+    }
+}
+
 impl GateDraft {
     /// A row over `gate`, with one field per value the file carries.
     fn new(id: u64, gate: Gate, window: &mut Window, cx: &mut Context<GatesScreen>) -> Self {
@@ -120,6 +193,17 @@ impl GateDraft {
             cwd: input(gate.cwd.to_string_lossy().into_owned(), window, cx),
             timeout: input(gate.timeout.as_secs().to_string(), window, cx),
             run: GateRun::Idle,
+        }
+    }
+
+    /// What the row's last run says.
+    fn outcome(&self) -> Outcome {
+        match &self.run {
+            GateRun::Idle => Outcome::NotRun,
+            GateRun::Running => Outcome::Running,
+            GateRun::Done(Err(_)) => Outcome::Failed,
+            GateRun::Done(Ok(report)) if report.passed() => Outcome::Passed,
+            GateRun::Done(Ok(_)) => Outcome::Failed,
         }
     }
 }
@@ -145,10 +229,8 @@ impl Note {
     }
 }
 
-/// The configured repositories (add, remove, forget) and the selected
-/// repository's gates from `flow.toml`, editable with validation and able to
-/// run once, so the command, the working directory and the timeout are checked
-/// against reality before a run depends on them.
+/// The configured repositories (add, forget, remember) and the selected
+/// repository's gates from `flow.toml`, as a work list and one editor.
 pub struct GatesScreen {
     /// The app's engine host: the source of the run's live phase, which pauses
     /// a manual gate run while the engine is driving the repository.
@@ -174,7 +256,7 @@ pub struct GatesScreen {
     merge_mode: MergeMode,
     /// Whether the merge queue may push, read beside the gates.
     push: bool,
-    /// The gate list's keyboard cursor and the row it marks.
+    /// The gate list's keyboard cursor: the row the editor edits.
     cursor: Option<usize>,
     /// The screen's own focus: the gate list is the pane that holds it.
     focus: FocusHandle,
@@ -182,13 +264,15 @@ pub struct GatesScreen {
     list_scroll: ScrollHandle,
     /// The next row id, so a row keeps its identity across removals.
     next_id: u64,
+    /// The row whose trash is armed: the family's second click removes it.
+    confirm_remove: Option<u64>,
     /// The `Add repository` field, built on the first frame that needs it.
     add_repository: Option<Entity<InputState>>,
     /// The last add or remove, under the `Add repository` row.
     add_note: Option<Note>,
-    /// The last refused save, under the gates.
+    /// The last refused save, under the editor's fields.
     save_note: Option<Note>,
-    /// The last save, with the path and the time it landed.
+    /// The last save or create, with the path and the time it landed.
     save_report: Option<String>,
     /// The window that owns these screens: a repository added or forgotten here
     /// changes what the board scans, and only the window can rescan it.
@@ -219,6 +303,7 @@ impl GatesScreen {
             focus: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
             next_id: 0,
+            confirm_remove: None,
             add_repository: None,
             add_note: None,
             save_note: None,
@@ -230,6 +315,25 @@ impl GatesScreen {
     /// repository is selected on the first show and whenever a different run
     /// is opened, but a poll of the same run never undoes a selection the
     /// person made here.
+    /// Show `repo`'s gates with no run involved: the Repos section's own view,
+    /// so a repository with no runs still has its `flow.toml` in reach.
+    pub fn show_repository(
+        &mut self,
+        repo: std::path::PathBuf,
+        driving: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let repo_changed = self.shown.as_ref() != Some(&repo);
+        self.run = None;
+        self.shown = Some(repo.clone());
+        if repo_changed || self.gates.is_empty() {
+            self.select_repository(repo, cx);
+            return;
+        }
+        let _ = driving;
+        cx.notify();
+    }
+
     pub fn show(&mut self, run: ScreenRun, cx: &mut Context<Self>) {
         let repo = run.repo.clone();
         let repo_changed = self.shown.as_ref() != Some(&repo);
@@ -274,6 +378,7 @@ impl GatesScreen {
         self.gates.clear();
         self.pending_gates = None;
         self.cursor = None;
+        self.confirm_remove = None;
         self.save_note = None;
         self.save_report = None;
         cx.spawn(async move |this, cx| {
@@ -331,7 +436,28 @@ impl GatesScreen {
         self.cursor = (!self.gates.is_empty()).then_some(0);
     }
 
+    /// The first remembered repository is the screen's starting point, so the
+    /// editor has a file even when the window has not opened a run here yet.
+    fn ensure_selection(&mut self, cx: &mut Context<Self>) {
+        if self.selected.is_some() || !matches!(self.load, Load::Idle) {
+            return;
+        }
+        if let Some(repo) = self.settings.repos.first().cloned() {
+            self.select_repository(repo, cx);
+        }
+    }
+
     // ---- editing the document ---------------------------------------------
+
+    /// The selected repository's `flow.toml`.
+    fn flow_path(&self) -> Option<PathBuf> {
+        Some(self.selected.as_ref()?.join("flow.toml"))
+    }
+
+    /// The selected row, when the document has one.
+    fn selected_index(&self) -> Option<usize> {
+        self.cursor.filter(|index| *index < self.gates.len())
+    }
 
     /// The row at `index` as the file would hold it, from its current fields.
     fn draft_gate(&self, index: usize, cx: &Context<Self>) -> Result<Gate, String> {
@@ -372,6 +498,7 @@ impl GatesScreen {
         let Some(repo) = self.selected.clone() else {
             return;
         };
+        self.confirm_remove = None;
         self.save_note = None;
         let mut gates = Vec::with_capacity(self.gates.len());
         for index in 0..self.gates.len() {
@@ -455,30 +582,28 @@ impl GatesScreen {
         self.next_id += 1;
         let gate = Gate {
             name: self.unique_gate_name(cx),
-            command: String::new(),
+            command: ADDED_GATE_COMMAND.to_owned(),
             cwd: PathBuf::from("."),
-            timeout: Duration::from_secs(DEFAULT_GATE_TIMEOUT_SECS),
+            timeout: Duration::from_secs(ADDED_GATE_TIMEOUT_SECS),
         };
         self.gates
             .push(GateDraft::new(self.next_id, gate, window, cx));
         let index = self.gates.len() - 1;
         self.cursor = Some(index);
         self.list_scroll.scroll_to_item(index);
+        self.confirm_remove = None;
         self.save_note = None;
         cx.notify();
     }
 
-    /// A name not taken by any row yet: `gate`, then `gate-2` and so on.
+    /// A name not taken by any row yet: `gate-1`, then `gate-2` and so on.
     fn unique_gate_name(&self, cx: &Context<Self>) -> String {
         let taken: Vec<String> = self
             .gates
             .iter()
             .map(|draft| value(&draft.name, cx).trim().to_owned())
             .collect();
-        if !taken.iter().any(|name| name == "gate") {
-            return "gate".to_owned();
-        }
-        let mut number = 2;
+        let mut number = 1;
         loop {
             let candidate = format!("gate-{number}");
             if !taken.iter().any(|name| name == &candidate) {
@@ -499,7 +624,23 @@ impl GatesScreen {
             Some(cursor) if cursor >= self.gates.len() => Some(self.gates.len() - 1),
             cursor => cursor,
         };
+        self.confirm_remove = None;
         self.save_note = None;
+        cx.notify();
+    }
+
+    /// The trash: the first click arms it, the second removes the row, and any
+    /// other click in the screen disarms it.
+    fn trash(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(draft) = self.gates.get(index) else {
+            return;
+        };
+        if self.confirm_remove == Some(draft.id) {
+            self.remove_gate(index, cx);
+            return;
+        }
+        self.confirm_remove = Some(draft.id);
+        self.cursor = Some(index);
         cx.notify();
     }
 
@@ -512,6 +653,7 @@ impl GatesScreen {
         if index >= self.gates.len() {
             return;
         }
+        self.confirm_remove = None;
         let gate = match self.draft_gate(index, cx) {
             Ok(gate) => gate,
             Err(message) => {
@@ -728,6 +870,7 @@ impl GatesScreen {
                     self.gates.clear();
                     self.pending_gates = None;
                     self.cursor = None;
+                    self.confirm_remove = None;
                     self.save_note = None;
                     self.save_report = None;
                 }
@@ -739,9 +882,9 @@ impl GatesScreen {
     // ---- the gate list's keys ---------------------------------------------
 
     /// The list's own key map: arrows move its cursor while the list has
-    /// focus. A focused field inside a row keeps its arrows — its caret moves,
-    /// and this handler runs for an ancestor in the same dispatch — so the
-    /// handler refuses to act unless the list itself holds the focus.
+    /// focus. A focused field keeps its arrows — its caret moves, and this
+    /// handler runs for an ancestor in the same dispatch — so the handler
+    /// refuses to act unless the list itself holds the focus.
     fn handle_key(&mut self, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
         if !self.focus.is_focused(window) {
             return;
@@ -754,113 +897,103 @@ impl GatesScreen {
             return;
         };
         self.cursor = Some(next);
+        self.confirm_remove = None;
         self.list_scroll.scroll_to_item(next);
         cx.stop_propagation();
         cx.notify();
     }
 
-    // ---- rendering --------------------------------------------------------
+    // ---- rendering: the work list -----------------------------------------
 
-    fn render_head(&self) -> AnyElement {
+    fn render_work_list(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let repositories = self.render_repositories(window, cx);
+        let head = self.render_gates_head(cx);
+        let list = self.render_gate_list(cx);
         div()
-            .id("flow-gates-head")
-            .debug_selector(|| "flow-gates-head".into())
-            .flex_shrink_0()
+            .id("flow-gates-column")
+            .debug_selector(|| "flow-gates-column".into())
             .flex()
-            .items_start()
-            .gap(px(12.))
-            .px(px(theme::scaled(theme::RUN_PADDING)))
-            .pt(px(18.))
-            .pb(px(14.))
+            .flex_col()
+            .flex_shrink_0()
+            .w(px(theme::scaled(LIST_WIDTH)))
+            .h_full()
+            .min_h_0()
+            .bg(theme::surface())
+            .border_r_1()
+            .border_color(theme::hairline())
+            .child(repositories)
+            .child(head)
+            .child(
+                div()
+                    .id("flow-gates-scroll")
+                    .debug_selector(|| "flow-gates-scroll".into())
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(list),
+            )
+            .into_any_element()
+    }
+
+    /// The remembered repositories, and the field that adds one.
+    fn render_repositories(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let mut section = div()
+            .id("flow-gates-repos")
+            .debug_selector(|| "flow-gates-repos".into())
+            .flex_shrink_1()
+            .min_h(px(0.))
+            .max_h(px(theme::scaled(REPO_BAND_MAX_HEIGHT)))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .px(px(12.))
+            .py(px(12.))
             .border_b_1()
-            .border_color(theme::border_light())
+            .border_color(theme::hairline())
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap(px(3.))
-                    .flex_1()
-                    .min_w_0()
+                    .items_center()
+                    .gap(px(8.))
                     .child(
                         div()
-                            .debug_selector(|| "flow-gates-title".into())
-                            .text_size(px(theme::font_screen_title()))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .line_height(relative(1.2))
-                            .text_color(theme::text())
+                            .flex_1()
+                            .min_w_0()
                             .truncate()
-                            .child("Repos & gates"),
+                            .text_size(px(theme::font_meta()))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_dim())
+                            .child("Repositories"),
                     )
                     .child(
                         div()
-                            .text_size(px(theme::font_meta()))
+                            .flex_shrink_0()
+                            .font_family(theme::code_font())
+                            .text_size(px(theme::font_micro()))
                             .text_color(theme::text_muted())
-                            .child(
-                                "the repositories this window shows, and the gates a run must \
-                                 pass in each",
-                            ),
+                            .child(repository_word(self.settings.repos.len())),
                     ),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .font_family(theme::code_font())
-                    .text_size(px(theme::font_micro()))
-                    .text_color(theme::text_muted())
-                    .child(repository_word(self.settings.repos.len())),
-            )
-            .into_any_element()
-    }
-
-    fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .id("flow-gates-scroll")
-            .debug_selector(|| "flow-gates-scroll".into())
-            .flex()
-            .flex_col()
-            .gap(px(theme::scaled(theme::RUN_GAP)))
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .p(px(theme::scaled(theme::RUN_PADDING)))
-            .child(self.render_repositories(window, cx))
-            .child(self.render_gates(window, cx))
-            .into_any_element()
-    }
-
-    // ---- the repositories section -----------------------------------------
-
-    fn render_repositories(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let mut card = div()
-            .id("flow-gates-repos")
-            .debug_selector(|| "flow-gates-repos".into())
-            .flex()
-            .flex_col()
-            .gap(px(8.))
-            .rounded(px(8.))
-            .border_1()
-            .border_color(theme::hairline())
-            .bg(theme::panel())
-            .p(px(12.))
-            .child(section_head("Repositories", String::new()));
+            );
         if self.settings.repos.is_empty() {
-            card = card.child(quiet_line(
+            section = section.child(quiet_line(
                 "No repositories yet. Add the first folder below.",
             ));
         }
         let mut rows = div()
             .id("flow-gates-repo-rows")
-            .role(gpui::Role::ListBox)
+            .role(gpui::Role::List)
             .flex()
             .flex_col()
-            .gap(px(8.));
+            .gap(px(2.));
         for index in 0..self.settings.repos.len() {
             rows = rows.child(self.render_repository_row(index, cx));
         }
-        card = card
+        section
             .child(rows)
-            .child(self.render_add_repository(window, cx));
-        card.into_any_element()
+            .child(self.render_add_repository(window, cx))
+            .into_any_element()
     }
 
     fn render_repository_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -875,29 +1008,20 @@ impl GatesScreen {
         let remove_selector = format!("flow-gates-repo-remove-{index}");
         let select_repo = repo.clone();
 
-        let row = div()
+        div()
             .id(SharedString::from(row_selector.clone()))
             .debug_selector(move || row_selector.clone())
             .a11y_option(format!("{name} — {}", store::display_path(&repo)), selected)
+            .cursor_pointer()
             .flex()
             .items_center()
-            .gap(px(10.))
+            .gap(px(8.))
+            .h(px(theme::scaled(REPO_ROW_HEIGHT)))
+            .pl(px(8.))
+            .pr(px(6.))
             .rounded(px(6.))
-            .border_1()
-            .border_color(if selected {
-                theme::accent_ink()
-            } else {
-                theme::hairline()
-            })
-            .bg(if selected {
-                theme::tint(theme::accent_ink())
-            } else {
-                theme::surface().into()
-            })
-            .px(px(10.))
-            .py(px(7.))
-            .cursor_pointer()
-            .hover(|style| style.bg(theme::raised()))
+            .when(selected, |row| row.bg(theme::raised()))
+            .when(!selected, |row| row.hover(|style| style.bg(theme::panel())))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.select_repository(select_repo.clone(), cx);
             }))
@@ -905,11 +1029,11 @@ impl GatesScreen {
                 div()
                     .debug_selector(move || mark_selector.clone())
                     .flex_shrink_0()
-                    .w(px(3.))
-                    .h(px(20.))
-                    .rounded(px(2.))
+                    .w(px(2.))
+                    .h(px(18.))
+                    .rounded(px(1.))
                     .bg(if selected {
-                        theme::accent_ink()
+                        theme::accent()
                     } else {
                         theme::hairline()
                     }),
@@ -917,7 +1041,9 @@ impl GatesScreen {
             .child(
                 div()
                     .flex_shrink_0()
-                    .text_size(px(theme::font_control()))
+                    .max_w(px(110.))
+                    .truncate()
+                    .text_size(px(theme::font_meta()))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme::text())
                     .child(name),
@@ -942,8 +1068,8 @@ impl GatesScreen {
                     cx.stop_propagation();
                     this.remove_repository(index, cx);
                 }),
-            ));
-        row.into_any_element()
+            ))
+            .into_any_element()
     }
 
     fn render_add_repository(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -953,12 +1079,12 @@ impl GatesScreen {
             .debug_selector(|| "flow-gates-add-repo-row".into())
             .flex()
             .flex_col()
-            .gap(px(6.))
+            .gap(px(4.))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(px(6.))
                     .child(div().flex_1().min_w_0().child(field::text(
                         "flow-gates-add-repo-field",
                         &input,
@@ -967,7 +1093,7 @@ impl GatesScreen {
                     )))
                     .child(action_button(
                         "flow-gates-add-repo".to_owned(),
-                        "Add repository",
+                        "Add",
                         false,
                         true,
                         Some("Append a folder to this window's repository list."),
@@ -990,363 +1116,693 @@ impl GatesScreen {
         row.into_any_element()
     }
 
-    // ---- the gates section ------------------------------------------------
-
-    fn render_gates(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let mut card = div()
-            .id("flow-gates-card")
-            .debug_selector(|| "flow-gates-card".into())
-            .flex()
-            .flex_col()
-            .gap(px(8.))
-            .rounded(px(8.))
-            .border_1()
-            .border_color(theme::hairline())
-            .bg(theme::panel())
-            .p(px(12.));
-
-        let Some(repo) = self.selected.clone() else {
-            return card
-                .child(section_head("Gates", String::new()))
-                .child(quiet_line("Add a repository to see its gates."))
-                .into_any_element();
-        };
-
-        let path = repo.join("flow.toml");
-        let state = match &self.load {
-            Load::Idle | Load::Loading => GateState::Loading,
-            Load::Missing { path } => GateState::Missing(path.clone()),
-            Load::Failed { path, message } => GateState::Failed(path.clone(), message.clone()),
-            Load::Ready => GateState::Ready,
-        };
-        let ready = matches!(state, GateState::Ready);
-        let meta = store::display_path(&path);
-        card = card.child(self.render_gates_head(meta, ready, cx));
-        card = match state {
-            GateState::Loading => card.child(quiet_line("Reading flow.toml…")),
-            GateState::Missing(path) => card.child(self.render_missing(&path, cx)),
-            GateState::Failed(path, message) => card.child(self.render_failed(&path, &message, cx)),
-            GateState::Ready => card.child(self.render_gate_list(window, cx)),
-        };
-        if let Some(note) = self
-            .save_note
-            .as_ref()
-            .map(|note| note_line("flow-gates-save-error", note))
-        {
-            card = card.child(note);
-        }
-        if let Some(report) = &self.save_report {
-            card = card.child(report_line("flow-gates-saved", report));
-        }
-        card.into_any_element()
-    }
-
-    fn render_gates_head(&self, meta: String, ready: bool, cx: &mut Context<Self>) -> AnyElement {
+    /// The gates list's head: the word, the count and the one link that grows
+    /// the document.
+    fn render_gates_head(&self, cx: &mut Context<Self>) -> AnyElement {
+        let ready = matches!(self.load, Load::Ready);
         let mut head = div()
+            .id("flow-gates-head")
+            .debug_selector(|| "flow-gates-head".into())
+            .flex_shrink_0()
             .flex()
-            .flex_wrap()
             .items_center()
             .gap(px(8.))
+            .h(px(theme::scaled(LIST_HEAD_HEIGHT)))
+            .px(px(14.))
+            .border_b_1()
+            .border_color(theme::hairline())
             .child(
                 div()
-                    .text_size(px(theme::font_row_meta()))
+                    .debug_selector(|| "flow-gates-title".into())
+                    .text_size(px(theme::font_meta()))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::text())
+                    .text_color(theme::text_dim())
                     .child("Gates"),
-            )
-            .child(
+            );
+        if ready && !self.gates.is_empty() {
+            head = head.child(
                 div()
                     .font_family(theme::code_font())
                     .text_size(px(theme::font_micro()))
                     .text_color(theme::text_muted())
-                    .child(meta),
-            )
-            .child(div().flex_1());
+                    .child(format!("{}", self.gates.len())),
+            );
+        }
+        head = head.child(div().flex_1());
         if ready {
-            let save_enabled = !self.gates.is_empty();
-            head = head
-                .child(action_button(
-                    "flow-gates-add-gate".to_owned(),
-                    "+ Add gate",
-                    false,
-                    true,
-                    Some("Append an empty row to the document; Save writes it."),
-                    cx.listener(|this, _, window, cx| this.add_gate(window, cx)),
-                ))
-                .child(action_button(
-                    "flow-gates-save".to_owned(),
-                    "Save",
-                    true,
-                    save_enabled,
-                    save_enabled.then_some(
-                        "A flow.toml needs at least one gate; write a command in this row.",
-                    ),
-                    cx.listener(|this, _, _, cx| this.save(cx)),
-                ));
+            head = head.child(action_link(
+                "flow-gates-add-gate",
+                "Add gate",
+                Some("Append a row with a fresh name; Save writes it."),
+                cx.listener(|this, _, window, cx| this.add_gate(window, cx)),
+            ));
         }
         head.into_any_element()
     }
 
-    fn render_missing(&self, path: &Path, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(8.))
-            .child(quiet_line(format!(
-                "There is no flow.toml at {}.",
-                store::display_path(path)
-            )))
-            .child(quiet_line(
-                "A repository starts with one test gate running cargo test; the file is \
-                 yours to edit once it exists.",
-            ))
-            .child(action_button(
-                "flow-gates-create".to_owned(),
-                "Create the default document",
-                true,
-                true,
-                Some("Write schema 1, merge local, and one `test` gate."),
-                cx.listener(|this, _, _, cx| this.create_default(cx)),
-            ))
-            .into_any_element()
-    }
-
-    fn render_failed(&self, path: &Path, message: &str, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(8.))
-            .child(
-                div()
-                    .debug_selector(|| "flow-gates-load-error".into())
-                    .font_family(theme::code_font())
-                    .text_size(px(theme::font_micro()))
-                    .text_color(theme::DANGER)
-                    .child(format!(
-                        "{} could not be read: {message}",
-                        store::display_path(path)
-                    )),
-            )
-            .child(quiet_line(
-                "Fix the file outside Warp Flow, then read it again.",
-            ))
-            .child(action_button(
-                "flow-gates-reload".to_owned(),
-                "Read again",
-                false,
-                true,
-                Some("Read the selected repository's flow.toml again."),
-                cx.listener(|this, _, _, cx| this.reload(cx)),
-            ))
-            .into_any_element()
-    }
-
-    fn render_gate_list(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        if self.gates.is_empty() {
-            return div()
-                .flex()
-                .flex_col()
-                .gap(px(8.))
-                .child(quiet_line("No gates yet. `+ Add gate` starts one."))
-                .into_any_element();
-        }
-        let handle = self.list_scroll.clone();
+    /// The gate rows, in document order: the work list's body.
+    fn render_gate_list(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut list = div()
             .id("flow-gates-list")
             .debug_selector(|| "flow-gates-list".into())
             .role(gpui::Role::List)
+            .track_focus(&self.focus)
             .flex()
             .flex_col()
-            .gap(px(8.))
-            .max_h(px(GATE_LIST_MAX_HEIGHT))
+            .flex_1()
+            .min_h_0()
             .overflow_y_scroll()
             .track_scroll(&self.list_scroll)
-            .on_scroll(move |event, window, cx| {
-                scroll::consume_wheel(&handle, event, window, cx);
+            .on_scroll({
+                let handle = self.list_scroll.clone();
+                move |event, window, cx| {
+                    scroll::consume_wheel(&handle, event, window, cx);
+                }
             })
-            .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key(event, window, cx);
             }));
+        if self.gates.is_empty() {
+            let mut empty = div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(6.))
+                .p(px(20.));
+            if matches!(self.load, Load::Ready) {
+                empty = empty
+                    .child(icon(
+                        "icons/icon-gate.svg",
+                        px(EMPTY_GLYPH),
+                        theme::text_muted(),
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(theme::font_heading()))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child("No gates"),
+                    )
+                    .child(
+                        div()
+                            .text_align(gpui::TextAlign::Center)
+                            .text_size(px(theme::font_meta()))
+                            .text_color(theme::text_muted())
+                            .child("A run passes this repository's gates before its merge step."),
+                    );
+            } else {
+                empty = empty.child(quiet_line(
+                    "The gates of the selected repository appear here once its flow.toml is read.",
+                ));
+            }
+            list = list.child(empty);
+        }
         for index in 0..self.gates.len() {
-            list = list.child(self.render_gate(index, window, cx));
+            list = list.child(self.render_gate_row(index, cx));
         }
         list.into_any_element()
     }
 
-    fn render_gate(
-        &mut self,
-        index: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let selector = format!("flow-gates-gate-{index}");
-        let select_selector = format!("flow-gates-select-{index}");
-        let cursor_selector = format!("flow-gates-selected-{index}");
-        let name_id = format!("flow-gates-name-{index}");
-        let command_id = format!("flow-gates-command-{index}");
-        let cwd_id = format!("flow-gates-cwd-{index}");
-        let timeout_id = format!("flow-gates-timeout-{index}");
-        let remove_id = format!("flow-gates-remove-{index}");
-        let run_id = format!("flow-gates-run-{index}");
-        let selected = self.cursor == Some(index);
-        let driving = self.driving();
-        let state = self.gates[index].run.clone();
+    fn render_gate_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let draft = &self.gates[index];
-
-        let mut header = div().flex().flex_wrap().items_center().gap(px(8.));
+        let selected = self.cursor == Some(index);
+        let outcome = draft.outcome();
+        let name = value(&draft.name, cx);
+        let name = if name.trim().is_empty() {
+            "A gate with no name".to_owned()
+        } else {
+            name
+        };
+        let command = value(&draft.command, cx);
+        let command = if command.trim().is_empty() {
+            "no command yet".to_owned()
+        } else {
+            command
+        };
+        let row_selector = format!("flow-gates-gate-{index}");
+        let select_selector = format!("flow-gates-select-{index}");
+        let mark_selector = format!("flow-gates-selected-{index}");
+        let mut row = div()
+            .id(SharedString::from(row_selector.clone()))
+            .debug_selector(move || row_selector.clone())
+            .a11y_option(
+                format!("Gate {:02}, {name}, {}", index + 1, outcome.word()),
+                selected,
+            )
+            .relative()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .h(px(theme::scaled(GATE_ROW_HEIGHT)))
+            .pl(px(13.))
+            .pr(px(12.))
+            .cursor_pointer()
+            .when(selected, |row| row.bg(theme::raised()))
+            .when(!selected, |row| row.hover(|style| style.bg(theme::panel())))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.cursor = Some(index);
+                this.confirm_remove = None;
+                window.focus(&this.focus, cx);
+                cx.notify();
+            }));
         if selected {
-            header = header.child(
+            row = row.child(
                 div()
-                    .debug_selector(move || cursor_selector.clone())
-                    .flex_shrink_0()
-                    .w(px(3.))
-                    .h(px(26.))
-                    .rounded(px(2.))
-                    .bg(theme::accent_ink()),
+                    .debug_selector(move || mark_selector.clone())
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(theme::ROW_MARK))
+                    .bg(theme::accent()),
             );
         }
-        header = header
+        row.child(
+            div()
+                .debug_selector(move || select_selector.clone())
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .min_w(px(24.))
+                .h(px(theme::CHIP_HEIGHT))
+                .px(px(5.))
+                .rounded(px(6.))
+                .bg(theme::well())
+                .font_family(theme::code_font())
+                .text_size(px(theme::font_micro()))
+                .text_color(if selected {
+                    theme::text()
+                } else {
+                    theme::text_muted()
+                })
+                .child(format!("{:02}", index + 1)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(theme::font_name()))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::text())
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .font_family(theme::code_font())
+                        .text_size(px(theme::font_mono_meta()))
+                        .text_color(theme::text_dim())
+                        .child(command),
+                ),
+        )
+        .child(icon(
+            outcome.glyph(),
+            px(theme::icon_small()),
+            outcome.hue(),
+        ))
+        .into_any_element()
+    }
+
+    // ---- rendering: the editor --------------------------------------------
+
+    fn render_editor(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let path = self.flow_path();
+        let index = self.selected_index();
+        let mut head = div()
+            .id("flow-gates-editor-head")
+            .debug_selector(|| "flow-gates-editor-head".into())
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .px(px(theme::scaled(shell::DETAIL_PADDING)))
+            .pt(px(16.))
+            .pb(px(12.))
+            .border_b_1()
+            .border_color(theme::hairline())
+            .child(self.render_editor_title(index, window, cx));
+        if let Some(path) = &path {
+            let mut sub = div()
+                .debug_selector(|| "flow-gates-path".into())
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(6.))
+                .text_size(px(theme::font_meta()))
+                .text_color(theme::text_muted())
+                .child(
+                    div()
+                        .font_family(theme::code_font())
+                        .child(store::display_path(path)),
+                );
+            if matches!(self.load, Load::Ready) {
+                sub = sub
+                    .child(div().text_color(theme::line_strong()).child("·"))
+                    .child("the engine reads it when the step starts");
+            }
+            head = head.child(sub);
+        }
+        let body = self.render_editor_body(index, window, cx);
+        div()
+            .id("flow-gates-card")
+            .debug_selector(|| "flow-gates-card".into())
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .min_h_0()
+            .bg(theme::panel())
+            .child(head)
             .child(
                 div()
-                    .id(SharedString::from(select_selector.clone()))
-                    .debug_selector(move || select_selector.clone())
-                    .a11y_button(format!("Select gate {}", index + 1))
+                    .id("flow-gates-editor-scroll")
+                    .debug_selector(|| "flow-gates-editor-scroll".into())
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px(px(theme::scaled(shell::DETAIL_PADDING)))
+                    .py(px(20.))
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .max_w(px(shell::READING_WIDTH))
+                            .flex()
+                            .flex_col()
+                            .gap(px(12.))
+                            .child(body),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The editor's title row: the gate's number and name, its last outcome,
+    /// and its three controls.
+    fn render_editor_title(
+        &self,
+        index: Option<usize>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let title: String = match (&self.load, index) {
+            (Load::Ready, Some(index)) => {
+                let name = value(&self.gates[index].name, cx);
+                if name.trim().is_empty() {
+                    "A gate with no name".to_owned()
+                } else {
+                    name
+                }
+            }
+            (Load::Ready, None) => "No gates".to_owned(),
+            (Load::Loading, _) => "Gates".to_owned(),
+            (Load::Missing { .. }, _) => "No flow.toml yet".to_owned(),
+            (Load::Failed { .. }, _) => "flow.toml could not be read".to_owned(),
+            (Load::Idle, _) => "No repository".to_owned(),
+        };
+        let mut row = div().flex().items_center().gap(px(10.));
+        if let (Load::Ready, Some(index)) = (&self.load, index) {
+            row = row.child(
+                div()
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(px(24.))
-                    .flex_shrink_0()
-                    .rounded(px(4.))
-                    .border_1()
-                    .border_color(if selected {
-                        theme::accent_ink()
-                    } else {
-                        theme::line_strong()
-                    })
-                    .bg(if selected {
-                        theme::tint(theme::accent_ink())
-                    } else {
-                        theme::well().into()
-                    })
+                    .min_w(px(24.))
+                    .h(px(theme::CHIP_HEIGHT))
+                    .px(px(5.))
+                    .rounded(px(6.))
+                    .bg(theme::well())
                     .font_family(theme::code_font())
                     .text_size(px(theme::font_micro()))
-                    .text_color(if selected {
-                        theme::accent_ink()
-                    } else {
-                        theme::text_muted()
-                    })
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.cursor = Some(index);
-                        window.focus(&this.focus, cx);
-                        cx.notify();
-                    }))
+                    .text_color(theme::text_muted())
                     .child(format!("{:02}", index + 1)),
-            )
-            .child(label_word("name"))
-            .child(
+            );
+        }
+        row = row.child(
+            div()
+                .debug_selector(|| "flow-gates-editor-title".into())
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(theme::font_screen_title()))
+                .font_weight(FontWeight::SEMIBOLD)
+                .line_height(relative(1.27))
+                .text_color(theme::text())
+                .child(title),
+        );
+        let ready = matches!(self.load, Load::Ready);
+        if let (true, Some(index)) = (ready, index) {
+            let draft = &self.gates[index];
+            let outcome = draft.outcome();
+            row = row.child(
                 div()
-                    .w(px(150.))
-                    .child(field::text(name_id, &draft.name, window, cx)),
-            )
-            .child(label_word("command"))
-            .child(div().flex_1().min_w(px(220.)).child(field::text(
-                command_id,
-                &draft.command,
-                window,
-                cx,
-            )))
-            .child(action_button(
-                remove_id,
-                "Remove",
-                false,
-                true,
-                Some("Remove this row; Save writes the document without it."),
-                cx.listener(move |this, _, _, cx| this.remove_gate(index, cx)),
-            ));
-
-        let (state_word, state_tail) = render_run_state(index, &state);
-        let mut detail = div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(px(8.))
-            .child(label_word("cwd"))
-            .child(
-                div()
-                    .w(px(210.))
-                    .child(field::text(cwd_id, &draft.cwd, window, cx)),
-            )
-            .child(label_word("timeout"))
-            .child(
-                div()
-                    .w(px(80.))
-                    .child(field::text(timeout_id, &draft.timeout, window, cx)),
-            )
-            .child(label_word("seconds"))
-            .child(div().flex_1())
-            .child(action_button(
-                run_id,
+                    .debug_selector(|| "flow-gates-editor-state".into())
+                    .child(state_pill(outcome)),
+            );
+            let driving = self.driving();
+            let running = matches!(draft.run, GateRun::Running);
+            let mut actions = div().flex_shrink_0().flex().items_center().gap(px(8.));
+            actions = actions.child(action_button(
+                format!("flow-gates-run-{index}"),
                 "Run once",
                 false,
-                !driving && !matches!(state, GateRun::Running),
+                !driving && !running,
                 if driving {
                     Some("Warp Flow is driving this run; run a gate once it stops at a boundary.")
-                } else if matches!(state, GateRun::Running) {
+                } else if running {
                     Some("This gate is already running.")
                 } else {
                     None
                 },
                 cx.listener(move |this, _, _, cx| this.run_gate(index, cx)),
             ));
-        if let Some(word) = state_word {
-            detail = detail.child(word);
+            let enabled = !self.gates.is_empty();
+            actions = actions.child(action_button(
+                "flow-gates-save".to_owned(),
+                "Save",
+                true,
+                enabled,
+                (!enabled).then_some("A flow.toml needs at least one gate; `Add gate` starts one."),
+                cx.listener(|this, _, _, cx| this.save(cx)),
+            ));
+            actions = actions.child(self.render_trash(index, cx));
+            row = row.child(actions);
         }
+        // A document with no rows still offers Save, parked until one exists:
+        // the editor never loses the one action that writes the file.
+        if ready && index.is_none() {
+            let enabled = !self.gates.is_empty();
+            row = row.child(action_button(
+                "flow-gates-save".to_owned(),
+                "Save",
+                true,
+                enabled,
+                (!enabled).then_some("A flow.toml needs at least one gate; `Add gate` starts one."),
+                cx.listener(|this, _, _, cx| this.save(cx)),
+            ));
+        }
+        row.into_any_element()
+    }
 
-        let mut card = div()
+    /// The trash: a ghost icon that arms in place, then removes the row from
+    /// the working copy. `Save` is the write.
+    fn render_trash(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let armed = self
+            .gates
+            .get(index)
+            .is_some_and(|draft| self.confirm_remove == Some(draft.id));
+        let selector = format!("flow-gates-remove-{index}");
+        let mut holder = div()
             .id(SharedString::from(selector.clone()))
             .debug_selector(move || selector.clone())
-            .role(gpui::Role::ListItem)
+            .flex_shrink_0()
             .flex()
-            .flex_col()
-            .gap(px(8.))
-            .rounded(px(8.))
-            .border_1()
-            .border_color(if selected {
-                theme::accent_ink()
-            } else {
-                theme::hairline()
-            })
-            .bg(theme::surface())
-            .p(px(10.))
-            .child(header)
-            .child(detail);
-        if let Some(tail) = state_tail {
-            card = card.child(tail);
+            .items_center();
+        if armed {
+            holder = holder.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "flow-gates-remove-{index}-armed"
+                    )))
+                    .a11y_button("Click again to remove this gate from the document")
+                    .flex()
+                    .items_center()
+                    .h(px(theme::scaled(shell::CONTROL_HEIGHT)))
+                    .px(px(10.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(theme::DANGER)
+                    .bg(theme::danger_bg())
+                    .cursor_pointer()
+                    .text_size(px(theme::font_meta()))
+                    .text_color(theme::DANGER)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.trash(index, cx);
+                    }))
+                    .child("Click again to remove"),
+            );
+        } else {
+            holder = holder.child(
+                controls::icon_button(
+                    format!("flow-gates-remove-{index}-button"),
+                    "Remove this gate",
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.trash(index, cx);
+                }))
+                .child(icon(
+                    "icons/icon-trash.svg",
+                    px(theme::icon_medium()),
+                    theme::text_muted(),
+                )),
+            );
         }
-        card.into_any_element()
+        holder.into_any_element()
+    }
+
+    /// The editor's body: the fields of the selected gate, or the one state
+    /// that stands in for them.
+    fn render_editor_body(
+        &self,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match &self.load {
+            Load::Idle => quiet_line(
+                "Add a repository in the list beside this pane; each one's gates live in its \
+                 flow.toml.",
+            ),
+            Load::Loading => div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(motion::spinner(
+                    "flow-gates-loading",
+                    "icons/icon-spinner.svg",
+                    px(theme::icon_tiny()),
+                    theme::text_muted(),
+                ))
+                .child(quiet_line("Reading flow.toml…"))
+                .into_any_element(),
+            Load::Missing { path } => div()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .child(quiet_line(format!(
+                    "There is no flow.toml at {}.",
+                    store::display_path(path)
+                )))
+                .child(quiet_line(
+                    "A repository starts with one test gate running cargo test; the file is \
+                     yours to edit once it exists.",
+                ))
+                .child(action_button(
+                    "flow-gates-create".to_owned(),
+                    "Create the default document",
+                    true,
+                    true,
+                    Some("Write schema 1, merge local, and one `test` gate."),
+                    cx.listener(|this, _, _, cx| this.create_default(cx)),
+                ))
+                .into_any_element(),
+            Load::Failed { path, message } => div()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .debug_selector(|| "flow-gates-load-error".into())
+                        .font_family(theme::code_font())
+                        .text_size(px(theme::font_mono_meta()))
+                        .text_color(theme::DANGER)
+                        .child(format!(
+                            "{} could not be read: {message}",
+                            store::display_path(path)
+                        )),
+                )
+                .child(quiet_line(
+                    "Fix the file outside Warp Flow, then read it again.",
+                ))
+                .child(action_button(
+                    "flow-gates-reload".to_owned(),
+                    "Read again",
+                    false,
+                    true,
+                    Some("Read the selected repository's flow.toml again."),
+                    cx.listener(|this, _, _, cx| this.reload(cx)),
+                ))
+                .into_any_element(),
+            Load::Ready => self.render_ready(index, window, cx),
+        }
+    }
+
+    /// The document read: the selected gate's four fields, its last run, and
+    /// the sentences that explain what a save does.
+    fn render_ready(
+        &self,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut body = div().flex().flex_col().gap(px(12.));
+        if index.is_none() {
+            body = body.child(quiet_line(
+                "Add a gate to give this repository a check the engine can run.",
+            ));
+        }
+        if let Some(index) = index {
+            let draft = &self.gates[index];
+            body = body
+                .child(self.field_row(index, "Name", "name", &draft.name, false, window, cx))
+                .child(self.field_row(
+                    index,
+                    "Command",
+                    "command",
+                    &draft.command,
+                    true,
+                    window,
+                    cx,
+                ))
+                .child(self.field_row(index, "Folder", "cwd", &draft.cwd, true, window, cx))
+                .child(self.field_row(
+                    index,
+                    "Timeout, seconds",
+                    "timeout",
+                    &draft.timeout,
+                    true,
+                    window,
+                    cx,
+                ));
+            let (word, tail) = render_run_state(index, &draft.run);
+            if let Some(word) = word {
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(word),
+                );
+            }
+            if let Some(tail) = tail {
+                body = body.child(tail);
+            }
+        }
+        body = body.child(
+            div()
+                .text_size(px(theme::font_meta()))
+                .text_color(theme::text_muted())
+                .child(
+                    "A gate that runs past its timeout fails the step; it never passes by \
+                     silence.",
+                ),
+        );
+        if let Some(note) = self
+            .save_note
+            .as_ref()
+            .map(|note| note_line("flow-gates-save-error", note))
+        {
+            body = body.child(note);
+        }
+        if let Some(report) = &self.save_report {
+            body = body.child(report_line("flow-gates-saved", report));
+        }
+        body.into_any_element()
+    }
+
+    /// One editable field: the label at 112, the 36-high box beside it.
+    ///
+    /// `field` carries everything that names the row — its index, the label,
+    /// the selector stem and the box — so the helper stays one call shape for
+    /// four fields and the clippy argument-count lint has nothing to say.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a field row is the index, its label, its selector stem, its box, \
+                  whether the hairline above it is drawn, and the frame's two handles"
+    )]
+    fn field_row(
+        &self,
+        index: usize,
+        label: &str,
+        key: &str,
+        input: &Entity<InputState>,
+        ruled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selector = format!("flow-gates-{key}-{index}");
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .min_h(px(theme::scaled(FIELD_ROW_HEIGHT)))
+            .py(px(6.));
+        if ruled {
+            row = row.border_t_1().border_color(theme::border_light());
+        }
+        row.child(
+            div()
+                .flex_shrink_0()
+                .w(px(theme::scaled(LABEL_WIDTH)))
+                .text_size(px(theme::font_meta()))
+                .text_color(theme::text_dim())
+                .child(label.to_owned()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(field::mono(selector, input, window, cx)),
+        )
+        .into_any_element()
     }
 }
 
 impl Render for GatesScreen {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_selection(cx);
         self.materialize_rows(window, cx);
+        let list = self.render_work_list(window, cx);
+        let editor = self.render_editor(window, cx);
+        // Any click that is not the trash disarms it: the trash stops its own
+        // click before it reaches here.
         div()
             .id("flow-gates")
             .debug_selector(|| "flow-gates".into())
             .flex()
-            .flex_col()
+            .flex_row()
             .flex_1()
             .min_w_0()
             .h_full()
+            .min_h_0()
             .bg(theme::surface())
-            .child(self.render_head())
-            .child(self.render_body(window, cx))
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.confirm_remove.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            .child(list)
+            .child(editor)
     }
 }
 
 // ---- probes ---------------------------------------------------------------
+
 impl GatesScreen {
     /// The repository whose gates the screen shows.
     pub fn selected_for_probe(&self) -> Option<&Path> {
@@ -1403,13 +1859,21 @@ impl GatesScreen {
 
 // ---- small helpers --------------------------------------------------------
 
-/// The state the gates card draws, copied off [`Load`] so the borrow of the
-/// screen's field ends before the frame borrows it again.
-enum GateState {
-    Loading,
-    Missing(PathBuf),
-    Failed(PathBuf, String),
-    Ready,
+/// Read one repository's `flow.toml` gates, for a surface that shows the same
+/// rows without owning this screen (the run's Task & diff tab).
+///
+/// The read is the engine's own reader, so a runner and this screen can never
+/// disagree about which gates a repository has.
+#[doc(hidden)]
+pub fn read_gates(repo: &Path) -> std::result::Result<Vec<Gate>, String> {
+    let path = repo.join("flow.toml");
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("could not read {}: {error}", path.display())),
+        Ok(_) => FlowConfig::read(&path)
+            .map(|config| config.gates_in_order().to_vec())
+            .map_err(|error| error.to_string()),
+    }
 }
 
 /// Read one repository's `flow.toml`, on the background executor.
@@ -1516,6 +1980,39 @@ fn report_color(report: &GateReport) -> gpui::Rgba {
     }
 }
 
+/// The gate's last outcome as a pill: a glyph and a word, in the hue the
+/// outcome means.
+fn state_pill(outcome: Outcome) -> AnyElement {
+    let hue = outcome.hue();
+    let mut pill = div()
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .h(px(theme::CHIP_HEIGHT))
+        .px(px(8.))
+        .rounded(px(999.))
+        .text_size(px(theme::font_meta()))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(hue);
+    pill = match outcome {
+        Outcome::NotRun => pill.bg(theme::raised()),
+        _ => pill.bg(theme::tint(hue)),
+    };
+    let glyph = if outcome == Outcome::Running {
+        motion::spinner(
+            "flow-gates-editor-spinner",
+            "icons/icon-spinner.svg",
+            px(theme::icon_tiny()),
+            hue,
+        )
+    } else {
+        icon(outcome.glyph(), px(theme::icon_tiny()), hue).into_any_element()
+    };
+    pill.child(glyph)
+        .child(outcome.word().to_owned())
+        .into_any_element()
+}
+
 /// One row's `Running…` word, its report word, and the output tail under it.
 fn render_run_state(index: usize, state: &GateRun) -> (Option<AnyElement>, Option<AnyElement>) {
     match state {
@@ -1526,7 +2023,7 @@ fn render_run_state(index: usize, state: &GateRun) -> (Option<AnyElement>, Optio
                 div()
                     .debug_selector(move || format!("flow-gates-report-{index}"))
                     .font_family(theme::code_font())
-                    .text_size(px(theme::font_micro()))
+                    .text_size(px(theme::font_mono_meta()))
                     .text_color(theme::DANGER)
                     .child(message.clone())
                     .into_any_element(),
@@ -1537,7 +2034,7 @@ fn render_run_state(index: usize, state: &GateRun) -> (Option<AnyElement>, Optio
             let word = div()
                 .debug_selector(move || format!("flow-gates-report-{index}"))
                 .font_family(theme::code_font())
-                .text_size(px(theme::font_micro()))
+                .text_size(px(theme::font_mono_meta()))
                 .text_color(report_color(report))
                 .child(report_word(report))
                 .into_any_element();
@@ -1558,12 +2055,12 @@ fn running_line(index: usize) -> AnyElement {
             format!("flow-gates-spinner-{index}"),
             "icons/icon-spinner.svg",
             px(theme::icon_tiny()),
-            theme::accent_ink(),
+            theme::BEHIND,
         ))
         .child(
             div()
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::accent_ink())
+                .text_size(px(theme::font_meta()))
+                .text_color(theme::BEHIND)
                 .child("Running…"),
         )
         .into_any_element()
@@ -1579,7 +2076,7 @@ fn tail_block(index: usize, tail: &str) -> Option<AnyElement> {
         lines = lines.child(
             div()
                 .font_family(theme::code_font())
-                .text_size(px(theme::font_micro()))
+                .text_size(px(theme::font_mono_meta()))
                 .text_color(theme::text_dim())
                 .child(line.to_owned()),
         );
@@ -1593,40 +2090,12 @@ fn tail_block(index: usize, tail: &str) -> Option<AnyElement> {
             .max_h(px(TAIL_MAX_HEIGHT))
             .overflow_y_scroll()
             .rounded(px(6.))
-            .border_1()
-            .border_color(theme::hairline())
             .bg(theme::well())
-            .px(px(8.))
-            .py(px(6.))
+            .px(px(10.))
+            .py(px(8.))
             .child(lines)
             .into_any_element(),
     )
-}
-
-/// A section's title row: the word left, the meta in the code face right.
-fn section_head(title: &str, meta: String) -> AnyElement {
-    let mut row = div()
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .child(
-            div()
-                .text_size(px(theme::font_row_meta()))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme::text())
-                .child(title.to_owned()),
-        )
-        .child(div().flex_1());
-    if !meta.is_empty() {
-        row = row.child(
-            div()
-                .font_family(theme::code_font())
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_muted())
-                .child(meta),
-        );
-    }
-    row.into_any_element()
 }
 
 /// One quiet sentence in the doc's voice.
@@ -1638,23 +2107,12 @@ fn quiet_line(message: impl Into<String>) -> AnyElement {
         .into_any_element()
 }
 
-/// A small field label, in the code face.
-fn label_word(text: &str) -> AnyElement {
-    div()
-        .flex_shrink_0()
-        .font_family(theme::code_font())
-        .text_size(px(theme::font_micro()))
-        .text_color(theme::text_muted())
-        .child(text.to_owned())
-        .into_any_element()
-}
-
 /// One message under a field row, with the selector a probe reads it by.
 fn note_line(selector: &'static str, note: &Note) -> AnyElement {
     div()
         .debug_selector(move || selector.to_owned())
         .font_family(theme::code_font())
-        .text_size(px(theme::font_micro()))
+        .text_size(px(theme::font_mono_meta()))
         .text_color(if note.failed {
             theme::DANGER
         } else {
@@ -1669,7 +2127,7 @@ fn report_line(selector: &'static str, text: &str) -> AnyElement {
     div()
         .debug_selector(move || selector.to_owned())
         .font_family(theme::code_font())
-        .text_size(px(theme::font_micro()))
+        .text_size(px(theme::font_mono_meta()))
         .text_color(theme::ADD)
         .child(text.to_owned())
         .into_any_element()
@@ -1678,10 +2136,37 @@ fn report_line(selector: &'static str, text: &str) -> AnyElement {
 /// How many repositories the window shows, in words.
 fn repository_word(count: usize) -> String {
     match count {
-        0 => "no repositories".to_owned(),
-        1 => "1 repository".to_owned(),
-        other => format!("{other} repositories"),
+        0 => "none".to_owned(),
+        1 => "1".to_owned(),
+        other => format!("{other}"),
     }
+}
+
+/// A quiet text action: a link-shaped control at the meta step.
+fn action_link(
+    id: &'static str,
+    label: &'static str,
+    hint: Option<&'static str>,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    let mut link = div()
+        .id(SharedString::from(id))
+        .debug_selector(move || id.to_owned())
+        .a11y_button(label)
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .h(px(theme::scaled(shell::CONTROL_HEIGHT)))
+        .px(px(6.))
+        .rounded(px(6.))
+        .text_size(px(theme::font_meta()))
+        .text_color(theme::accent_ink())
+        .hover(|style| style.text_color(theme::text()))
+        .on_click(on_click);
+    if let Some(hint) = hint {
+        link = link.tooltip(tooltip_text(hint));
+    }
+    link.child(label).into_any_element()
 }
 
 /// One kit button under its own debug selector, with the reason a disabled
@@ -1720,7 +2205,7 @@ fn action_button(
         .into_any_element()
 }
 
-/// One `InputState` seeded with `value`, drawn by `field::text` later.
+/// One `InputState` seeded with `value`, drawn by `field::mono` later.
 fn input(
     value: impl Into<SharedString>,
     window: &mut Window,

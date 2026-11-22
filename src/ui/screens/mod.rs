@@ -33,7 +33,7 @@ pub mod workflow;
 pub use artifacts::ArtifactsScreen;
 pub use diff::DiffScreen;
 pub use gates::GatesScreen;
-pub use settings::SettingsScreen;
+pub use settings::{SettingsGroup, SettingsScreen};
 pub use workflow::WorkflowScreen;
 
 /// One screen a run opens into. The board is what you get with no run open, so
@@ -108,6 +108,11 @@ pub struct ScreenRun {
     pub repo: PathBuf,
     /// Whether this window's engine is driving the run.
     pub driving: bool,
+    /// Whether the screen may only read. The run's own Workflow tab is a
+    /// reading of the revision the run uses; the template is edited in
+    /// Repos › Workflow, so a running run never reads a file that changes
+    /// under it.
+    pub read_only: bool,
 }
 
 impl ScreenRun {
@@ -120,6 +125,17 @@ impl ScreenRun {
     pub fn title(&self) -> &str {
         &self.run.title
     }
+}
+
+/// The repository the Repos section's tabs edit. It carries no run on purpose:
+/// gates and the workflow template belong to the repository, so a repository
+/// with no runs still has both in reach.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScreenRepo {
+    /// The repository root.
+    pub repo: PathBuf,
+    /// Whether this window's engine is driving a run of it right now.
+    pub driving: bool,
 }
 
 /// The five screen entities, held by the window and told which run they show.
@@ -153,10 +169,43 @@ impl Screens {
         }
     }
 
+    /// Hand the settings screen its group: the section's list selects one, and
+    /// the detail shows it.
+    pub fn show_settings(&mut self, group: SettingsGroup, cx: &mut App) {
+        self.settings
+            .update(cx, |view, cx| view.show_group(group, cx));
+    }
+
     /// The gates screen, for a probe that drives the repository list.
     #[doc(hidden)]
     pub fn gates_for_probe(&self) -> Entity<GatesScreen> {
         self.gates.clone()
+    }
+
+    /// The artifacts screen, for a probe that reads the run's documents.
+    #[doc(hidden)]
+    pub fn artifacts_for_probe(&self) -> Entity<ArtifactsScreen> {
+        self.artifacts.clone()
+    }
+
+    /// Point `screen` — one of the repository's two editors — at `repo`.
+    ///
+    /// The repository detail is a window a person edits, so it never needs a
+    /// run: a repository with no runs, or one whose runs are all landed, still
+    /// has gates to edit and a template to revise.
+    pub fn show_repo(&mut self, screen: Screen, repo: ScreenRepo, cx: &mut App) {
+        match screen {
+            Screen::Gates => {
+                self.gates.update(cx, |view, cx| {
+                    view.show_repository(repo.repo, repo.driving, cx)
+                });
+            }
+            Screen::Workflow => {
+                self.workflow
+                    .update(cx, |view, cx| view.show_repository(repo.repo, cx));
+            }
+            _ => {}
+        }
     }
 
     /// Point `screen` at `run`. Only the screen being shown is refreshed; the

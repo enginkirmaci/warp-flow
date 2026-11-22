@@ -1,6 +1,12 @@
-//! The window: a repository rail, the six-column kanban board and the run
-//! detail pane. The board owns its keyboard cursor; there is no window-level
+//! The window: the family's one shell for this app — a 76 rail of sections, the
+//! repository list, and the detail, which holds the 320 run column beside the
+//! open run. The run column owns its keyboard cursor; there is no window-level
 //! arrow handler.
+//!
+//! Each surface lives in its own module and renders through `impl FlowApp`:
+//! [`crate::ui::chrome`] (title bar and rail), [`crate::ui::repos`] (the list),
+//! [`crate::ui::runs`] (the run column) and [`crate::ui::detail`] (the run's head,
+//! tabs, strip and tab bodies). The run tab's own content is [`crate::ui::run`].
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -10,25 +16,188 @@ use std::cell::RefCell;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Bounds, Context, Entity, FocusHandle, FontWeight, KeyDownEvent, MouseButton,
-    ScrollHandle, SharedString, Window, div, point, px, relative,
+    AnyElement, Bounds, Context, Entity, FocusHandle, FontWeight, ScrollHandle, SharedString,
+    Window, div, px,
 };
 use gpui_kit::component::input::InputState;
-use warpui_kit_core::list_nav::{self, ListKey};
-use warpui_kit_core::{A11y, icon, motion, shell, tooltip::tooltip_text};
+use warpui_kit_core::list_nav::ListKey;
+use warpui_kit_core::shell;
 use warpui_kit_markdown::LiveEditorState;
 
 use crate::app::Launch;
 use crate::door::SharedBoard;
 use crate::host::{self, Host, HostSnapshot};
-use crate::store::{
-    self, Column, MAX_LOG_ROWS, Question, Run, RunKey, RunRow, Snapshot, recent_rows,
-};
+use crate::store::{self, Column, RunFilter, RunKey, Snapshot};
 use crate::theme;
-use crate::ui::screens::{Screen, ScreenRun, Screens};
+use crate::ui::screens::settings::SettingsGroup;
+use crate::ui::screens::{Screen, ScreenRepo, ScreenRun, Screens};
 
-/// The board's page step: a page key moves five cards.
-const PAGE: usize = 5;
+/// The run column's page step: a page key moves five rows.
+pub(crate) const PAGE: usize = 5;
+
+/// The rail's sections. Settings and About are pinned to its bottom, the two
+/// work sections at its top.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Section {
+    /// The repositories on the left, the 320 run column and the open run on the
+    /// right: the window a person watches.
+    Runs,
+    /// The repositories on the left, the selected repository's gates and
+    /// workflow on the right: the window a person edits.
+    Repos,
+    /// The installed family, this app's build and the license. About sits above
+    /// Settings at the rail's foot, the same place every app carries it.
+    About,
+    /// This app's own settings.
+    Settings,
+}
+
+impl Section {
+    /// The work sections, in rail order. About and Settings are pinned to the
+    /// foot and are rendered from their own pair of items.
+    pub const WORK: [Self; 2] = [Self::Runs, Self::Repos];
+
+    /// A stable key for debug selectors and state.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Runs => "runs",
+            Self::Repos => "repos",
+            Self::About => "about",
+            Self::Settings => "settings",
+        }
+    }
+
+    /// The rail item's label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Runs => "Runs",
+            Self::Repos => "Repos",
+            Self::About => "About",
+            Self::Settings => "Settings",
+        }
+    }
+
+    /// The rail item's icon.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Runs => "icons/icon-flow.svg",
+            Self::Repos => "icons/icon-repos.svg",
+            Self::About => "icons/icon-info.svg",
+            Self::Settings => "icons/icon-cog.svg",
+        }
+    }
+
+    /// The screen this section shows when it has not been told otherwise.
+    pub fn screen(self) -> Option<Screen> {
+        match self {
+            Self::Runs => None,
+            Self::Repos => Some(Screen::Gates),
+            Self::About => None,
+            Self::Settings => Some(Screen::Settings),
+        }
+    }
+
+    /// Whether this section is one of the two pinned to the rail's foot.
+    pub fn is_foot(self) -> bool {
+        matches!(self, Self::About | Self::Settings)
+    }
+}
+
+/// The open run's four tabs. The design's run pane: what the engine is doing,
+/// the files it wrote, the folder itself, and the workflow revision it reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunTab {
+    /// The steps, the tasks, the question and the attempts.
+    Run,
+    /// The task's files and their diffs, with the gates beside them.
+    TaskDiff,
+    /// The issue folder's documents.
+    Artifacts,
+    /// The revision the run reads, read-only.
+    Workflow,
+}
+
+impl RunTab {
+    /// Every tab, in the strip's order.
+    pub const ALL: [Self; 4] = [Self::Run, Self::TaskDiff, Self::Artifacts, Self::Workflow];
+
+    /// A stable key for debug selectors and state.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::TaskDiff => "diff",
+            Self::Artifacts => "artifacts",
+            Self::Workflow => "workflow",
+        }
+    }
+
+    /// The tab's word.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Run => "Run",
+            Self::TaskDiff => "Task & diff",
+            Self::Artifacts => "Artifacts",
+            Self::Workflow => "Workflow",
+        }
+    }
+
+    /// The screen this tab renders.
+    pub fn screen(self) -> Screen {
+        match self {
+            Self::Run => Screen::Run,
+            Self::TaskDiff => Screen::Diff,
+            Self::Artifacts => Screen::Artifacts,
+            Self::Workflow => Screen::Workflow,
+        }
+    }
+
+    /// The tab for `screen`, when `screen` is one of the run's four.
+    pub fn from_screen(screen: Screen) -> Option<Self> {
+        Self::ALL.into_iter().find(|tab| tab.screen() == screen)
+    }
+}
+
+/// The repository detail's two tabs: the gates the runs must pass, and the
+/// workflow template they read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepoTab {
+    Gates,
+    Workflow,
+}
+
+impl RepoTab {
+    /// Every tab, in the strip's order.
+    pub const ALL: [Self; 2] = [Self::Gates, Self::Workflow];
+
+    /// A stable key for debug selectors and state.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Gates => "gates",
+            Self::Workflow => "workflow",
+        }
+    }
+
+    /// The tab's word.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Gates => "Gates",
+            Self::Workflow => "Workflow",
+        }
+    }
+
+    /// The screen this tab renders.
+    pub fn screen(self) -> Screen {
+        match self {
+            Self::Gates => Screen::Gates,
+            Self::Workflow => Screen::Workflow,
+        }
+    }
+
+    /// The tab for `screen`, when `screen` is one of the repository's two.
+    pub fn from_screen(screen: Screen) -> Option<Self> {
+        Self::ALL.into_iter().find(|tab| tab.screen() == screen)
+    }
+}
 
 /// One view of one document: the source it was built from, so a scan that
 /// changed it replaces the read-only editor instead of showing stale markdown.
@@ -44,9 +213,9 @@ pub(crate) struct DocSlot {
 type CardBounds = Rc<RefCell<Vec<(RunKey, Bounds<gpui::Pixels>)>>>;
 
 pub struct FlowApp {
-    settings: store::Settings,
+    pub(crate) settings: store::Settings,
     pub(crate) snapshot: Snapshot,
-    scanning: bool,
+    pub(crate) scanning: bool,
     /// Which run of the scan loop is current, so a restart retires the old one.
     scan_generation: u64,
     /// The engine host: one blocking run per repository, in memory.
@@ -56,28 +225,46 @@ pub struct FlowApp {
     pub(crate) board: SharedBoard,
     /// The host's in-memory snapshot, adopted only when it changes.
     pub(crate) host_snapshot: HostSnapshot,
+    /// The rail section the window shows.
+    pub(crate) section: Section,
+    /// Which runs the run column lists.
+    pub(crate) filter: RunFilter,
+    /// Whether the run column's filter menu is open.
+    pub(crate) filter_open: bool,
+    /// Whether the list pane is folded away (`Ctrl+\`, or the title bar's
+    /// toggle). The detail takes the width it leaves.
+    pub(crate) list_hidden: bool,
+    /// The list pane's width: the design's 432 until the owner drags it, and
+    /// always through `shell::clamp_list_width`.
+    pub(crate) list_width: f32,
+    /// The settings group the section's list selected.
+    pub(crate) settings_group: SettingsGroup,
     /// `None` is the "All repos" row.
-    selected_repo: Option<PathBuf>,
+    pub(crate) selected_repo: Option<PathBuf>,
     /// The run whose detail pane is open.
     pub(crate) selected_run: Option<RunKey>,
     /// The board's keyboard cursor; distinct from the open run.
     pub(crate) cursor: Option<RunKey>,
     pub(crate) board_focus: FocusHandle,
-    board_scroll: ScrollHandle,
+    pub(crate) board_scroll: ScrollHandle,
     /// How many more frames must pass before the board reveals the cursor's
     /// card: a frame is needed for the layout a change caused to be measured.
-    reveal_frames: u8,
+    pub(crate) reveal_frames: u8,
     /// Where the last frame painted each card, in window coordinates. The cards
     /// are nested inside their columns, so the scroll handle cannot reach them
     /// by index; this is what [`FlowApp::reveal_cursor`] measures against.
-    card_bounds: CardBounds,
-    rail_scroll: ScrollHandle,
-    detail_scroll: ScrollHandle,
-    detail_spec: Option<DocSlot>,
-    detail_tasks: Option<DocSlot>,
-    /// The screen the window shows for `selected_run`; `None` is the board.
-    /// The selected run stays selected so Back returns to it.
+    pub(crate) card_bounds: CardBounds,
+    pub(crate) rail_scroll: ScrollHandle,
+    /// The screen the detail shows. `None` in the Runs section means no run is
+    /// open, so the run column has the whole pane; `None` in Repos and About
+    /// means the section's own first surface.
     pub(crate) screen: Option<Screen>,
+    /// Whether the window is maximized, read in `render` so the zoom button's
+    /// glyph follows the compositor.
+    pub(crate) maximized: bool,
+    /// Set by a press on the title bar and cleared by the first motion: the
+    /// press that starts a window drag must never look like a click.
+    pub(crate) titlebar_should_move: bool,
     /// The five screens that are their own entities (S5).
     pub(crate) screens: Screens,
     /// The run screen's scrolling content.
@@ -145,13 +332,17 @@ impl FlowApp {
         }
         let board_focus = cx.focus_handle();
         let run_focus = cx.focus_handle();
-        let answer_field = cx.new(|cx| InputState::new(window, cx).placeholder("Type your answer"));
+        let answer_field =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Or write the answer yourself"));
         // The answer field is FlowApp state: a keystroke must repaint the
         // Submit button that reads whether the field is empty.
         cx.observe(&answer_field, |_, _, cx| cx.notify()).detach();
         window.focus(&board_focus, cx);
         let window_handle = cx.entity().downgrade();
         let screens = Screens::new(Arc::clone(&host), settings.clone(), Some(window_handle), cx);
+        let list_width = settings
+            .list_width
+            .map_or_else(|| theme::scaled(theme::LIST_WIDTH), shell::clamp_list_width);
         let mut app = Self {
             settings,
             snapshot: Snapshot::default(),
@@ -160,6 +351,12 @@ impl FlowApp {
             host,
             board,
             host_snapshot: HostSnapshot::default(),
+            section: Section::Runs,
+            filter: RunFilter::default(),
+            filter_open: false,
+            list_hidden: false,
+            list_width,
+            settings_group: SettingsGroup::default(),
             selected_repo: None,
             selected_run: None,
             cursor: None,
@@ -168,10 +365,9 @@ impl FlowApp {
             reveal_frames: 0,
             card_bounds: Rc::new(RefCell::new(Vec::new())),
             rail_scroll: ScrollHandle::new(),
-            detail_scroll: ScrollHandle::new(),
-            detail_spec: None,
-            detail_tasks: None,
             screen: None,
+            maximized: false,
+            titlebar_should_move: false,
             screens,
             run_focus,
             run_scroll: ScrollHandle::new(),
@@ -273,7 +469,7 @@ impl FlowApp {
 
     /// Adopt a finished scan. The snapshot is the only data compared: an
     /// unchanged poll keeps the frame, a changed one notifies.
-    fn adopt_snapshot(&mut self, next: Snapshot, cx: &mut Context<Self>) {
+    pub(crate) fn adopt_snapshot(&mut self, next: Snapshot, cx: &mut Context<Self>) {
         let changed = self.snapshot != next;
         let was_scanning = std::mem::replace(&mut self.scanning, false);
         if !changed {
@@ -340,6 +536,110 @@ impl FlowApp {
         cx.notify();
     }
 
+    /// Open one of the rail's sections. The section decides what the detail can
+    /// show: Runs keeps whatever run tab was open, Repos opens on the tab it was
+    /// last left on, About and Settings show their one page.
+    pub(crate) fn open_section(
+        &mut self,
+        section: Section,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.section == section {
+            window.focus(&self.board_focus, cx);
+            return;
+        }
+        self.section = section;
+        let screen = match section {
+            Section::Runs => self
+                .screen
+                .and_then(RunTab::from_screen)
+                .or_else(|| self.selected_run.is_some().then_some(RunTab::Run))
+                .map(RunTab::screen),
+            Section::Repos => Some(self.repo_tab().map_or(Screen::Gates, RepoTab::screen)),
+            Section::About => None,
+            Section::Settings => Some(Screen::Settings),
+        };
+        self.open_screen(screen, window, cx);
+    }
+
+    /// The run's open tab, when the Runs section is showing one.
+    pub(crate) fn run_tab(&self) -> Option<RunTab> {
+        self.screen.and_then(RunTab::from_screen)
+    }
+
+    /// The repository detail's open tab.
+    pub(crate) fn repo_tab(&self) -> Option<RepoTab> {
+        self.screen.and_then(RepoTab::from_screen)
+    }
+
+    /// Open one of the run's four tabs, opening the run itself when none is.
+    pub(crate) fn open_run_tab(
+        &mut self,
+        tab: RunTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.section != Section::Runs {
+            self.section = Section::Runs;
+        }
+        self.open_screen(Some(tab.screen()), window, cx);
+    }
+
+    /// Open one of the repository detail's two tabs.
+    pub(crate) fn open_repo_tab(
+        &mut self,
+        tab: RepoTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.section = Section::Repos;
+        self.open_screen(Some(tab.screen()), window, cx);
+    }
+
+    /// Fold the list pane away, or bring it back: the title bar's toggle and
+    /// `Ctrl+\`.
+    pub(crate) fn toggle_list(&mut self, cx: &mut Context<Self>) {
+        self.list_hidden = !self.list_hidden;
+        cx.notify();
+    }
+
+    /// Star or unstar a repository. The Favorites band follows on the next
+    /// frame, and the choice survives a restart.
+    pub(crate) fn toggle_favorite(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.settings.toggle_favorite(&path);
+        self.settings.save();
+        cx.notify();
+    }
+
+    /// Set the run column's filter. The design's "Clear filters" is this with
+    /// [`RunFilter::All`].
+    pub(crate) fn set_filter(&mut self, filter: RunFilter, cx: &mut Context<Self>) {
+        if self.filter == filter {
+            return;
+        }
+        self.filter = filter;
+        self.reconcile_selection(cx);
+        cx.notify();
+    }
+
+    /// Scan now instead of at the next tick: the run column's Refresh and the
+    /// repository detail both offer it. The loop keeps running; this only takes
+    /// one reading early.
+    pub(crate) fn refresh_now(&mut self, cx: &mut Context<Self>) {
+        let repos = self.settings.repos.clone();
+        self.scanning = true;
+        cx.spawn(async move |this, cx| {
+            let next = cx
+                .background_executor()
+                .spawn(async move { store::scan(&repos) })
+                .await;
+            let _ = this.update(cx, |this, cx| this.adopt_snapshot(next, cx));
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// Hand the open screen the current reading of its run. Only the screen on
     /// display is refreshed: a screen that is not showing catches up when it is
     /// opened, so a poll never builds five views' worth of state.
@@ -350,10 +650,28 @@ impl FlowApp {
         if screen == Screen::Run {
             return;
         }
+        // The repository detail's two tabs belong to the repository, so they are
+        // told which repository is in focus and nothing else. The run's own tabs
+        // are told which run they read.
+        if self.section == Section::Repos {
+            let Some(repo) = self.repo_in_focus() else {
+                return;
+            };
+            // a manual gate run is refused while any run of this repository
+            // is being driven
+            let driving = self
+                .host_snapshot
+                .active_for(&repo)
+                .is_some_and(|host_run| host_run.phase.is_driving());
+            self.screens
+                .show_repo(screen, ScreenRepo { repo, driving }, cx);
+            return;
+        }
         let Some(run) = self
             .selected_run
             .as_ref()
             .and_then(|key| self.snapshot.find(key))
+            .cloned()
         else {
             return;
         };
@@ -365,6 +683,7 @@ impl FlowApp {
             run: Arc::new(run.clone()),
             repo: run.key.repo.clone(),
             driving,
+            read_only: true,
         };
         self.screens.show(screen, payload, cx);
     }
@@ -408,14 +727,14 @@ impl FlowApp {
     }
 
     /// The keys of every run in board order: column by column, then card.
-    fn visible_keys(&self) -> Vec<RunKey> {
+    pub(crate) fn visible_keys(&self) -> Vec<RunKey> {
         Column::ALL
             .iter()
             .flat_map(|column| self.column_keys(*column))
             .collect()
     }
 
-    fn column_keys(&self, column: Column) -> Vec<RunKey> {
+    pub(crate) fn column_keys(&self, column: Column) -> Vec<RunKey> {
         self.snapshot
             .runs_for(self.selected_repo.as_deref())
             .filter(|run| run.column == column)
@@ -423,7 +742,12 @@ impl FlowApp {
             .collect()
     }
 
-    fn select_repo(&mut self, repo: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn select_repo(
+        &mut self,
+        repo: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.selected_repo == repo {
             window.focus(&self.board_focus, cx);
             return;
@@ -443,27 +767,28 @@ impl FlowApp {
         cx.notify();
     }
 
-    fn open_run(&mut self, key: RunKey, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_run(&mut self, key: RunKey, window: &mut Window, cx: &mut Context<Self>) {
         self.cursor = Some(key.clone());
         self.selected_run = Some(key.clone());
-        self.screen = None;
+        // the run's own tab: opening a run shows what it is doing
+        self.screen = Some(Screen::Run);
+        self.section = Section::Runs;
         self.run_question = None;
         self.run_multi.clear();
         self.run_answer_error = None;
         self.run_action_error = None;
         self.run_abandon_confirm = None;
         self.run_issue = None;
-        self.detail_scroll = ScrollHandle::new();
         window.focus(&self.board_focus, cx);
-        // The detail pane narrows the board, so the card that is open can slide
-        // under it. The bounds a frame renders from are the previous frame's,
-        // and the narrowing itself is only measured at the end of this one, so
-        // the reveal runs in the render two frames from now.
+        // The run pane takes the width the column gives up, so the row that is
+        // open can slide under it. The bounds a frame renders from are the
+        // previous frame's, and the narrowing itself is only measured at the end
+        // of this one, so the reveal runs in the render two frames from now.
         self.reveal_frames = 2;
         cx.notify();
     }
 
-    fn close_detail(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn close_detail(&mut self, cx: &mut Context<Self>) {
         self.selected_run = None;
         self.screen = None;
         self.run_question = None;
@@ -472,8 +797,6 @@ impl FlowApp {
         self.run_action_error = None;
         self.run_abandon_confirm = None;
         self.run_issue = None;
-        self.detail_spec = None;
-        self.detail_tasks = None;
         cx.notify();
     }
 
@@ -492,968 +815,6 @@ impl FlowApp {
     }
 
     // ---- rendering ---------------------------------------------------------
-
-    fn render_titlebar(&self) -> AnyElement {
-        let scope = self
-            .selected_repo
-            .as_deref()
-            .and_then(|path| self.snapshot.repo(path))
-            .map(|repo| repo.name.clone())
-            .unwrap_or_else(|| "all repos".to_owned());
-
-        let mut bar = shell::title_bar()
-            .px(px(14.))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_0p5()
-                    .text_size(px(theme::font_brand()))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(div().text_color(theme::text()).child("warp"))
-                    .child(div().text_color(theme::accent_ink()).child("-flow")),
-            )
-            .child(
-                div()
-                    .id("flow-scope-chip")
-                    .debug_selector(|| "flow-scope-chip".into())
-                    .h(px(24.))
-                    .px(px(10.))
-                    .rounded(px(6.))
-                    .bg(theme::raised())
-                    .flex()
-                    .items_center()
-                    .text_size(px(theme::font_meta()))
-                    .text_color(theme::text_dim())
-                    .whitespace_nowrap()
-                    .child(scope),
-            )
-            .child(div().flex_1());
-        // The same phrase the OS title carries, so the two cannot disagree.
-        let activity = self
-            .host_snapshot
-            .driving_label()
-            .or_else(|| self.scanning.then(|| "Scanning".to_owned()));
-        if let Some(activity) = activity {
-            bar = bar.child(
-                div()
-                    .id("flow-activity")
-                    .debug_selector(|| "flow-activity".into())
-                    .role(gpui::Role::Status)
-                    .aria_label(activity.clone())
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .h(px(24.))
-                    .px(px(10.))
-                    .rounded(px(999.))
-                    .bg(theme::raised())
-                    .text_size(px(theme::font_meta()))
-                    .text_color(theme::text_dim())
-                    .child(motion::spinner(
-                        "flow-activity-spinner",
-                        "icons/icon-spinner.svg",
-                        px(theme::icon_tiny()),
-                        theme::accent_ink(),
-                    ))
-                    .child(activity),
-            );
-        }
-        bar = bar
-            .child(warpui_kit_core::text_size_control())
-            .child(warpui_kit_core::palette_control());
-        bar.into_any_element()
-    }
-
-    fn render_rail(&self, cx: &mut Context<Self>) -> AnyElement {
-        let selected = self.selected_repo.clone();
-        let total = self.snapshot.run_count(None);
-        let scope_runs: Vec<Run> = self
-            .snapshot
-            .runs_for(selected.as_deref())
-            .cloned()
-            .collect();
-
-        let mut repo_rows = div().flex().flex_col().gap(px(2.)).px(px(8.));
-        repo_rows = repo_rows.child(self.render_all_repos_row(total, cx));
-        for repo in &self.snapshot.repos {
-            repo_rows = repo_rows.child(self.render_repo_row(repo, cx));
-        }
-
-        let screen_nav = self.render_screen_nav(cx);
-
-        let runs_head = div()
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .px(px(14.))
-            .pt(px(12.))
-            .pb(px(6.))
-            .child(
-                div()
-                    .text_size(px(theme::font_micro()))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::text_muted())
-                    .child("RUNS"),
-            )
-            .child(
-                div()
-                    .font_family(theme::code_font())
-                    .text_size(px(theme::font_micro()))
-                    .text_color(theme::text_muted())
-                    .child(scope_runs.len().to_string()),
-            );
-
-        let mut run_rows = div()
-            .id("flow-run-list")
-            .debug_selector(|| "flow-run-list".into())
-            .flex()
-            .flex_col()
-            .gap(px(1.))
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.rail_scroll)
-            .px(px(8.))
-            .pb(px(8.));
-        if scope_runs.is_empty() {
-            run_rows = run_rows.child(
-                div()
-                    .px(px(12.))
-                    .py(px(8.))
-                    .text_size(px(theme::font_meta()))
-                    .text_color(theme::text_muted())
-                    .child(if self.scanning {
-                        "Reading repositories…"
-                    } else {
-                        "No runs yet."
-                    }),
-            );
-        }
-        for run in &scope_runs {
-            run_rows = run_rows.child(self.render_run_row(run, cx));
-        }
-
-        div()
-            .flex()
-            .flex_col()
-            .flex_shrink_0()
-            .w(px(theme::scaled(theme::RAIL_WIDTH)))
-            .h_full()
-            .min_h_0()
-            .bg(theme::window_chrome())
-            .border_r_1()
-            .border_color(theme::hairline())
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .px(px(14.))
-                    .pt(px(14.))
-                    .pb(px(8.))
-                    .child(
-                        div()
-                            .text_size(px(theme::font_micro()))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text_muted())
-                            .child("REPOSITORIES"),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .font_family(theme::code_font())
-                            .text_size(px(theme::font_micro()))
-                            .text_color(theme::text_muted())
-                            .child(self.snapshot.repos.len().to_string()),
-                    ),
-            )
-            .child(repo_rows)
-            .child(screen_nav)
-            .child(runs_head)
-            .child(run_rows)
-            .child(self.render_rail_foot())
-            .into_any_element()
-    }
-
-    /// The rail's list for the open run: Board, then the six screens. Empty
-    /// until a run is selected, so the rail stays a repository list otherwise.
-    fn render_screen_nav(&self, cx: &mut Context<Self>) -> AnyElement {
-        if self.selected_run.is_none() {
-            return div().into_any_element();
-        }
-        let mut list = div()
-            .id("flow-screen-nav")
-            .debug_selector(|| "flow-screen-nav".into())
-            .flex()
-            .flex_col()
-            .gap(px(1.))
-            .px(px(8.))
-            .pt(px(6.))
-            .child(
-                div()
-                    .px(px(6.))
-                    .pb(px(4.))
-                    .text_size(px(theme::font_micro()))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::text_muted())
-                    .child("THIS RUN"),
-            );
-        list = list.child(screen_row(
-            "board",
-            "Board",
-            self.screen.is_none(),
-            cx.listener(|this, _, window, cx| this.open_screen(None, window, cx)),
-        ));
-        for screen in Screen::ALL {
-            list = list.child(screen_row(
-                screen.key(),
-                screen.label(),
-                self.screen == Some(screen),
-                cx.listener(move |this, _, window, cx| {
-                    this.open_screen(Some(screen), window, cx);
-                }),
-            ));
-        }
-        list.into_any_element()
-    }
-
-    fn render_all_repos_row(&self, total: usize, cx: &mut Context<Self>) -> AnyElement {
-        let selected = self.selected_repo.is_none();
-        shell::list_row("flow-repo-all", selected)
-            .debug_selector(|| "flow-repo-all".into())
-            .a11y_button(format!("All repos, {total} runs"))
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.select_repo(None, window, cx);
-            }))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .text_size(px(theme::font_name()))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::text())
-                            .truncate()
-                            .child("All repos"),
-                    )
-                    .child(
-                        div()
-                            .mt(px(1.))
-                            .text_size(px(theme::font_meta()))
-                            .text_color(theme::text_muted())
-                            .truncate()
-                            .child("every repository"),
-                    ),
-            )
-            .child(
-                div()
-                    .font_family(theme::code_font())
-                    .text_size(px(theme::font_mono_meta()))
-                    .text_color(if selected {
-                        theme::accent_ink()
-                    } else {
-                        theme::text_muted()
-                    })
-                    .child(total.to_string()),
-            )
-            .into_any_element()
-    }
-
-    fn render_repo_row(&self, repo: &store::RepoView, cx: &mut Context<Self>) -> AnyElement {
-        let selected = self.selected_repo.as_deref() == Some(repo.path.as_path());
-        let path = repo.path.clone();
-        let selector = format!("flow-repo-{}", repo.name);
-        let mut label = format!("{}, {} runs", repo.name, repo.runs.len());
-        if repo.dirty {
-            label.push_str(", uncommitted changes");
-        }
-        if let Some(note) = &repo.note {
-            label.push_str(", ");
-            label.push_str(note);
-        }
-
-        let mut row = shell::list_row(SharedString::from(selector.clone()), selected)
-            .debug_selector(move || selector.clone())
-            .a11y_button(label)
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.select_repo(Some(path.clone()), window, cx);
-            }))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(5.))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_size(px(theme::font_name()))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme::text())
-                                    .truncate()
-                                    .child(repo.name.clone()),
-                            )
-                            .when(repo.dirty, |line| {
-                                line.child(
-                                    icon(
-                                        "icons/icon-alert.svg",
-                                        px(theme::icon_tiny()),
-                                        theme::WARN,
-                                    )
-                                    .into_any_element(),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .mt(px(1.))
-                            .text_size(px(theme::font_meta()))
-                            .text_color(theme::text_muted())
-                            .truncate()
-                            .child(store::display_path(&repo.path)),
-                    ),
-            )
-            .child(
-                div()
-                    .font_family(theme::code_font())
-                    .text_size(px(theme::font_mono_meta()))
-                    .text_color(if selected {
-                        theme::accent_ink()
-                    } else {
-                        theme::text_muted()
-                    })
-                    .child(repo.runs.len().to_string()),
-            );
-        if let Some(note) = &repo.note {
-            row = row.tooltip(tooltip_text(note.clone()));
-        } else if repo.dirty {
-            row = row.tooltip(tooltip_text("Uncommitted changes"));
-        }
-        row.into_any_element()
-    }
-
-    fn render_run_row(&self, run: &Run, cx: &mut Context<Self>) -> AnyElement {
-        let selected = self.selected_run.as_ref() == Some(&run.key);
-        let key = run.key.clone();
-        let selector = format!("flow-run-{}-{}", repo_label(&run.key.repo), run.key.id);
-        let label = format!("Open {}, {}, {}", run.title, run.column.label(), run.step);
-        shell::list_row(SharedString::from(selector.clone()), selected)
-            .debug_selector(move || selector.clone())
-            .a11y_button(label)
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.open_run(key.clone(), window, cx);
-            }))
-            .child(
-                div()
-                    .size(px(6.))
-                    .rounded_full()
-                    .bg(column_color(run.column)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .text_size(px(theme::font_meta()))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::text())
-                            .truncate()
-                            .child(run.title.clone()),
-                    )
-                    .child(
-                        div()
-                            .mt(px(1.))
-                            .font_family(theme::code_font())
-                            .text_size(px(theme::font_micro()))
-                            .text_color(theme::text_muted())
-                            .truncate()
-                            .child(format!("{} · {}", run.key.id, run.step)),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_rail_foot(&self) -> AnyElement {
-        let (color, word) = if self.scanning {
-            (theme::WARN, "Scanning repositories…")
-        } else {
-            (theme::ADD, "Up to date · every 2 s")
-        };
-        div()
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .border_t_1()
-            .border_color(theme::hairline())
-            .px(px(14.))
-            .py(px(10.))
-            .child(div().size(px(7.)).rounded_full().bg(color))
-            .child(
-                div()
-                    .text_size(px(theme::font_micro()))
-                    .text_color(theme::text_muted())
-                    .child(word),
-            )
-            .into_any_element()
-    }
-
-    fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let scope = self.selected_repo.clone();
-        let title = scope
-            .as_deref()
-            .and_then(|path| self.snapshot.repo(path))
-            .map(|repo| repo.name.clone())
-            .unwrap_or_else(|| "All runs".to_owned());
-        let count = self.snapshot.run_count(scope.as_deref());
-        let waiting = self.snapshot.waiting_count(scope.as_deref());
-
-        let mut main = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .bg(theme::surface());
-
-        let open_run = self
-            .selected_run
-            .as_ref()
-            .and_then(|key| self.snapshot.find(key))
-            .cloned();
-        if self.settings.repos.is_empty() {
-            main = main.child(self.render_empty());
-        } else if let (Some(screen), Some(run)) = (self.screen, open_run.clone()) {
-            main = match screen {
-                Screen::Run => main.child(self.render_run_screen(run, window, cx)),
-                other => main.child(self.screens.render(other)),
-            };
-        } else {
-            let detail = self
-                .selected_run
-                .as_ref()
-                .and_then(|key| self.snapshot.find(key))
-                .cloned();
-            main = main
-                .child(self.render_board_head(&title, count, waiting))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .flex_1()
-                        .min_h_0()
-                        .child(self.render_board(window, cx))
-                        .when_some(detail, |row, run| {
-                            row.child(self.render_detail(run, window, cx))
-                        }),
-                );
-        }
-        main.into_any_element()
-    }
-
-    fn render_board_head(&self, title: &str, count: usize, waiting: usize) -> AnyElement {
-        div()
-            .flex_shrink_0()
-            .flex()
-            .items_end()
-            .gap(px(12.))
-            .px(px(theme::scaled(theme::BOARD_PADDING)))
-            .pt(px(18.))
-            .pb(px(14.))
-            .border_b_1()
-            .border_color(theme::border_light())
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.))
-                    .child(
-                        div()
-                            .debug_selector(|| "flow-board-title".into())
-                            .text_size(px(theme::font_list_title()))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text())
-                            .child(title.to_owned()),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(|| "flow-board-sub".into())
-                            .text_size(px(theme::font_meta()))
-                            .text_color(theme::text_muted())
-                            .child(format!(
-                                "{count} runs · {waiting} waiting on you · one merge at a time"
-                            )),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_board(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let selected = self.selected_repo.clone();
-        let runs: Vec<Run> = self
-            .snapshot
-            .runs_for(selected.as_deref())
-            .cloned()
-            .collect();
-        let cursor = self
-            .cursor
-            .clone()
-            .filter(|key| runs.iter().any(|run| &run.key == key))
-            .or_else(|| runs.first().map(|run| run.key.clone()));
-        let focused = self.board_focus.is_focused(window);
-        if self.reveal_frames > 0 {
-            self.reveal_frames -= 1;
-            self.reveal_cursor();
-        }
-
-        // The six lanes keep a readable floor. A row whose children stop
-        // shrinking is as wide as its content only when it says so, and the
-        // scroller measures its direct child: without this the lanes squashed
-        // instead of the board scrolling sideways.
-        let lanes = Column::ALL.len() as f32;
-        let floor = lanes * theme::BOARD_COLUMN_MIN_WIDTH
-            + (lanes - 1.) * theme::BOARD_GAP
-            + 2. * theme::BOARD_PADDING;
-        let mut columns = div()
-            .flex()
-            .flex_row()
-            .items_start()
-            .gap(px(theme::scaled(theme::BOARD_GAP)))
-            .p(px(theme::scaled(theme::BOARD_PADDING)))
-            .min_w(px(theme::scaled(floor)));
-        for column in Column::ALL {
-            let column_runs: Vec<&Run> = runs.iter().filter(|run| run.column == column).collect();
-            columns = columns.child(self.render_column(
-                column,
-                &column_runs,
-                cursor.as_ref(),
-                focused,
-                cx,
-            ));
-        }
-
-        div()
-            .id("flow-board")
-            .debug_selector(|| "flow-board".into())
-            .flex()
-            .flex_col()
-            .track_focus(&self.board_focus)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                this.handle_board_key(event, window, cx);
-            }))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    window.focus(&this.board_focus, cx);
-                }),
-            )
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .child({
-                // recorded afresh every frame: a card that left the board must
-                // not leave a rectangle behind for the reveal to scroll to
-                self.card_bounds.borrow_mut().clear();
-                div()
-                    .id("flow-board-scroll")
-                    .debug_selector(|| "flow-board-scroll".into())
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_scroll()
-                    .track_scroll(&self.board_scroll)
-                    .child(columns)
-            })
-            .into_any_element()
-    }
-
-    /// Scroll the board so the cursor's card is wholly in view.
-    ///
-    /// Called after a keyboard move and when the detail pane opens (it narrows
-    /// the board), from the bounds the last frame recorded; a card that is
-    /// already visible needs no offset, so this is cheap on every move.
-    fn reveal_cursor(&mut self) {
-        let Some(key) = self.cursor.clone() else {
-            return;
-        };
-        let bounds = self
-            .card_bounds
-            .borrow()
-            .iter()
-            .find(|(card, _)| card == &key)
-            .map(|(_, bounds)| *bounds);
-        let Some(bounds) = bounds else {
-            return;
-        };
-        let viewport = self.board_scroll.bounds();
-        if viewport.size.width <= gpui::px(0.) && viewport.size.height <= gpui::px(0.) {
-            // the board has not been laid out yet
-            return;
-        }
-        // A gpui scroll offset is never positive: content moves up and left, so
-        // an offset lives in `[-max, 0]` and scrolling *down* decreases it.
-        let offset = self.board_scroll.offset();
-        let max = self.board_scroll.max_offset();
-        let mut next = offset;
-        if bounds.left() < viewport.left() {
-            next.x += viewport.left() - bounds.left();
-        } else if bounds.right() > viewport.right() {
-            next.x -= bounds.right() - viewport.right();
-        }
-        if bounds.top() < viewport.top() {
-            next.y += viewport.top() - bounds.top();
-        } else if bounds.bottom() > viewport.bottom() {
-            next.y -= bounds.bottom() - viewport.bottom();
-        }
-        next.x = next.x.clamp(-max.x, gpui::px(0.));
-        next.y = next.y.clamp(-max.y, gpui::px(0.));
-        if next != offset {
-            self.board_scroll.set_offset(point(next.x, next.y));
-        }
-    }
-
-    fn render_column(
-        &self,
-        column: Column,
-        runs: &[&Run],
-        cursor: Option<&RunKey>,
-        focused: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let count_selector = format!("flow-column-{}-count", column.key());
-        let mut head = div()
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .min_w_0()
-            .px(px(2.))
-            .pb(px(6.))
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(theme::font_row_meta()))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::text())
-                    .child(column.label()),
-            )
-            .child(
-                div()
-                    .debug_selector(move || count_selector.clone())
-                    .flex_shrink_0()
-                    .h(px(18.))
-                    .px(px(6.))
-                    .rounded(px(999.))
-                    .bg(theme::raised())
-                    .flex()
-                    .items_center()
-                    .font_family(theme::code_font())
-                    .text_size(px(theme::font_micro()))
-                    .text_color(theme::text_muted())
-                    .child(runs.len().to_string()),
-            );
-        head = head.child(div().flex_1());
-
-        let mut cards = div().flex().flex_col().gap(px(theme::scaled(8.)));
-        for run in runs {
-            cards = cards.child(self.render_card(run, cursor, focused, cx));
-        }
-        // the one place that knows where a card landed: the scroller's handle
-        // sees only its direct children, and a card is two levels down
-        let keys: Vec<RunKey> = runs.iter().map(|run| run.key.clone()).collect();
-        let recorded = Rc::clone(&self.card_bounds);
-        cards = cards.on_children_prepainted(move |bounds, _, _| {
-            let mut recorded = recorded.borrow_mut();
-            for (key, bounds) in keys.iter().cloned().zip(bounds) {
-                recorded.push((key, bounds));
-            }
-        });
-
-        div()
-            .id(SharedString::from(format!("flow-column-{}", column.key())))
-            .debug_selector({
-                let selector = format!("flow-column-{}", column.key());
-                move || selector.clone()
-            })
-            .flex()
-            .flex_col()
-            // The six lanes share the width the rail leaves, and keep a readable
-            // floor: below it the board scrolls sideways instead of squashing.
-            .flex_1()
-            .min_w(px(theme::scaled(theme::BOARD_COLUMN_MIN_WIDTH)))
-            .max_w(px(theme::scaled(theme::BOARD_COLUMN_WIDTH)))
-            .min_h(px(120.))
-            .child(head)
-            .child(cards)
-            .into_any_element()
-    }
-
-    fn render_card(
-        &self,
-        run: &Run,
-        cursor: Option<&RunKey>,
-        focused: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let is_open = self.selected_run.as_ref() == Some(&run.key);
-        let is_cursor = cursor == Some(&run.key) && focused;
-        // A quiet mark for the one run this window is driving; the card's own
-        // look stays the run's, not the engine's.
-        let driving = self
-            .host_snapshot
-            .run(&run.dir)
-            .is_some_and(|host_run| host_run.is_driving());
-        let border = if is_open || is_cursor {
-            theme::accent()
-        } else {
-            theme::hairline()
-        };
-        let key = run.key.clone();
-        let selector = format!("flow-card-{}-{}", repo_label(&run.key.repo), run.key.id);
-        let label = format!(
-            "Open {}, {}, {}, {} attempts",
-            run.title,
-            run.column.label(),
-            run.step,
-            run.attempts
-        );
-
-        div()
-            .id(SharedString::from(selector.clone()))
-            .debug_selector(move || selector.clone())
-            .a11y_button(label)
-            .cursor_pointer()
-            .flex()
-            .flex_col()
-            .gap(px(7.))
-            .p(px(theme::scaled(12.)))
-            .rounded(px(theme::scaled(8.)))
-            .border_1()
-            .border_color(border)
-            .bg(theme::panel())
-            .hover(|style| style.border_color(theme::line_strong()).bg(theme::raised()))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.open_run(key.clone(), window, cx);
-            }))
-            .child(
-                div()
-                    .text_size(px(theme::font_body()))
-                    .font_weight(FontWeight::MEDIUM)
-                    .line_height(relative(1.35))
-                    .line_clamp(3)
-                    .text_color(theme::text())
-                    .child(run.title.clone()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(5.))
-                    .font_family(theme::code_font())
-                    .text_size(px(theme::font_mono_meta()))
-                    .text_color(theme::text_muted())
-                    .child(repo_label(&run.key.repo))
-                    .child(div().text_color(theme::line_strong()).child("·"))
-                    .child(run.key.id.clone()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(6.))
-                    .child(status_pill(run))
-                    .child(tag(run.step.clone()))
-                    .child(tag(attempt_word(run.attempts)))
-                    .when(driving, |row| {
-                        let selector = format!("flow-driving-{}", run.key.id);
-                        row.child(
-                            div()
-                                .debug_selector(move || selector.clone())
-                                .child(tag("driving".to_owned())),
-                        )
-                    }),
-            )
-            .into_any_element()
-    }
-
-    fn render_detail(
-        &mut self,
-        run: Run,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let key = run.key.clone();
-        let spec = ensure_document(&mut self.detail_spec, &key, run.spec.clone(), window, cx);
-        let tasks = ensure_document(&mut self.detail_tasks, &key, run.tasks.clone(), window, cx);
-        let spec_body = match &spec {
-            // the section is already a bounded, padded card, so the document
-            // fills it instead of centring the engine's readable column
-            Some(editor) => warpui_kit_markdown::render_read_only_document_in_card(editor, cx),
-            None => empty_document("No spec yet."),
-        };
-        let tasks_body = match &tasks {
-            Some(editor) => warpui_kit_markdown::render_read_only_document_in_card(editor, cx),
-            None => empty_document("No tasks yet."),
-        };
-
-        let mut body = div()
-            .id("flow-detail-scroll")
-            .flex()
-            .flex_col()
-            .gap(px(16.))
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.detail_scroll)
-            .p(px(theme::scaled(theme::DETAIL_PADDING)));
-        body = body.child(self.render_detail_meta(&run));
-        if let Some(question) = &run.question {
-            body = body.child(question_card(question));
-        }
-        if let Some(note) = &run.note {
-            body = body.child(
-                div()
-                    .rounded(px(6.))
-                    .bg(theme::tint(theme::DANGER))
-                    .px(px(10.))
-                    .py(px(8.))
-                    .font_family(theme::code_font())
-                    .text_size(px(theme::font_micro()))
-                    .text_color(theme::DANGER)
-                    .child(note.clone()),
-            );
-        }
-        body = body
-            .child(log_card(recent_rows(&run.rows, MAX_LOG_ROWS), run.attempts))
-            .child(document_section("Spec", spec_body, "flow-detail-spec"))
-            .child(document_section("Tasks", tasks_body, "flow-detail-tasks"));
-
-        div()
-            .id("flow-detail")
-            .debug_selector(|| "flow-detail".into())
-            .flex()
-            .flex_col()
-            .flex_shrink_0()
-            .w(px(theme::scaled(theme::DETAIL_WIDTH)))
-            .h_full()
-            .min_h_0()
-            .bg(theme::panel())
-            .border_l_1()
-            .border_color(theme::hairline())
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .flex()
-                    .items_start()
-                    .gap(px(10.))
-                    .p(px(theme::scaled(theme::DETAIL_PADDING)))
-                    .border_b_1()
-                    .border_color(theme::border_light())
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(3.))
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .text_size(px(theme::font_heading()))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .line_height(relative(1.3))
-                                    .text_color(theme::text())
-                                    .child(run.title.clone()),
-                            )
-                            .child(
-                                div()
-                                    .font_family(theme::code_font())
-                                    .text_size(px(theme::font_mono_meta()))
-                                    .text_color(theme::text_muted())
-                                    .child(format!(
-                                        "{} · {} · {}",
-                                        repo_label(&run.key.repo),
-                                        run.key.id,
-                                        run.status
-                                    )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(|| "flow-detail-open-run".into())
-                            .child(warpui_kit_core::controls::button(
-                                "flow-detail-open-run-button",
-                                "Open run",
-                                warpui_kit_core::controls::BtnKind::Chip,
-                                theme::accent(),
-                                theme::font_control(),
-                                true,
-                                cx.listener(move |this, _, window, cx| {
-                                    this.open_run_screen(key.clone(), window, cx);
-                                }),
-                            )),
-                    )
-                    .child(
-                        warpui_kit_core::controls::icon_button(
-                            "flow-detail-close",
-                            "Close run detail",
-                        )
-                        .debug_selector(|| "flow-detail-close".into())
-                        .on_click(cx.listener(|this, _, _, cx| this.close_detail(cx)))
-                        .child(icon(
-                            "icons/icon-close.svg",
-                            px(theme::icon_small()),
-                            theme::text_dim(),
-                        )),
-                    ),
-            )
-            .child(body)
-            .into_any_element()
-    }
-
-    fn render_detail_meta(&self, run: &Run) -> AnyElement {
-        let attempts = attempt_word(run.attempts);
-        let tasks = format!("{} of {}", run.tasks_done, run.tasks_total);
-        div()
-            .flex()
-            .flex_col()
-            .rounded(px(8.))
-            .border_1()
-            .border_color(theme::hairline())
-            .bg(theme::surface())
-            .px(px(12.))
-            .py(px(8.))
-            .child(meta_row("Repository", repo_label(&run.key.repo)))
-            .child(meta_row("Run", run.key.id.clone()))
-            .child(meta_row("Workflow", run.workflow.clone()))
-            .child(meta_row("Step", run.step.clone()))
-            .child(meta_row("Attempts", attempts))
-            .child(meta_row("Tasks resolved", tasks))
-            .into_any_element()
-    }
 
     fn render_empty(&self) -> AnyElement {
         div()
@@ -1515,114 +876,6 @@ impl FlowApp {
     }
 
     // ---- keyboard ----------------------------------------------------------
-
-    fn handle_board_key(
-        &mut self,
-        event: &KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(key) = list_nav::list_key(event) else {
-            return;
-        };
-        if self.move_cursor(key, window, cx) {
-            cx.stop_propagation();
-        }
-    }
-
-    /// Move the board's cursor. Up/Down step inside the column, Left/Right
-    /// cross to the nearest non-empty column, Home/End go to the board's ends,
-    /// and Enter opens the run under the cursor.
-    fn move_cursor(&mut self, key: ListKey, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let visible = self.visible_keys();
-        if visible.is_empty() {
-            return false;
-        }
-        let current = self
-            .cursor
-            .clone()
-            .filter(|cursor| visible.contains(cursor))
-            .or_else(|| visible.first().cloned());
-        let Some(current) = current else {
-            return false;
-        };
-        let Some(run) = self.snapshot.find(&current) else {
-            return false;
-        };
-        let column = run.column;
-
-        // Home/End are the board's ends, not the column's: the board is one
-        // list and the columns are its lanes.
-        if matches!(key, ListKey::Home | ListKey::End) {
-            self.cursor = if matches!(key, ListKey::Home) {
-                visible.first().cloned()
-            } else {
-                visible.last().cloned()
-            };
-            self.reveal_cursor();
-            cx.notify();
-            return true;
-        }
-
-        match key {
-            ListKey::Enter => {
-                // With the detail pane already open, Enter opens the full run
-                // screen for that run; otherwise it opens the pane.
-                match self.selected_run.clone() {
-                    Some(open) => self.open_run_screen(open, window, cx),
-                    None => self.open_run(current, window, cx),
-                }
-                return true;
-            }
-            ListKey::Up | ListKey::Down | ListKey::PageUp | ListKey::PageDown => {
-                let keys = self.column_keys(column);
-                let index = keys.iter().position(|key| key == &current).unwrap_or(0);
-                let last = keys.len().saturating_sub(1);
-                let next = match key {
-                    ListKey::Up => index.saturating_sub(1),
-                    ListKey::Down => (index + 1).min(last),
-                    ListKey::PageUp => index.saturating_sub(PAGE),
-                    ListKey::PageDown => (index + PAGE).min(last),
-                    _ => index,
-                };
-                self.cursor = keys.get(next).cloned();
-            }
-            ListKey::Left | ListKey::Right => {
-                let index = Column::ALL
-                    .iter()
-                    .position(|candidate| *candidate == column)
-                    .unwrap_or(0);
-                let step = if matches!(key, ListKey::Left) {
-                    -1isize
-                } else {
-                    1
-                };
-                let row = self
-                    .column_keys(column)
-                    .iter()
-                    .position(|key| key == &current)
-                    .unwrap_or(0);
-                let mut next = index as isize + step;
-                while (0..Column::ALL.len() as isize).contains(&next) {
-                    let keys = self.column_keys(Column::ALL[next as usize]);
-                    if !keys.is_empty() {
-                        self.cursor = keys.get(row.min(keys.len() - 1)).cloned();
-                        break;
-                    }
-                    next += step;
-                }
-            }
-            // Home/End are handled above, before the match; the arm keeps
-            // the match exhaustive without reaching here.
-            ListKey::Home | ListKey::End => {}
-            ListKey::Menu => return false,
-        }
-        // the card the cursor moved to may sit under the detail pane or below
-        // the fold; the board follows the keyboard
-        self.reveal_cursor();
-        cx.notify();
-        true
-    }
 
     // ---- probe accessors ---------------------------------------------------
 
@@ -1698,15 +951,6 @@ impl FlowApp {
         self.selected_repo.as_deref()
     }
 
-    /// The read-only markdown editor's value, so a probe can see that the
-    /// detail pane renders `spec.md` rather than only reserving space for it.
-    #[doc(hidden)]
-    pub fn detail_spec_for_probe(&self, cx: &App) -> Option<String> {
-        self.detail_spec
-            .as_ref()
-            .map(|slot| slot.editor.read(cx).value().to_string())
-    }
-
     /// The run screen's run, or `None` while the board is shown.
     #[doc(hidden)]
     pub fn run_screen_for_probe(&self) -> Option<&RunKey> {
@@ -1768,22 +1012,233 @@ impl FlowApp {
 impl Render for FlowApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_window_title(window);
+        // read in the frame, so the title bar's zoom glyph follows the
+        // compositor without a control having to tell it
+        self.maximized = window.is_maximized();
+        let detail = match self.section {
+            Section::Runs => self.render_runs_detail(window, cx),
+            Section::Repos => self.render_repos_detail(window, cx),
+            Section::About => self.render_about_detail(cx),
+            Section::Settings => self.render_settings_detail(window, cx),
+        };
+        let list = (!self.list_hidden).then(|| match self.section {
+            Section::Runs | Section::Repos => self.render_list_pane(cx),
+            // About's list is the kit's installed family, and Settings has its
+            // own three groups: a repository list beside either would be noise
+            Section::About => div().into_any_element(),
+            Section::Settings => self.render_settings_list(cx),
+        });
+        let mut stage = shell::panes().debug_selector(|| "flow-panes".into());
+        if let Some(list) = list {
+            stage = stage.child(list);
+        }
         div()
             .size_full()
             .flex()
             .flex_col()
             .bg(theme::surface())
             .text_color(theme::text())
-            .child(self.render_titlebar())
+            .child(self.render_title_bar(cx))
             .child(
-                div()
+                shell::stage()
                     .flex()
                     .flex_row()
                     .flex_1()
                     .min_h_0()
                     .child(self.render_rail(cx))
-                    .child(self.render_main(window, cx)),
+                    .child(stage.child(detail)),
             )
+    }
+}
+
+impl FlowApp {
+    /// The Runs section's detail: the 320 run column, then the open run or the
+    /// line that says no run is open.
+    fn render_runs_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.settings.repos.is_empty() {
+            return self.render_empty();
+        }
+        // The detail holds the run column and the open run side by side: the
+        // column is the work list, the run is what the list opened. It is a row,
+        // not the shell's page column, because neither is under the other.
+        let open = self.run_tab().is_some()
+            && self
+                .selected_run
+                .as_ref()
+                .and_then(|key| self.snapshot.find(key))
+                .is_some();
+        let pane = if open {
+            self.render_run_pane(window, cx)
+        } else {
+            self.render_no_run()
+        };
+        div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .h_full()
+            .child(self.render_run_column(window, cx))
+            .child(
+                shell::detail_pane()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .child(pane),
+            )
+            .into_any_element()
+    }
+
+    /// The Repos section's detail: the selected repository's head and its Gates
+    /// and Workflow tabs.
+    fn render_repos_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.settings.repos.is_empty() {
+            return self.render_empty();
+        }
+        self.render_repo_detail(window, cx)
+    }
+
+    /// The About section: the installed family, the build and the license.
+    fn render_about_detail(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.render_about(cx)
+    }
+
+    /// The Settings section: this window's own knobs, one group at a time.
+    fn render_settings_detail(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.screens.show_settings(self.settings_group, cx);
+        self.screens.render(Screen::Settings)
+    }
+
+    /// The Settings section's list: its three groups, the selected one lifted.
+    fn render_settings_list(&self, cx: &mut Context<Self>) -> AnyElement {
+        let width = shell::clamp_list_width(self.list_width);
+        let mut rows = div()
+            .id("flow-settings-list-scroll")
+            .debug_selector(|| "flow-settings-list".into())
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.rail_scroll);
+        for group in SettingsGroup::ALL {
+            let selected = self.settings_group == group;
+            let selector = format!("flow-settings-{}", group.key());
+            let mut row = div()
+                .id(SharedString::from(selector.clone()))
+                .debug_selector(move || selector.clone())
+                .role(gpui::Role::Button)
+                .aria_label(group.label())
+                .relative()
+                .cursor_pointer()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .gap(px(2.))
+                .h(px(theme::scaled(theme::ROW_HEIGHT)))
+                .pl(px(13.))
+                .pr(px(16.))
+                .py(px(10.))
+                .border_b_1()
+                .border_color(theme::hairline())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.settings_group = group;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .text_size(px(theme::font_name()))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::text())
+                        .child(group.label()),
+                )
+                .child(
+                    div()
+                        .text_size(px(theme::font_meta()))
+                        .text_color(theme::text_muted())
+                        .child(group.blurb()),
+                );
+            if selected {
+                row = row.bg(theme::raised()).child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left_0()
+                        .w(px(theme::ROW_MARK))
+                        .bg(theme::accent()),
+                );
+            } else {
+                row = row.hover(|style| style.bg(theme::panel()));
+            }
+            rows = rows.child(row);
+        }
+        shell::list_pane(width)
+            .debug_selector(|| "flow-list".into())
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .px(px(16.))
+                    .pt(px(15.))
+                    .pb(px(12.))
+                    .border_b_1()
+                    .border_color(theme::hairline())
+                    .child(
+                        div()
+                            .text_size(px(theme::font_list_title()))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child("Settings"),
+                    ),
+            )
+            .child(rows)
+            .into_any_element()
+    }
+
+    /// The detail with no run open: one honest line and the two ways forward,
+    /// never placeholder text.
+    pub(crate) fn render_no_run(&self) -> AnyElement {
+        div()
+            .id("flow-no-run")
+            .debug_selector(|| "flow-no-run".into())
+            .flex()
+            .flex_1()
+            .w_full()
+            .h_full()
+            .items_center()
+            .justify_center()
+            .p(px(theme::scaled(shell::DETAIL_PADDING)))
+            .child(
+                div()
+                    .w(px(360.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .text_size(px(theme::font_heading()))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child("No run open"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme::font_body()))
+                            .text_color(theme::text_dim())
+                            .child(
+                                "Pick a run in the column beside this pane. The engine owns its \
+                                 folder while it drives; everything it wrote is on the run's tabs.",
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 }
 
@@ -1791,93 +1246,11 @@ impl Render for FlowApp {
 
 /// One row of the rail's screen list: the board's shape at a smaller size, so
 /// the screen list reads as a second list in the same rail.
-fn screen_row(
-    key: &'static str,
-    label: &'static str,
-    selected: bool,
-    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
-) -> AnyElement {
-    let selector = format!("flow-nav-{key}");
-    shell::list_row(SharedString::from(selector.clone()), selected)
-        .debug_selector(move || selector.clone())
-        .a11y_button(label)
-        .flex()
-        .items_center()
-        .h(px(26.))
-        .px(px(8.))
-        .gap(px(8.))
-        .on_click(on_click)
-        .child(
-            div()
-                .text_size(px(theme::font_meta()))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(if selected {
-                    theme::text()
-                } else {
-                    theme::text_dim()
-                })
-                .child(label),
-        )
-        .into_any_element()
-}
-
 pub(crate) fn repo_label(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| path.display().to_string())
-}
-
-fn column_color(column: Column) -> gpui::Rgba {
-    match column {
-        Column::Triage => theme::text_muted(),
-        Column::Ready => theme::text_dim(),
-        Column::Running => theme::accent_ink(),
-        Column::Waiting => theme::WARN,
-        Column::Blocked => theme::DANGER,
-        Column::Merged => theme::ADD,
-    }
-}
-
-fn column_word(column: Column) -> &'static str {
-    match column {
-        Column::Triage => "triage",
-        Column::Ready => "ready",
-        Column::Running => "running",
-        Column::Waiting => "waiting",
-        Column::Blocked => "blocked",
-        Column::Merged => "merged",
-    }
-}
-
-pub(crate) fn status_pill(run: &Run) -> AnyElement {
-    let color = column_color(run.column);
-    // The lane's word is what the board sorts by; the record can say something
-    // sharper. A paused run sits in Waiting on you, but a person paused it —
-    // say so rather than telling them a question is open; and a run whose
-    // every step finished is `done` whether or not it had a merge step, so the
-    // lane's word must not promise one.
-    let word: String = if run.question.is_some() {
-        "asking you".to_owned()
-    } else if matches!(run.status.as_str(), "paused" | "abandoned" | "done") {
-        run.status.clone()
-    } else {
-        column_word(run.column).to_owned()
-    };
-    div()
-        .flex()
-        .items_center()
-        .gap(px(5.))
-        .h(px(20.))
-        .px(px(7.))
-        .rounded(px(999.))
-        .bg(theme::tint(color))
-        .text_color(color)
-        .text_size(px(theme::font_micro()))
-        .font_weight(FontWeight::MEDIUM)
-        .child(div().size(px(5.)).rounded_full().bg(color))
-        .child(word)
-        .into_any_element()
 }
 
 pub(crate) fn tag(text: String) -> AnyElement {
@@ -1907,191 +1280,6 @@ pub(crate) fn attempt_word(attempts: usize) -> String {
     }
 }
 
-pub(crate) fn meta_row(label: &str, value: String) -> AnyElement {
-    div()
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap(px(12.))
-        .py(px(3.))
-        .child(
-            div()
-                .text_size(px(theme::font_meta()))
-                .text_color(theme::text_muted())
-                .child(label.to_owned()),
-        )
-        .child(
-            div()
-                .font_family(theme::code_font())
-                .text_size(px(theme::font_mono_meta()))
-                .text_color(theme::text())
-                .truncate()
-                .child(value),
-        )
-        .into_any_element()
-}
-
-fn question_card(question: &Question) -> AnyElement {
-    let mut card = div()
-        .flex()
-        .flex_col()
-        .gap(px(5.))
-        .rounded(px(8.))
-        .border_1()
-        .border_color(theme::WARN)
-        .bg(theme::tint(theme::WARN))
-        .p(px(12.))
-        .child(
-            div()
-                .text_size(px(theme::font_micro()))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme::WARN)
-                .child(format!("WAITING ON YOU · {}", question.kind.to_uppercase())),
-        )
-        .child(
-            div()
-                .text_size(px(theme::font_body()))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme::text())
-                .child(question.title.clone()),
-        )
-        .child(
-            div()
-                .font_family(theme::code_font())
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_muted())
-                .child(format!("asked by {}", question.asked_by)),
-        );
-    if let Some(task) = &question.task {
-        card = card.child(
-            div()
-                .text_size(px(theme::font_meta()))
-                .text_color(theme::text_dim())
-                .child(format!("about task {task}")),
-        );
-    }
-    card.into_any_element()
-}
-
-fn log_card(rows: &[RunRow], attempts: usize) -> AnyElement {
-    let mut card = div()
-        .flex()
-        .flex_col()
-        .gap(px(4.))
-        .rounded(px(8.))
-        .border_1()
-        .border_color(theme::hairline())
-        .bg(theme::surface())
-        .p(px(12.))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(8.))
-                .child(
-                    div()
-                        .text_size(px(theme::font_row_meta()))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::text())
-                        .child("Run log"),
-                )
-                .child(
-                    div()
-                        .font_family(theme::code_font())
-                        .text_size(px(theme::font_micro()))
-                        .text_color(theme::text_muted())
-                        .child(attempt_word(attempts)),
-                ),
-        );
-    if rows.is_empty() {
-        card = card.child(
-            div()
-                .text_size(px(theme::font_meta()))
-                .text_color(theme::text_muted())
-                .child("No attempts recorded yet."),
-        );
-        return card.into_any_element();
-    }
-    card = card.child(log_header());
-    for row in rows {
-        card = card.child(log_row(row));
-    }
-    card.into_any_element()
-}
-
-fn log_header() -> AnyElement {
-    div()
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .py(px(2.))
-        .border_b_1()
-        .border_color(theme::border_light())
-        .font_family(theme::code_font())
-        .text_size(px(theme::font_micro()))
-        .text_color(theme::text_muted())
-        .whitespace_nowrap()
-        .child(div().w(px(86.)).child("STEP"))
-        .child(div().w(px(34.)).child("TASK"))
-        .child(div().w(px(30.)).child("TRY"))
-        .child(div().flex_1().min_w_0().child("OUTCOME"))
-        .child(div().w(px(112.)).child("AT"))
-        .into_any_element()
-}
-
-fn log_row(row: &RunRow) -> AnyElement {
-    div()
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .py(px(2.))
-        .font_family(theme::code_font())
-        .text_size(px(theme::font_micro()))
-        .text_color(theme::text_dim())
-        .whitespace_nowrap()
-        .child(div().w(px(86.)).truncate().child(row.step.clone()))
-        .child(div().w(px(34.)).truncate().child(row.task.clone()))
-        .child(div().w(px(30.)).truncate().child(row.attempt.clone()))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .child(row.outcome.clone()),
-        )
-        .child(div().w(px(112.)).truncate().child(row.at.clone()))
-        .into_any_element()
-}
-
-fn document_section(title: &str, body: AnyElement, selector: &'static str) -> AnyElement {
-    div()
-        .debug_selector(move || selector.into())
-        .flex()
-        .flex_col()
-        .gap(px(6.))
-        .child(
-            div()
-                .text_size(px(theme::font_row_meta()))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme::text())
-                .child(title.to_owned()),
-        )
-        .child(
-            div()
-                .rounded(px(8.))
-                .border_1()
-                .border_color(theme::hairline())
-                .bg(theme::surface())
-                .p(px(12.))
-                .child(body),
-        )
-        .into_any_element()
-}
-
-/// Read (or rebuild) the read-only editor for one document. The slot keeps
-/// the source it was built from, so a scan that changed `spec.md` replaces
-/// the markdown instead of leaving the old text behind.
 pub(crate) fn ensure_document(
     slot: &mut Option<DocSlot>,
     key: &RunKey,
@@ -2112,12 +1300,4 @@ pub(crate) fn ensure_document(
         });
     }
     slot.as_ref().map(|slot| slot.editor.clone())
-}
-
-fn empty_document(message: &str) -> AnyElement {
-    div()
-        .text_size(px(theme::font_meta()))
-        .text_color(theme::text_muted())
-        .child(message.to_owned())
-        .into_any_element()
 }

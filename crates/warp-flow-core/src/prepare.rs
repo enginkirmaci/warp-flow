@@ -5,6 +5,13 @@
 //! names, read the issue's tasks, and only then contact a harness. This module
 //! owns that sequence once so the two drivers cannot drift (S4a).
 //!
+//! A workflow's template belongs to the repository: `Repos › Workflow` edits
+//! `<repo>/workflow.toml` and appends a revision, and a run copies the template
+//! it starts on into its issue folder. The issue's copy is what a run reads, so
+//! a template edited mid-run never reaches a run that already started; when an
+//! issue folder carries no copy, preparation falls back to the repository's
+//! template, so a run started by hand or by the CLI reads the same graph.
+//!
 //! A run also refuses to start on a working tree that is dirty outside the
 //! issue folder: the engine owns the issue folder and commits only that folder,
 //! while any other uncommitted change would make the merge queue refuse its own
@@ -40,6 +47,9 @@ pub struct Prepared {
     pub flow: FlowConfig,
     /// The workflow this run's issue folder carries.
     pub workflow: Workflow,
+    /// The file the workflow was read from: the issue's copy, or the
+    /// repository's template when the folder carries none.
+    pub workflow_path: PathBuf,
     /// The issue's tasks as they stand at preparation time.
     pub state: Issue,
     /// The issue's title: `spec.md`'s first heading, else the folder name.
@@ -59,7 +69,8 @@ pub fn prepare(issue: &Path) -> Result<Prepared> {
     // a bad workflow or gate file cannot leave a session behind.
     let repo = Repo::open(issue)?;
     let flow = FlowConfig::read(repo.root.join("flow.toml"))?;
-    let workflow = Workflow::read(issue.join("workflow.toml"))?;
+    let workflow_path = resolve_workflow(issue, &repo.root);
+    let workflow = Workflow::read(&workflow_path)?;
     workflow.validate()?;
     let state = Issue::open(issue)?;
     let gates = flow.gates();
@@ -70,11 +81,50 @@ pub fn prepare(issue: &Path) -> Result<Prepared> {
         repo,
         flow,
         workflow,
+        workflow_path,
         state,
     })
 }
 
+/// The workflow file a run reads: the issue folder's copy first, then the
+/// repository's template. The issue's copy is missing only for a run started by
+/// hand or by the CLI before the engine copied one in, so the fallback keeps
+/// those runs on the same graph the window shows.
+///
+/// `prepare` reports the issue's own path when neither exists: the error then
+/// names the file the run expected, which is the thing a person can fix.
+pub fn resolve_workflow(issue: &Path, repo_root: &Path) -> PathBuf {
+    let copy = issue.join("workflow.toml");
+    if copy.is_file() {
+        return copy;
+    }
+    let template = repo_root.join("workflow.toml");
+    if template.is_file() {
+        return template;
+    }
+    copy
+}
+
 impl Prepared {
+    /// Pin the graph this run starts on into its issue folder.
+    ///
+    /// A template belongs to the repository and gathers revisions while runs
+    /// drive; a run reads the copy it started on, so a save in
+    /// `Repos › Workflow` never changes the graph under a step that is already
+    /// running. A folder that already carries a copy keeps it: that is the
+    /// revision this run was started on.
+    ///
+    /// # Errors
+    ///
+    /// The graph's validation error, or the filesystem's.
+    pub fn pin_workflow(&self) -> Result<()> {
+        let copy = self.issue.join("workflow.toml");
+        if copy.is_file() {
+            return Ok(());
+        }
+        self.workflow.write(copy)
+    }
+
     /// Whether `run.md` already exists, so the next run continues its record.
     pub fn resume(&self) -> bool {
         self.issue.join("run.md").is_file()
@@ -398,6 +448,36 @@ depends_on = ["check"]
         prepared
             .require_clean()
             .expect("the issue folder is the engine's to write");
+    }
+
+    #[test]
+    fn a_folder_without_a_copy_reads_the_repository_template() {
+        let dir = TempDir::new();
+        let (root, issue) = fixture(&dir);
+        // the template belongs to the repository; the issue folder carries none
+        fs::rename(issue.join("workflow.toml"), root.join("workflow.toml"))
+            .expect("the template moved to the repository");
+        let prepared = prepare(&issue).expect("prepares");
+        assert_eq!(prepared.workflow_path, root.join("workflow.toml"));
+        assert_eq!(prepared.workflow.name, "implement");
+
+        // the run pins the revision it starts on: the copy lands in its folder
+        prepared.pin_workflow().expect("pins");
+        assert!(issue.join("workflow.toml").is_file());
+        let pinned = Workflow::read(issue.join("workflow.toml")).expect("the copy reads");
+        assert_eq!(pinned.revision, prepared.workflow.revision);
+
+        // and a folder that already carries one keeps it
+        fs::write(
+            issue.join("workflow.toml"),
+            WORKFLOW.replace("revision = 1", "revision = 7"),
+        )
+        .expect("a newer copy");
+        let prepared = prepare(&issue).expect("prepares");
+        assert_eq!(prepared.workflow_path, issue.join("workflow.toml"));
+        prepared.pin_workflow().expect("pins nothing");
+        let kept = Workflow::read(issue.join("workflow.toml")).expect("the copy reads");
+        assert_eq!(kept.revision, 7, "the pinned copy is the run's own");
     }
 
     #[test]

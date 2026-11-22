@@ -20,14 +20,29 @@ either way. This file adds only the app-specific facts.
 - `src/bin/warp-flow-cli.rs` — the headless driver (`run`, `status`, `answer`)
   over `core::prepare`, the same preparation the app uses. Keep it building and
   keep its argument tests.
-- `src/ui/` — the shell: repository rail, kanban board, run detail and the run
-  screen (`run.rs`: workflow step bands, task dependency strip, open question
-  and attempt history).
+- `src/ui/` — the family's one shell: `chrome.rs` (the 46 title bar and the 76
+  rail), `repos.rs` (the 432 repository list), `runs.rs` (the 320 run column,
+  the board read downwards: lane bands, run rows, the keyboard cursor and its
+  reveal) and `detail.rs` (the run's head, its four tabs — Run, Task & diff,
+  Artifacts, Workflow — and the 44 strip under them). `window.rs` holds the
+  state, the scan and host adoption, selection and the render composition;
+  `run.rs` is the Run tab's body (workflow step bands, task chips, the
+  question card, attempt history, sessions and the engine log). The shell is
+  `warpui_kit_core::shell`: rail 76, list 432 (320–560), detail padding 24,
+  reading 760, control 34, field 36, tab 42. Keep the state grouping: a lane
+  band per non-empty `store::Column`, Waiting on you in `CHANGES`, Blocked in
+  `DANGER`, the rest quiet.
 - `src/ui/screens/` — the run's five screens, one entity each: `artifacts.rs`,
   `diff.rs`, `workflow.rs`, `gates.rs`, `settings.rs`. `mod.rs` owns the
   `Screen` vocabulary, the `ScreenRun` a screen is handed, and the two rules
   they all follow: `edit_permission` (the engine owns the folder while it
   drives) and `write_artifact`/`write_atomic_raw` (the only writers).
+- Sections and tabs are state, not routes: `Section` (Runs, Repos, About,
+  Settings) picks the rail's page, `RunTab` the open run's four screens and
+  `RepoTab` the repository's Gates and Workflow. The run's Workflow tab is
+  `ScreenRun::read_only` — a reading of the revision the run uses — and the
+  template is edited in Repos › Workflow, so a running run never reads a file
+  that changes under it.
 - `app.toml`, `version.toml`, `rust-toolchain.toml`, `scripts/version.py` and
   `.githooks/pre-commit` follow the family's rules; do not hand-edit a version.
 

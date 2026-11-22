@@ -29,26 +29,31 @@ cargo run -- --repo <path>     # the desktop app (repeat --repo per repository)
 cargo run --bin warp-flow-cli -- run <issue-dir>   # drive a run from a terminal
 ```
 
-The app is the process that drives a run. The board is the six lanes the issue
-folders fall into; opening a run shows its workflow as step bands with one lane
-per task, the task dependency strip, the attempt history and the open question.
-The run screen's actions start, pause, resume and abandon the engine, which
-blocks on a worker thread while the UI reads a snapshot from memory.
+The app is the process that drives a run, and it wears the suite's one shell:
+a 76 rail of sections, the 432 repository list, then the detail. The `Runs`
+section's detail holds the 320 run column — the board read downwards, one lane
+band per state the issue folders fall into — beside the open run. The `Repos`
+section holds the selected repository's gates and workflow template.
 
-A run has six screens, listed under the rail's `THIS RUN`:
+The rail is `Runs`, `Repos`, then `About` and `Settings` at its foot. Opening a
+run puts its four tabs in the run's head:
 
 | Screen | What it is |
 | --- | --- |
-| Run | the workflow, the task strip, the question, the engine's log, and the harness sessions each step recorded |
+| Run | the workflow as step bands, the task chips, the question, the attempt history, the engine's log and the harness sessions each step recorded |
 | Artifacts | the issue folder's documents, edited in place and saved atomically |
-| Task & diff | one task's file and the diff its branch carries against `main` |
-| Workflow | the graph as rows, saved as a new revision the engine reads at its next step boundary |
-| Repos & gates | the window's repositories and their `flow.toml` gates, with a gate you can run once |
-| Settings | reduce motion, where the app keeps its files, the door's state, the version |
+| Task & diff | the files the run wrote, conflicts first, the diff beside them, and the run's gates with the outcome each last produced |
+| Workflow | the revision the run uses, read-only: the template is edited in Repos › Workflow |
+
+`Repos` is the window a person edits: its `Gates` tab is the repository's
+`flow.toml` as a work list and one gate editor (run once, save, remove), and its
+`Workflow` tab is the step template with its revisions. `About` carries the
+installed family, the build and the license; `Settings` the reduce-motion
+switch, where the app keeps its files, the door's state and the version.
 
 The engine owns an issue folder while it drives a run: Artifacts refuses an
-edit then (one line says why), while Workflow and Repos & gates may save —
-their files are read at step boundaries, and both validate before writing.
+edit then (one line says why), while the repository's Workflow template may
+save — it is read at step boundaries, and it validates before writing.
 
 `warp-flow-cli` drives the same engine from a terminal (`run`, `status`,
 `answer`, `--dry-run`); it is a second binary of this package, not a separate

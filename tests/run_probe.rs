@@ -264,7 +264,6 @@ fn the_run_screen_shows_the_harness_sessions_newest_last(cx: &mut TestAppContext
     settle(cx);
 
     click(cx, "flow-card-repo-a-run-sessions");
-    click(cx, "flow-detail-open-run");
     assert!(cx.debug_bounds("flow-run-sessions").is_some());
 
     // a session per step, in the order they settled: analyze first, code last
@@ -344,14 +343,13 @@ fn the_run_screen_has_a_band_per_step_and_a_lane_per_task(cx: &mut TestAppContex
         cx.debug_bounds("flow-detail").is_some(),
         "the card still opens the detail pane"
     );
-    click(cx, "flow-detail-open-run");
     assert!(
         cx.debug_bounds("flow-run").is_some(),
         "Open run opens the run screen"
     );
     assert!(
-        cx.debug_bounds("flow-board").is_none(),
-        "the run screen replaces the board"
+        cx.debug_bounds("flow-board").is_some(),
+        "the run column stays beside the run, the board read downwards"
     );
     assert!(
         cx.debug_bounds("flow-run-workflow-note").is_none(),
@@ -531,7 +529,6 @@ fn answering_a_select_question_writes_the_file_and_the_scan_moves_the_run(cx: &m
     });
 
     click(cx, "flow-card-repo-a-run-answer");
-    click(cx, "flow-detail-open-run");
     assert!(
         cx.debug_bounds("flow-run-question").is_some(),
         "the open question is on the run screen"
@@ -584,7 +581,7 @@ fn answering_a_select_question_writes_the_file_and_the_scan_moves_the_run(cx: &m
 }
 
 #[gpui_kit::gpui::test]
-fn back_returns_to_the_board_with_the_run_selected(cx: &mut TestAppContext) {
+fn closing_the_run_returns_to_the_column_with_nothing_selected(cx: &mut TestAppContext) {
     let _guard = hold_home();
     let home = scratch_home("back");
     cx.update(gpui_kit::init);
@@ -610,104 +607,44 @@ fn back_returns_to_the_board_with_the_run_selected(cx: &mut TestAppContext) {
     settle(cx);
 
     click(cx, "flow-card-repo-a-run-back");
-    click(cx, "flow-detail-open-run");
     assert!(cx.debug_bounds("flow-run").is_some());
 
+    // the ✕ closes the run pane; the column it sits beside is still the window
     click(cx, "flow-run-back");
     assert!(
-        cx.debug_bounds("flow-run").is_none(),
-        "Back leaves the run screen"
+        cx.debug_bounds("flow-detail").is_none(),
+        "closing the run takes its pane away"
     );
     assert!(
         cx.debug_bounds("flow-board").is_some(),
-        "Back shows the board"
-    );
-    assert!(
-        cx.debug_bounds("flow-detail").is_some(),
-        "the run stays selected, so its detail pane is open"
+        "the run column is still there"
     );
     page.read_with(cx, |page, _| {
-        assert_eq!(
-            page.selected_run_for_probe().map(|key| key.id.as_str()),
-            Some("run-back"),
-            "the board selection survives Back"
-        );
+        assert!(page.selected_run_for_probe().is_none());
         assert!(page.run_screen_for_probe().is_none());
     });
 
-    // The keyboard path works the same way: Enter reopens it, Escape backs out.
+    // the keyboard path works the same way: Enter opens the run under the
+    // cursor, Escape closes it
+    let focus = page.read_with(cx, |page, _| page.board_focus_handle());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    settle(cx);
     cx.simulate_keystrokes("enter");
     settle(cx);
     assert!(
         cx.debug_bounds("flow-run").is_some(),
-        "Enter on the open pane reopens the run screen"
+        "Enter opens the run under the cursor"
     );
     cx.simulate_keystrokes("escape");
     settle(cx);
     assert!(
-        cx.debug_bounds("flow-run").is_none(),
-        "Escape leaves the run screen"
+        cx.debug_bounds("flow-detail").is_none(),
+        "Escape closes the run"
     );
     assert!(
         cx.debug_bounds("flow-board").is_some(),
-        "Escape returns to the board"
+        "Escape leaves the column"
     );
-
-    cleanup(home);
-}
-
-#[gpui_kit::gpui::test]
-fn a_missing_workflow_falls_back_to_the_log_steps(cx: &mut TestAppContext) {
-    let _guard = hold_home();
-    let home = scratch_home("fallback");
-    cx.update(gpui_kit::init);
-    cx.update(theme::apply_kit_theme);
-
-    let repo = seed_repo(&home, "repo-a");
-    seed_spec(
-        &repo,
-        "run-fallback",
-        "ready-for-agent",
-        "No graph",
-        "Body.",
-    );
-    seed_run(
-        &repo,
-        "run-fallback",
-        "running",
-        "code",
-        &[("analyze", "-", 1, "done"), ("code", "01", 1, "failed")],
-    );
-    seed_task(&repo, "run-fallback", 1, "One", "ready-for-agent", "None");
-
-    let (handle, _page) = open_app(cx, vec![repo]);
-    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
-    settle(cx);
-
-    click(cx, "flow-card-repo-a-run-fallback");
-    click(cx, "flow-detail-open-run");
-    assert!(
-        cx.debug_bounds("flow-run").is_some(),
-        "the run screen still opens without workflow.toml"
-    );
-    assert!(
-        cx.debug_bounds("flow-run-workflow-note").is_some(),
-        "the missing graph is stated in one line"
-    );
-    assert!(
-        cx.debug_bounds("flow-run-step-analyze").is_some(),
-        "the log's first step is a band"
-    );
-    assert!(
-        cx.debug_bounds("flow-run-step-code").is_some(),
-        "the log's second step is a band"
-    );
-    assert!(
-        cx.debug_bounds("flow-run-lane-code-01").is_none(),
-        "without a graph the fallback cannot invent per-task lanes"
-    );
-
-    cleanup(home);
 }
 
 #[gpui_kit::gpui::test]
@@ -746,7 +683,6 @@ fn a_multi_question_joins_the_ticked_options(cx: &mut TestAppContext) {
     settle(cx);
 
     click(cx, "flow-card-repo-a-run-multi");
-    click(cx, "flow-detail-open-run");
     click(cx, "flow-answer-option-0");
     click(cx, "flow-answer-option-2");
     click(cx, "flow-answer-submit");
@@ -803,7 +739,6 @@ fn an_approve_question_answers_yes_or_no(cx: &mut TestAppContext) {
     settle(cx);
 
     click(cx, "flow-card-repo-a-run-approve");
-    click(cx, "flow-detail-open-run");
     assert!(
         cx.debug_bounds("flow-answer-yes").is_some(),
         "an approve question offers Yes"
@@ -864,7 +799,6 @@ fn an_unknown_question_kind_falls_back_to_text(cx: &mut TestAppContext) {
     settle(cx);
 
     click(cx, "flow-card-repo-a-run-text");
-    click(cx, "flow-detail-open-run");
     assert!(
         cx.debug_bounds("flow-answer-field").is_some(),
         "an unknown kind renders the single-line field"

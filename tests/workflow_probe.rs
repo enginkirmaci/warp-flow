@@ -137,6 +137,7 @@ fn screen_run(repo: &Path) -> ScreenRun {
         run: Arc::new(run),
         repo: repo.to_path_buf(),
         driving: false,
+        read_only: false,
     }
 }
 
@@ -243,6 +244,63 @@ fn a_run_with_no_workflow_starts_from_the_shipped_shape(cx: &mut TestAppContext)
     let on_disk = Workflow::read(issue.join("workflow.toml")).expect("the editor created the file");
     assert_eq!(on_disk.steps.len(), 2);
     assert_eq!(on_disk.revision, 2, "a fresh graph starts at revision 1");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The repository's template is the editor's file: `Repos › Workflow` writes
+/// `<repo>/workflow.toml`, appends a revision, and never touches an issue
+/// folder's copy.
+#[gpui_kit::gpui::test]
+fn the_repository_template_is_what_the_repos_tab_edits(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("template");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    // the issue folder carries no copy: the template is the repository's own
+    let (repo, issue) = seed_repo(&home, Some(WORKFLOW));
+    std::fs::remove_file(issue.join("workflow.toml")).expect("the issue copy is gone");
+    std::fs::write(repo.join("workflow.toml"), WORKFLOW).expect("the repository template");
+
+    let host = Arc::new(Host::new());
+    let handle = cx.open_window(size(px(1200.), px(860.)), |_window, cx| {
+        let screen = cx.new(|cx| WorkflowScreen::new(Arc::clone(&host), cx));
+        screen.update(cx, |screen, cx| {
+            screen.show_repository(repo.clone(), cx);
+        });
+        ScreenHost(screen)
+    });
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    // the repository's revision is what the tab loaded
+    let graph = handle
+        .read_with(cx, |host, cx| host.0.read(cx).graph_for_probe().cloned())
+        .expect("the window is open")
+        .expect("the template loaded");
+    assert_eq!(graph.revision, 4);
+    assert!(cx.debug_bounds("flow-workflow-inspector").is_some());
+
+    // an edit, then a save: a save appends a revision to the repository's file,
+    // not to an issue copy
+    handle
+        .update(cx, |host, _, cx| {
+            host.0.update(cx, |screen, cx| {
+                let mut graph = screen.graph_for_probe().cloned().expect("the template");
+                // a real edit: one step stops running once per task
+                graph.steps[1].per_task = false;
+                screen.set_graph_for_probe(graph, cx);
+                screen.save_for_probe(cx);
+            });
+        })
+        .expect("the window is open");
+    settle(cx);
+    let saved = Workflow::read(repo.join("workflow.toml")).expect("the template reads");
+    assert_eq!(saved.revision, 5, "a save appends one revision");
+    assert!(
+        !issue.join("workflow.toml").exists(),
+        "the editor never writes an issue folder"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }

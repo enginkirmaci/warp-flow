@@ -96,7 +96,7 @@ fn click(cx: &mut VisualTestContext, name: &str) {
 }
 
 #[gpui_kit::gpui::test]
-fn a_runs_screens_are_reachable_from_the_rail(cx: &mut TestAppContext) {
+fn the_shell_routes_its_sections_and_a_runs_tabs(cx: &mut TestAppContext) {
     let _guard = hold_home();
     let home = scratch_home("routing");
     cx.update(gpui_kit::init);
@@ -107,52 +107,66 @@ fn a_runs_screens_are_reachable_from_the_rail(cx: &mut TestAppContext) {
     let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
     settle(cx);
 
-    // the board owns the window until a run is picked
+    // the run column owns the detail until a run is picked, and the two work
+    // sections are the rail's items
     assert!(cx.debug_bounds("flow-board").is_some());
     assert!(
-        cx.debug_bounds("flow-screen-nav").is_none(),
-        "the screen list belongs to the open run"
+        cx.debug_bounds("flow-detail").is_none(),
+        "no run is open before one is picked"
     );
+    for section in ["runs", "repos", "about", "settings"] {
+        assert!(
+            cx.debug_bounds(selector(&format!("flow-rail-{section}")))
+                .is_some(),
+            "{section} is a rail item"
+        );
+    }
 
-    // picking a run opens its detail pane and the rail's screen list
+    // picking a run opens its pane: the column stays, the four tabs appear
     click(cx, "flow-card-repo-a-demo-run");
     assert!(cx.debug_bounds("flow-detail").is_some());
     assert!(
-        cx.debug_bounds("flow-screen-nav").is_some(),
-        "a selected run offers its screens"
+        cx.debug_bounds("flow-board").is_some(),
+        "the run column stays beside the run"
     );
-
-    // every screen is a row, and a row shows its screen
-    for screen in ["run", "artifacts", "diff", "workflow", "gates", "settings"] {
+    for tab in ["run", "diff", "artifacts", "workflow"] {
         assert!(
-            cx.debug_bounds(selector(&format!("flow-nav-{screen}")))
+            cx.debug_bounds(selector(&format!("flow-nav-{tab}")))
                 .is_some(),
-            "{screen} is in the rail"
+            "{tab} is one of the run's tabs"
         );
     }
+
+    // a tab swaps the pane's body, never the column
     click(cx, "flow-nav-workflow");
+    settle(cx);
     assert!(
         cx.debug_bounds("flow-screen-workflow").is_some(),
-        "the workflow screen renders in the main area"
+        "the run's workflow tab renders in the pane"
     );
-    assert!(
-        cx.debug_bounds("flow-board").is_none(),
-        "the board is replaced, not covered"
-    );
-
-    // and the run screen is still the window's own, reached the same way
+    assert!(cx.debug_bounds("flow-board").is_some());
     click(cx, "flow-nav-run");
+    settle(cx);
     assert!(
-        cx.debug_bounds("flow-run-workflow").is_some(),
-        "the run screen draws its workflow"
+        cx.debug_bounds("flow-run").is_some(),
+        "the Run tab is the run's own screen"
     );
 
-    // Board takes the window back
-    click(cx, "flow-nav-board");
+    // the repository section shows the repository detail, and About and
+    // Settings are pages, not runs
+    click(cx, "flow-rail-repos");
+    assert!(cx.debug_bounds("flow-repo-detail").is_some());
+    click(cx, "flow-rail-settings");
+    assert!(cx.debug_bounds("flow-screen-settings").is_some());
+    click(cx, "flow-rail-about");
+    assert!(cx.debug_bounds("flow-about").is_some());
+
+    // and Runs brings the column back with the run still open
+    click(cx, "flow-rail-runs");
     assert!(cx.debug_bounds("flow-board").is_some());
     assert!(
         cx.debug_bounds("flow-detail").is_some(),
-        "the run stays selected"
+        "the run stays open across a trip through the rail"
     );
 
     let _ = std::fs::remove_dir_all(&home);
@@ -172,7 +186,6 @@ fn entering_a_run_still_opens_the_run_screen(cx: &mut TestAppContext) {
     settle(cx);
 
     click(cx, "flow-card-repo-a-demo-run");
-    click(cx, "flow-detail-open-run");
     assert!(
         cx.debug_bounds("flow-run-workflow").is_some(),
         "the detail pane's Open run still opens the run screen"

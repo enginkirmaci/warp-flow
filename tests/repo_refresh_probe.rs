@@ -124,9 +124,10 @@ fn a_repository_added_in_the_screen_reaches_the_board_at_once(cx: &mut TestAppCo
         "the second repository is not known yet"
     );
 
-    // select the first run and open the Repos & gates screen from the rail
+    // select the first run, then open the repository section from the rail: its
+    // Gates tab is the repository's flow.toml
     click(cx, "flow-card-repo-a-alpha-run");
-    click(cx, "flow-nav-gates");
+    click(cx, "flow-rail-repos");
     assert!(
         cx.debug_bounds("flow-gates-head").is_some(),
         "the gates screen is showing"
@@ -144,7 +145,7 @@ fn a_repository_added_in_the_screen_reaches_the_board_at_once(cx: &mut TestAppCo
     settle(cx);
 
     // the board, brought back by its rail row, has the new card
-    click(cx, "flow-nav-board");
+    click(cx, "flow-rail-runs");
     assert!(
         cx.debug_bounds("flow-card-repo-b-beta-run").is_some(),
         "the added repository's run is on the board"
@@ -161,7 +162,7 @@ fn a_repository_added_in_the_screen_reaches_the_board_at_once(cx: &mut TestAppCo
 
     // removing it takes its run off the board and closes its screen
     click(cx, "flow-card-repo-b-beta-run");
-    click(cx, "flow-nav-gates");
+    click(cx, "flow-rail-repos");
     handle
         .update(cx, |app, _window, cx| {
             app.screens_for_probe()
@@ -184,6 +185,9 @@ fn a_repository_added_in_the_screen_reaches_the_board_at_once(cx: &mut TestAppCo
         .expect("the window is open");
     assert_eq!(screen, None, "the removed run's screen is closed");
     assert_eq!(selected, None, "and nothing keeps it selected");
+    // the run column is the Runs section's, so walk back to it before reading
+    // which rows the scan holds
+    click(cx, "flow-rail-runs");
     assert!(
         cx.debug_bounds("flow-card-repo-b-beta-run").is_none(),
         "the removed repository's card is gone"

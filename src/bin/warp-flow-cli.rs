@@ -83,6 +83,9 @@ fn command_run(args: &[String]) -> Result<u8, String> {
     prepared
         .require_clean()
         .map_err(|error| error.to_string())?;
+    // the repository's template is pinned into the issue folder, so this run
+    // reads the revision it started on
+    prepared.pin_workflow().map_err(|error| error.to_string())?;
 
     let harness = DoorHarness::local().map_err(|error| error.to_string())?;
     let mut config = prepared.config(harness, Box::new(StderrLog), Box::new(KeepGoing));

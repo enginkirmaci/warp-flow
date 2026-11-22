@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use warp_flow_core::artifact::{Document, Issue, Status, Task};
@@ -29,7 +29,7 @@ pub const MAX_LOG_ROWS: usize = 8;
 
 /// `~/.warp/flow/settings.json`: the remembered repositories. The platform
 /// store adds `schema_version`; this is the whole typed document.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Repositories the app shows, in the order the owner added them.
@@ -38,6 +38,13 @@ pub struct Settings {
     /// unless a person (or the desktop) turns it off. Additive, so an older
     /// document without the key reads as `false`.
     pub reduce_motion: bool,
+    /// Repositories the owner starred. The list shows them in a Favorites band
+    /// above the rest, and nothing else changes: a favorite is a shortcut, not
+    /// a filter.
+    pub favorites: Vec<PathBuf>,
+    /// The list pane's dragged width, when the owner moved it. `None` is the
+    /// design's 432; the shell clamps whatever is stored.
+    pub list_width: Option<f32>,
 }
 
 impl Settings {
@@ -69,6 +76,29 @@ impl Settings {
             }
         }
         changed
+    }
+
+    /// Whether `path` is starred.
+    pub fn is_favorite(&self, path: &Path) -> bool {
+        self.favorites.iter().any(|favorite| favorite == path)
+    }
+
+    /// Star or unstar `path`. Returns whether the document changed.
+    pub fn toggle_favorite(&mut self, path: &Path) -> bool {
+        let path = absolute(path);
+        match self.favorites.iter().position(|favorite| *favorite == path) {
+            Some(index) => {
+                self.favorites.remove(index);
+            }
+            None => self.favorites.push(path),
+        }
+        true
+    }
+
+    /// Forget a repository, dropping its star with it.
+    pub fn forget(&mut self, path: &Path) {
+        self.repos.retain(|repo| repo != path);
+        self.favorites.retain(|favorite| favorite != path);
     }
 }
 
@@ -126,7 +156,25 @@ impl Column {
             Self::Running => "Running",
             Self::Waiting => "Waiting on you",
             Self::Blocked => "Blocked",
-            Self::Merged => "Merged",
+            // the design's word: a run that landed, not a merged branch
+            Self::Merged => "Landed",
+        }
+    }
+
+    /// The lane band's dot and count take a hue only where a person is needed:
+    /// Waiting on you takes `changes`, Blocked takes `danger`, and the rest stay
+    /// quiet because they are not wrong, they only wait.
+    pub fn is_attention(self) -> bool {
+        matches!(self, Self::Waiting | Self::Blocked)
+    }
+
+    /// The word a run row's state pill uses, when a surface has no lane band to
+    /// read the state from.
+    pub fn state_word(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting on you",
+            Self::Merged => "landed",
+            other => other.label(),
         }
     }
 
@@ -147,6 +195,54 @@ impl Column {
             "blocked" | "abandoned" | "wontfix" => Self::Blocked,
             "done" | "merged" => Self::Merged,
             _ => Self::Triage,
+        }
+    }
+}
+
+/// Which runs the run column shows. The design's filter menu: `All runs`,
+/// `Needs you`, `Running`, `Landed`, and a way back to all of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunFilter {
+    #[default]
+    All,
+    Need,
+    Running,
+    Landed,
+}
+
+impl RunFilter {
+    /// Every filter, in the menu's order.
+    pub const ALL: [Self; 4] = [Self::All, Self::Need, Self::Running, Self::Landed];
+
+    /// A stable key for debug selectors and state.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Need => "need",
+            Self::Running => "running",
+            Self::Landed => "landed",
+        }
+    }
+
+    /// The menu row's word.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All runs",
+            Self::Need => "Needs you",
+            Self::Running => "Running",
+            Self::Landed => "Landed",
+        }
+    }
+
+    /// Whether a run in `column` passes this filter. "Needs you" is the two
+    /// lanes that take a hue.
+    pub fn passes(self, column: Column) -> bool {
+        match self {
+            Self::All => true,
+            Self::Need => column.is_attention(),
+            Self::Running => column == Column::Running,
+            Self::Landed => column == Column::Merged,
         }
     }
 }
@@ -304,8 +400,11 @@ pub struct Run {
     pub open_questions: Vec<Question>,
     /// Every row of `run.md`'s log table, oldest first.
     pub rows: Vec<RunRow>,
-    /// `workflow.toml`, when the issue folder carries one it could read.
+    /// `workflow.toml`, whichever copy this run reads: its own, or the
+    /// repository's template when the folder carries none.
     pub graph: Option<Workflow>,
+    /// The file the graph was read from, so the screen names it.
+    pub workflow_path: Option<PathBuf>,
     /// Why `workflow.toml` could not be read, for the run screen's one line.
     pub workflow_note: Option<String>,
     /// The workflow's steps in topological order, or the log's steps when the
@@ -320,6 +419,34 @@ pub struct Run {
     pub sessions: Vec<Session>,
     /// The first artifact problem found while scanning this folder.
     pub note: Option<String>,
+    /// When the folder last changed: the age the run row and the run strip
+    /// show. `run.md`'s own timestamp when it exists, else the folder's.
+    pub updated: Option<SystemTime>,
+}
+
+impl Run {
+    /// The age of the run's newest write in the row's short form: `now`, `3m`,
+    /// `2h`, `5d`. `None` when the folder's timestamp cannot be read.
+    pub fn age(&self) -> Option<String> {
+        age_words(self.updated)
+    }
+
+    /// Whether this run is in one of the two states that need a person.
+    pub fn needs_attention(&self) -> bool {
+        self.column.is_attention()
+    }
+}
+
+/// A timestamp as a row shows it: `now`, `3m`, `2h`, `5d`.
+pub fn age_words(at: Option<SystemTime>) -> Option<String> {
+    let elapsed = at?.elapsed().ok()?;
+    let seconds = elapsed.as_secs();
+    Some(match seconds {
+        0..=59 => "now".to_owned(),
+        60..=3_599 => format!("{}m", seconds / 60),
+        3_600..=86_399 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
+    })
 }
 
 /// One harness session a step recorded, read from `sessions/<step>[-task-NN].md`.
@@ -362,6 +489,49 @@ pub struct RepoView {
     pub runs: Vec<Run>,
 }
 
+impl RepoView {
+    /// Runs per state in the design's summary order: the two that need a
+    /// person first, then running, landed, and the quiet lanes last.
+    pub fn state_counts(&self) -> Vec<(Column, usize)> {
+        const ORDER: [Column; 6] = [
+            Column::Waiting,
+            Column::Blocked,
+            Column::Running,
+            Column::Merged,
+            Column::Ready,
+            Column::Triage,
+        ];
+        ORDER
+            .into_iter()
+            .map(|column| {
+                let count = self.runs.iter().filter(|run| run.column == column).count();
+                (column, count)
+            })
+            .filter(|(_, count)| *count > 0)
+            .collect()
+    }
+
+    /// The summary the repository row's second line shows: at most three
+    /// states, waiting and blocked first.
+    pub fn summary(&self) -> Vec<(Column, usize)> {
+        self.state_counts().into_iter().take(3).collect()
+    }
+
+    /// How many runs in this repository need a person.
+    pub fn needs_attention(&self) -> usize {
+        self.runs.iter().filter(|run| run.needs_attention()).count()
+    }
+
+    /// The age of this repository's newest run, for the row's right edge.
+    pub fn newest_age(&self) -> Option<String> {
+        self.runs
+            .iter()
+            .filter_map(|run| run.updated)
+            .max()
+            .and_then(|at| age_words(Some(at)))
+    }
+}
+
 /// One scan of every configured repository. Equality is what keeps an
 /// unchanged poll from repainting the window.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -397,6 +567,28 @@ impl Snapshot {
     pub fn waiting_count(&self, repo: Option<&Path>) -> usize {
         self.runs_for(repo)
             .filter(|run| run.column == Column::Waiting)
+            .count()
+    }
+
+    /// How many runs in the selected scope are running right now.
+    pub fn running_count(&self, repo: Option<&Path>) -> usize {
+        self.runs_for(repo)
+            .filter(|run| run.column == Column::Running)
+            .count()
+    }
+
+    /// How many runs in the selected scope landed.
+    pub fn landed_count(&self, repo: Option<&Path>) -> usize {
+        self.runs_for(repo)
+            .filter(|run| run.column == Column::Merged)
+            .count()
+    }
+
+    /// How many runs in the selected scope need a person: waiting on you or
+    /// blocked, the two lanes that take a hue.
+    pub fn need_you_count(&self, repo: Option<&Path>) -> usize {
+        self.runs_for(repo)
+            .filter(|run| run.needs_attention())
             .count()
     }
 
@@ -437,7 +629,7 @@ fn scan_repo(path: &Path) -> RepoView {
                 if !dir.is_dir() || !is_issue_folder(&dir) {
                     continue;
                 }
-                runs.push(scan_run(&dir, path, note.as_deref()));
+                runs.push(scan_run(&dir, path, root.as_deref(), note.as_deref()));
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -468,7 +660,12 @@ fn is_issue_folder(dir: &Path) -> bool {
         || dir.join("workflow.toml").is_file()
 }
 
-fn scan_run(dir: &Path, repo_path: &Path, repo_note: Option<&str>) -> Run {
+fn scan_run(
+    dir: &Path,
+    repo_path: &Path,
+    repo_root: Option<&Path>,
+    repo_note: Option<&str>,
+) -> Run {
     let dir = &canonical_dir(dir);
     let id = folder_name(dir);
     // The repository's note (not a git checkout, an unreadable `.scratch/`) is
@@ -508,7 +705,9 @@ fn scan_run(dir: &Path, repo_path: &Path, repo_note: Option<&str>) -> Run {
     // workflow.toml: the graph the run screen draws. A missing or unreadable
     // copy is a note and a log-only fallback, never a failed scan.
     let mut workflow_note = None;
-    let graph = read_workflow(dir, &mut workflow_note);
+    let workflow_read = read_workflow(dir, repo_root, &mut workflow_note);
+    let workflow_path = workflow_read.as_ref().map(|(_, path)| path.clone());
+    let graph = workflow_read.map(|(workflow, _)| workflow);
     let workflow = workflow_name(run_doc.as_ref())
         .or_else(|| {
             graph
@@ -550,13 +749,21 @@ fn scan_run(dir: &Path, repo_path: &Path, repo_note: Option<&str>) -> Run {
         open_questions,
         rows,
         graph,
+        workflow_path,
         workflow_note,
         steps,
         spec,
         tasks: tasks_markdown,
         sessions,
         note,
+        // the age a row shows: `run.md`'s own write, else the folder's
+        updated: modified_at(&dir.join("run.md")).or_else(|| modified_at(dir)),
     }
+}
+
+/// A path's last write, when the filesystem reports one.
+fn modified_at(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).and_then(|meta| meta.modified()).ok()
 }
 
 /// A parsed artifact: the body the detail renders and, when the file has one,
@@ -614,10 +821,25 @@ fn workflow_name(document: Option<&DocView>) -> Option<String> {
 
 /// Read `<issue>/workflow.toml`. A missing or unreadable copy is a note and a
 /// log-only fallback, never a failed scan.
-fn read_workflow(dir: &Path, note: &mut Option<String>) -> Option<Workflow> {
-    let path = dir.join("workflow.toml");
+fn read_workflow(
+    dir: &Path,
+    root: Option<&Path>,
+    note: &mut Option<String>,
+) -> Option<(Workflow, PathBuf)> {
+    // The run's own copy first: that is the revision it started on. A folder
+    // that carries none reads the repository's template, which is what a run
+    // started by hand or by the CLI uses.
+    let copy = dir.join("workflow.toml");
+    let path = if copy.is_file() {
+        copy
+    } else {
+        match root.map(|root| root.join("workflow.toml")) {
+            Some(template) if template.is_file() => template,
+            _ => copy,
+        }
+    };
     match Workflow::read(&path) {
-        Ok(workflow) => Some(workflow),
+        Ok(workflow) => Some((workflow, path)),
         Err(_) => {
             // The screen states this in one line; a TOML error's own text can
             // span several, so it is not carried into the row.
@@ -1373,8 +1595,9 @@ produces = "spec.md"
         .expect("workflow.toml");
 
         let mut note = None;
-        let workflow = read_workflow(&dir, &mut note).expect("the workflow reads");
+        let (workflow, path) = read_workflow(&dir, None, &mut note).expect("the workflow reads");
         assert_eq!(note, None);
+        assert_eq!(path, dir.join("workflow.toml"));
         assert_eq!(workflow.name, "implement");
         let ids: Vec<&str> = topological_steps(&workflow)
             .iter()
@@ -1389,7 +1612,7 @@ produces = "spec.md"
     fn a_missing_workflow_is_one_note_not_a_failure() {
         let dir = scratch_dir("no-workflow");
         let mut note = None;
-        let workflow = read_workflow(&dir, &mut note);
+        let workflow = read_workflow(&dir, None, &mut note);
         assert!(workflow.is_none());
         assert!(
             note.as_deref().is_some_and(|note| note.contains("missing")),
