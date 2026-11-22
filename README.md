@@ -9,8 +9,10 @@ Every step that needs judgement is a coding-agent session on
 itself never calls a model. The record lives in the target repository as
 markdown under `.scratch/<feature-slug>/`.
 
-The design, its decisions and the build order are
-`plans/warp-flow.md` in [warp-suite](https://github.com/enginkirmaci/warp-suite).
+The design, its decisions and the build order are in
+[`plans/warp-flow.md`](plans/warp-flow.md); the engine's ADRs are in
+[`docs/adr/`](docs/adr/), and the family's contract decisions stay in
+[warp-suite](https://github.com/enginkirmaci/warp-suite/tree/main/docs/adr).
 
 ## Install
 
