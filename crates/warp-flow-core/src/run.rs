@@ -861,13 +861,24 @@ impl<H: Harness> Runner<H> {
                     return Ok(StepRun::Done);
                 }
                 MergeOutcome::NothingToDo => {
-                    self.record_row(step, Some(task), attempt, "merged")?;
-                    self.resolve_task(task.number)?;
-                    self.commit_issue(&format!("flow: resolve task {:02}", task.number))?;
-                    let line =
-                        format!("{label} attempt {attempt}: branch already in main; task resolved");
-                    self.log_line(&line);
-                    return Ok(StepRun::Done);
+                    // An empty branch is not a merge: the task landed nothing,
+                    // so resolving it would close the run on work that does not
+                    // exist. The likeliest cause is a task whose files live in
+                    // another checkout, so the summary names the repository the
+                    // queue measured.
+                    let failure = Failure {
+                        outcome: "empty",
+                        summary: format!(
+                            "task {:02}'s branch has no commits to merge into `{}`; the `code` \
+                             step committed nothing there",
+                            task.number,
+                            repo.root.display()
+                        ),
+                        detail: None,
+                    };
+                    if self.register_failure(step, Some(task), attempt, &failure)? {
+                        return Ok(StepRun::Blocked);
+                    }
                 }
                 MergeOutcome::Conflicted { files } => {
                     let summary = if files.is_empty() {
@@ -1943,6 +1954,71 @@ depends_on = ["code"]
         assert_eq!(calls.len(), 2, "analyze then code");
         assert_eq!(calls[1].step.id, "code");
         assert_eq!(calls[1].workdir, worktree.path);
+    }
+
+    #[test]
+    fn an_empty_task_branch_blocks_instead_of_resolving() {
+        let dir = TempDir::new();
+        let root = repository(&dir);
+        let issue = issue_in(&root);
+
+        let repo = Repo::open(&root).expect("repo opens");
+        // The worktree exists and the code step committed nothing into it: the
+        // branch is still at `main`, which is what a task pointing at another
+        // checkout looks like from this repository.
+        TaskWorktree::create(
+            &repo,
+            Issue::open(&issue)
+                .expect("issue opens")
+                .task(1)
+                .expect("task 1"),
+        )
+        .expect("worktree created");
+
+        let mut harness = FakeHarness::new();
+        harness.script(
+            "analyze",
+            Scripted::Done {
+                files: vec![(issue.join("spec.md"), "# Spec\n".to_owned())],
+                text: "analyzed".to_owned(),
+            },
+        );
+        harness.script(
+            "code",
+            Scripted::Done {
+                files: Vec::new(),
+                text: "coded".to_owned(),
+            },
+        );
+
+        let workflow = Workflow::parse(MERGE_WORKFLOW).expect("workflow parses");
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.workdir = root.clone();
+        config.repo = Some(repo);
+        config.max_attempts = 1;
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Blocked);
+
+        let opened = Issue::open(&issue).expect("issue reopens");
+        assert_eq!(
+            opened.task(1).expect("task 1").status,
+            Status::ReadyForAgent,
+            "nothing landed, so the task must not resolve"
+        );
+        let document = run_md(&issue);
+        assert!(
+            document.body.contains("| merge | 01 | 1 | empty |"),
+            "{}",
+            document.body
+        );
+        let repair = fs::read_to_string(issue.join("repairs/01.md")).expect("repair written");
+        assert!(repair.contains("has no commits to merge"), "{repair}");
+        assert!(
+            repair.contains(&root.display().to_string()),
+            "the summary names the repository it measured: {repair}"
+        );
     }
 
     /// A test harness that acts like a real coding session: it writes its work

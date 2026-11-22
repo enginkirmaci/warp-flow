@@ -72,8 +72,12 @@ pub enum MergeOutcome {
     /// The main checkout has uncommitted changes, so the queue refuses to
     /// start.
     DirtyMain,
-    /// The task branch has no commits that `main` lacks, so there is nothing
-    /// to merge.
+    /// The task branch has no commits that `main` lacks, so the queue has
+    /// nothing to merge.
+    ///
+    /// The runner reads this as a failed attempt, never as a landed task: a
+    /// task that resolves on an empty branch closes a run on work that does not
+    /// exist.
     NothingToDo,
 }
 

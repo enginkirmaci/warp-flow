@@ -76,6 +76,10 @@ withdraws the door and asks a blocking engine to stop.
   before a merge attempt, and `flow: resolve task NN` after a task lands. It
   never force-pushes and never touches another path on `main`.
 - A dirty working tree is a refusal to start, not a warning.
+- Only a merge that lands a commit resolves a task. A task branch with nothing
+  on it is a failed attempt with a repair that names the repository the queue
+  measured, because an empty branch usually means the `code` step committed
+  into another checkout.
 
 ## Tests
 
