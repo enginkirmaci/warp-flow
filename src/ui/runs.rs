@@ -728,11 +728,12 @@ impl FlowApp {
 
         let run_id = run.key.id.clone();
         menu = menu.child(
-            menu_row(
+            menu_row_with_keys(
                 "flow-run-menu-copy-id",
                 "Copy run id",
                 "icons/icon-copy.svg",
                 theme::text_dim(),
+                Some("C"),
             )
             .on_click(cx.listener(move |_, _, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(run_id.clone()));
@@ -854,6 +855,14 @@ impl FlowApp {
         if armed {
             abandon = abandon.bg(theme::danger_bg());
         }
+        // a landed or abandoned run has nothing to abandon: the row is left out
+        // rather than refused
+        if matches!(
+            run.status.as_str(),
+            "done" | "merged" | "abandoned" | "wontfix"
+        ) {
+            return menu.into_any_element();
+        }
         menu.child(abandon).into_any_element()
     }
 
@@ -871,10 +880,21 @@ impl FlowApp {
             }
             return;
         }
-        // the two keys the column answers beyond the list map: Escape hands the
-        // keyboard back to the repository list
+        // the two keys the column answers beyond the list map: Escape closes
+        // the run, and `C` copies the cursor's run id — the keycap the ⋯ menu
+        // shows on `Copy run id`
         if event.keystroke.key == "escape" {
             self.close_detail(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if event.keystroke.key == "c"
+            && !event.keystroke.modifiers.control
+            && !event.keystroke.modifiers.alt
+            && !event.keystroke.modifiers.platform
+            && let Some(key) = self.cursor.clone()
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(key.id));
             cx.stop_propagation();
         }
     }
@@ -1029,6 +1049,19 @@ fn menu_row(
     glyph: &str,
     ink: gpui::Rgba,
 ) -> gpui::Stateful<gpui::Div> {
+    menu_row_with_keys(selector, label, glyph, ink, None)
+}
+
+/// A menu row with the shortcut it answers to at its right edge, as a keycap.
+/// Only rows the app really binds pass one: a keycap that does nothing is worse
+/// than no keycap.
+fn menu_row_with_keys(
+    selector: &str,
+    label: &str,
+    glyph: &str,
+    ink: gpui::Rgba,
+    keys: Option<&'static str>,
+) -> gpui::Stateful<gpui::Div> {
     let selector = selector.to_owned();
     let debug_selector = selector.clone();
     let label = label.to_owned();
@@ -1060,6 +1093,23 @@ fn menu_row(
                 .child(icon(glyph, px(theme::icon_small()), ink)),
         )
         .child(div().flex_1().min_w_0().truncate().child(label))
+        .children(keys.map(|keys| {
+            div()
+                .flex_shrink_0()
+                .h(px(18.))
+                .px(px(5.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.))
+                .border_1()
+                .border_color(theme::line_strong())
+                .bg(theme::well())
+                .text_size(px(theme::font_micro()))
+                .font_weight(FontWeight::NORMAL)
+                .text_color(theme::text_muted())
+                .child(keys)
+        }))
 }
 
 /// The one state action the ⋯ menu offers a run.
@@ -1080,7 +1130,9 @@ fn run_menu_state(run: &Run, driving: bool) -> Option<RunStateAction> {
     ) {
         return None;
     }
-    if driving || run.column == Column::Running {
+    // `Host::pause` stops a worker this window started: a run another window
+    // drives has nothing here to pause, so the row is left out
+    if driving {
         return Some(RunStateAction::Pause);
     }
     if run.column == Column::Blocked {
@@ -1164,5 +1216,61 @@ pub(crate) fn plural(count: usize, word: &str) -> String {
         word.to_owned()
     } else {
         format!("{word}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Column, Run, RunKey};
+
+    fn run(status: &str, column: Column) -> Run {
+        Run {
+            key: RunKey {
+                repo: std::path::PathBuf::from("/tmp/repo"),
+                id: "demo".to_owned(),
+            },
+            dir: std::path::PathBuf::from("/tmp/repo/.scratch/demo"),
+            has_run: true,
+            title: "Demo".to_owned(),
+            column,
+            status: status.to_owned(),
+            step: "code".to_owned(),
+            workflow: "implement@3".to_owned(),
+            attempts: 1,
+            tasks_total: 0,
+            tasks_done: 0,
+            task_rows: Vec::new(),
+            task_levels: Vec::new(),
+            question: None,
+            open_questions: Vec::new(),
+            rows: Vec::new(),
+            graph: None,
+            workflow_path: None,
+            workflow_note: None,
+            steps: Vec::new(),
+            spec: String::new(),
+            tasks: String::new(),
+            sessions: Vec::new(),
+            note: None,
+            updated: None,
+        }
+    }
+
+    /// The ⋯ menu offers exactly one state row, and only one this window can
+    /// actually perform: a run another window drives has nothing to pause here,
+    /// and a landed run has nothing to abandon.
+    #[test]
+    fn the_state_row_is_the_move_this_window_can_make() {
+        assert!(run_menu_state(&run("running", Column::Running), true).is_some());
+        assert!(
+            run_menu_state(&run("running", Column::Running), false).is_none(),
+            "a run another window drives cannot be paused from this one"
+        );
+        assert!(run_menu_state(&run("blocked", Column::Blocked), false).is_some());
+        assert!(run_menu_state(&run("paused", Column::Waiting), false).is_some());
+        assert!(run_menu_state(&run("needs-triage", Column::Triage), false).is_none());
+        assert!(run_menu_state(&run("merged", Column::Merged), false).is_none());
+        assert!(run_menu_state(&run("done", Column::Merged), false).is_none());
     }
 }

@@ -10,11 +10,17 @@
 //! background scan replaces it with the siblings that answer `--version`.
 
 use gpui::prelude::*;
-use gpui::{AnyElement, App, ClickEvent, ClipboardItem, Context, Entity, Global, Window};
+use gpui::{
+    AnyElement, App, ClickEvent, ClipboardItem, Context, Entity, Global, SharedString, Window,
+};
 use warpui_kit_core::about::{self, AppId, Member};
 use warpui_kit_core::shell;
 
 use crate::ui::window::FlowApp;
+
+/// This app's own license, shown by the Legal card's View license in the
+/// family's modal rather than sent to the browser.
+const LICENSE: &str = include_str!("../../LICENSE");
 
 /// What About holds between frames: the selected member and the installed
 /// family.
@@ -71,7 +77,11 @@ impl FlowApp {
     /// from the build facts, the siblings from the one background scan), the
     /// selected one's identity, Build and Legal cards in the detail. It opens
     /// on Flow, the app you are in.
-    pub(crate) fn render_about(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_about(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let current = AppId::Flow;
         let state = about_state(cx);
         let (selected, members) = {
@@ -79,6 +89,14 @@ impl FlowApp {
             (state.selected, state.members.clone())
         };
         let width = shell::clamp_list_width(self.list_width);
+
+        if self.about_license.is_none() {
+            self.about_license = Some(warpui_kit_markdown::read_only_document(
+                SharedString::from(LICENSE),
+                window,
+                cx,
+            ));
+        }
 
         let entity = cx.entity();
         let pick_state = state.clone();
@@ -93,7 +111,16 @@ impl FlowApp {
                 apply_action(action, &act_state, cx);
             };
         let open_state = state;
+        let license_app = entity.clone();
         let on_link = move |link: about::Link, _: &ClickEvent, _: &mut Window, cx: &mut App| {
+            if link == about::Link::License {
+                // the family's modal, not a browser tab
+                license_app.update(cx, |this, cx| {
+                    this.about_license_open = true;
+                    cx.notify();
+                });
+                return;
+            }
             let selected = open_state.read(cx).selected;
             cx.open_url(&link.url(about::app(selected)));
         };

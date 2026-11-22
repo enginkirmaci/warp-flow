@@ -486,6 +486,9 @@ pub struct RepoView {
     pub dirty: bool,
     /// Why the repository or its `.scratch/` could not be read.
     pub note: Option<String>,
+    /// How many gates the repository's `flow.toml` defines. The Repos list
+    /// counts them the way a person reads the file, without opening it.
+    pub gates: usize,
     pub runs: Vec<Run>,
 }
 
@@ -619,6 +622,11 @@ fn scan_repo(path: &Path) -> RepoView {
     };
     let scan_root = root.clone().unwrap_or_else(|| path.to_path_buf());
     let dirty = root.as_deref().is_some_and(git_dirty);
+    // the repository's own gates, read once per scan: the Repos list shows the
+    // count, and a bad file is a note on the rows rather than a failed scan
+    let gates = warp_flow_core::config::FlowConfig::read(scan_root.join("flow.toml"))
+        .map(|config| config.gates_in_order().len())
+        .unwrap_or(0);
 
     let scratch = scan_root.join(".scratch");
     let mut runs = Vec::new();
@@ -645,6 +653,7 @@ fn scan_repo(path: &Path) -> RepoView {
         root,
         dirty,
         note,
+        gates,
         runs,
     }
 }
@@ -1618,6 +1627,32 @@ produces = "spec.md"
             note.as_deref().is_some_and(|note| note.contains("missing")),
             "{note:?}"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The Repos list counts a repository's gates without opening the file: the
+    /// scan reads `flow.toml` once and the row says how many steps will run.
+    #[test]
+    fn a_repository_counts_the_gates_its_flow_file_defines() {
+        let dir = scratch_dir("gates-count");
+        fs::create_dir_all(dir.join(".scratch")).expect("scratch");
+        fs::write(
+            dir.join("flow.toml"),
+            "schema = 1\n\n[merge]\nmode = \"local\"\npush = false\n\n\
+             [[gate]]\nname = \"fmt\"\ncommand = \"cargo fmt --check\"\n\n\
+             [[gate]]\nname = \"test\"\ncommand = \"cargo test\"\n",
+        )
+        .expect("flow.toml");
+
+        let snapshot = scan(std::slice::from_ref(&dir));
+        assert_eq!(snapshot.repos.len(), 1);
+        assert_eq!(snapshot.repos[0].gates, 2, "both gates are counted");
+
+        // a repository with no flow.toml is a zero, not a failure
+        fs::remove_file(dir.join("flow.toml")).expect("remove flow.toml");
+        let snapshot = scan(std::slice::from_ref(&dir));
+        assert_eq!(snapshot.repos[0].gates, 0);
+
         let _ = fs::remove_dir_all(dir);
     }
 

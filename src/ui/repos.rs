@@ -135,7 +135,12 @@ impl FlowApp {
                             .child(div().child("·"))
                     })
                     .child(if self.section == Section::Repos {
-                        format!("{repositories} {}", plural(repositories, "repository"))
+                        let gates: usize = self.snapshot.repos.iter().map(|repo| repo.gates).sum();
+                        format!(
+                            "{repositories} {} · {gates} {}",
+                            plural(repositories, "repository"),
+                            plural(gates, "gate")
+                        )
                     } else {
                         format!("{runs} {}", plural(runs, "run"))
                     }),
@@ -143,8 +148,33 @@ impl FlowApp {
 
         shell::list_pane(width)
             .debug_selector(|| "flow-list".into())
+            .relative()
             .child(head)
             .child(rows)
+            // the pane's edge: drag it between 320 and 560, and the width is
+            // remembered on release
+            .child(
+                div()
+                    .id("flow-list-resize")
+                    .debug_selector(|| "flow-list-resize".into())
+                    .role(gpui::Role::Splitter)
+                    .aria_label("Resize the list")
+                    .cursor_col_resize()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right(px(-3.))
+                    .w(px(6.))
+                    .occlude()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.list_resizing = true;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -321,7 +351,11 @@ impl FlowApp {
                         )
                     }),
             )
-            .child(stats_line(repo.summary()));
+            .child(if self.section == Section::Repos {
+                repo_facts_line(repo)
+            } else {
+                stats_line(repo.summary())
+            });
         row = row.child(hover_station(
             &format!("flow-repo-station-{}", repo.name),
             Some(path),
@@ -368,6 +402,44 @@ fn repo_row_frame(id: impl Into<gpui::ElementId>, selected: bool) -> gpui::State
         row = row.hover(|style| style.bg(theme::panel()));
     }
     row
+}
+
+/// The Repos section's second line: the repository's own path and how many gates
+/// its `flow.toml` defines. A repository row in that section is a place, not a
+/// run count, so it reads the way `Repos › Gates` will open.
+fn repo_facts_line(repo: &store::RepoView) -> AnyElement {
+    let path = repo
+        .root
+        .as_deref()
+        .map(store::display_path)
+        .unwrap_or_else(|| store::display_path(&repo.path));
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .pl(px(28.))
+        .min_w_0()
+        .text_size(px(theme::font_meta()))
+        .text_color(theme::text_muted())
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .font_family(theme::code_font())
+                .child(path),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_color(theme::line_strong())
+                .child("·"),
+        )
+        .child(div().flex_shrink_0().child(format!(
+            "{} {}",
+            repo.gates,
+            plural(repo.gates, "gate")
+        )))
+        .into_any_element()
 }
 
 /// The second line: at most three states with their counts, waiting and blocked

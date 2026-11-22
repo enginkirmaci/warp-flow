@@ -823,3 +823,38 @@ fn an_unknown_question_kind_falls_back_to_text(cx: &mut TestAppContext) {
 
     cleanup(home);
 }
+
+/// The ⋯ menu's `Copy run id` keycap is honest: the column really answers `C`
+/// with the cursor's run id on the clipboard.
+#[gpui_kit::gpui::test]
+fn c_copies_the_cursors_run_id(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("copy-key");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+
+    let repo = seed_repo(&home, "repo-a");
+    seed_spec(&repo, "run-copy", "ready-for-agent", "Copy me", "Body.");
+    seed_run(
+        &repo,
+        "run-copy",
+        "running",
+        "code",
+        &[("code", "-", 1, "running")],
+    );
+
+    let (handle, page) = open_app(cx, vec![repo]);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    cx.update(|window, _| window.activate_window());
+    settle(cx);
+    let focus = page.read_with(cx, |page, _| page.board_focus_handle());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    settle(cx);
+
+    cx.simulate_keystrokes("c");
+    settle(cx);
+    let copied = cx.read_from_clipboard().and_then(|item| item.text());
+    assert_eq!(copied.as_deref(), Some("run-copy"));
+
+    let _ = std::fs::remove_dir_all(&home);
+}

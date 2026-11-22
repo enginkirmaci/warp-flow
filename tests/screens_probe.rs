@@ -158,8 +158,32 @@ fn the_shell_routes_its_sections_and_a_runs_tabs(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("flow-repo-detail").is_some());
     click(cx, "flow-rail-settings");
     assert!(cx.debug_bounds("flow-screen-settings").is_some());
+    // the section's list picks one group, and the detail shows only that one
+    assert!(cx.debug_bounds("flow-settings-appearance").is_some());
+    assert!(cx.debug_bounds("settings-row-text-size").is_some());
+    assert!(
+        cx.debug_bounds("settings-row-folder").is_none(),
+        "the Files group is not on the Appearance page"
+    );
+    click(cx, "flow-settings-files");
+    assert!(cx.debug_bounds("settings-row-folder").is_some());
+    assert!(
+        cx.debug_bounds("settings-row-text-size").is_none(),
+        "Appearance left with its group"
+    );
     click(cx, "flow-rail-about");
     assert!(cx.debug_bounds("flow-about").is_some());
+    // the Legal card's View license opens the family's modal, not a browser tab
+    click(cx, "about-link-license");
+    assert!(
+        cx.debug_bounds("about-license-dialog").is_some(),
+        "the license dialog is the suite's modal"
+    );
+    click(cx, "about-license-close");
+    assert!(
+        cx.debug_bounds("about-license-dialog").is_none(),
+        "closing it takes it away"
+    );
 
     // and Runs brings the column back with the run still open
     click(cx, "flow-rail-runs");

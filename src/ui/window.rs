@@ -16,8 +16,8 @@ use std::cell::RefCell;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Bounds, Context, Entity, FocusHandle, FontWeight, ScrollHandle, SharedString,
-    Window, div, px,
+    AnyElement, Bounds, Context, Entity, FocusHandle, FontWeight, MouseButton, ScrollHandle,
+    SharedString, Window, div, px,
 };
 use gpui_kit::component::input::InputState;
 use warpui_kit_core::list_nav::ListKey;
@@ -239,6 +239,14 @@ pub struct FlowApp {
     pub(crate) list_width: f32,
     /// The settings group the section's list selected.
     pub(crate) settings_group: SettingsGroup,
+    /// Whether About's license dialog is up, and the document it shows: the
+    /// family's modal, opened by the Legal card's View license.
+    pub(crate) about_license_open: bool,
+    pub(crate) about_license: Option<Entity<LiveEditorState>>,
+    /// Whether the list pane's edge is being dragged. The pointer's window
+    /// position drives the width until the button comes up, and the width is
+    /// remembered on release.
+    pub(crate) list_resizing: bool,
     /// `None` is the "All repos" row.
     pub(crate) selected_repo: Option<PathBuf>,
     /// The run whose detail pane is open.
@@ -357,6 +365,9 @@ impl FlowApp {
             list_hidden: false,
             list_width,
             settings_group: SettingsGroup::default(),
+            list_resizing: false,
+            about_license_open: false,
+            about_license: None,
             selected_repo: None,
             selected_run: None,
             cursor: None,
@@ -1018,7 +1029,7 @@ impl Render for FlowApp {
         let detail = match self.section {
             Section::Runs => self.render_runs_detail(window, cx),
             Section::Repos => self.render_repos_detail(window, cx),
-            Section::About => self.render_about_detail(cx),
+            Section::About => self.render_about_detail(window, cx),
             Section::Settings => self.render_settings_detail(window, cx),
         };
         let list = (!self.list_hidden).then(|| match self.section {
@@ -1038,7 +1049,46 @@ impl Render for FlowApp {
             .flex_col()
             .bg(theme::surface())
             .text_color(theme::text())
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                if !this.list_resizing {
+                    return;
+                }
+                // the list starts after the rail, so the pane's width is the
+                // pointer's window position less the rail
+                let rail = shell::scaled(shell::RAIL_WIDTH);
+                this.list_width = shell::clamp_list_width(f32::from(event.position.x) - rail);
+                cx.notify();
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.list_resizing {
+                        this.list_resizing = false;
+                        this.settings.list_width = Some(this.list_width);
+                        this.settings.save();
+                        cx.notify();
+                    }
+                }),
+            )
             .child(self.render_title_bar(cx))
+            .when(self.about_license_open, |root| {
+                let editor = self.about_license.clone();
+                let body = match editor {
+                    Some(editor) => {
+                        warpui_kit_markdown::render_read_only_document_in_card(&editor, cx)
+                    }
+                    None => div().into_any_element(),
+                };
+                root.child(warpui_kit_core::about::license_dialog(
+                    "flow-about-license",
+                    "GNU General Public License v3.0",
+                    body,
+                    cx.listener(|this, _, _, cx| {
+                        this.about_license_open = false;
+                        cx.notify();
+                    }),
+                ))
+            })
             .child(
                 shell::stage()
                     .flex()
@@ -1102,8 +1152,8 @@ impl FlowApp {
     }
 
     /// The About section: the installed family, the build and the license.
-    fn render_about_detail(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        self.render_about(cx)
+    fn render_about_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.render_about(window, cx)
     }
 
     /// The Settings section: this window's own knobs, one group at a time.

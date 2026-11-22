@@ -562,3 +562,35 @@ fn the_board_owns_its_cursor_and_enter_opens_the_run(cx: &mut TestAppContext) {
 
     cleanup(home);
 }
+
+#[gpui_kit::gpui::test]
+fn the_list_pane_is_resizable_and_remembers_its_width(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("list-width");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let repo = seed_repo(&home, "repo-a");
+
+    // a remembered width is what the pane opens at
+    let mut settings = warp_flow::store::Settings::load();
+    settings.repos.push(repo.clone());
+    settings.list_width = Some(380.);
+    settings.save();
+
+    let (handle, _page) = open_app(cx, vec![repo]);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    let handle = cx.debug_bounds(selector("flow-list-resize"));
+    assert!(handle.is_some(), "the list pane carries its resize edge");
+    let list = cx
+        .debug_bounds(selector("flow-list"))
+        .expect("the list pane");
+    assert!(
+        (list.size.width - px(380.)).abs() <= px(1.),
+        "the remembered width is the pane's: {:?}",
+        list.size.width
+    );
+
+    cleanup(home);
+}
