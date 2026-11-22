@@ -857,6 +857,44 @@ mod tests {
     }
 
     #[test]
+    fn the_split_skill_teaches_a_task_the_parser_accepts() {
+        let document = crate::skill::document("split").expect("this build ships split");
+        let example = indented_block(document, "Each file:")
+            .replace("<title>", "A task")
+            .replace("<category>", "feature");
+        let task =
+            Task::parse(Path::new("issues/01-a-task.md"), &example).unwrap_or_else(|error| {
+                panic!("the split skill's example is refused: {error}\n{example}")
+            });
+        assert_eq!(task.number, 1);
+        assert_eq!(task.title, "A task");
+        assert_eq!(task.status, Status::ReadyForAgent);
+        assert_eq!(task.category, "feature");
+        assert!(task.blocked_by.is_empty());
+    }
+
+    /// The four-space block under `marker`, dedented: a skill document's example.
+    ///
+    /// The example is what an agent copies into every file, so it has to be a
+    /// shape this module accepts — a doc that teaches `open` makes a run stop at
+    /// the step boundary after `split`.
+    fn indented_block(document: &str, marker: &str) -> String {
+        let mut block = String::new();
+        let mut started = false;
+        for line in document.lines().skip_while(|line| !line.contains(marker)) {
+            if let Some(body) = line.strip_prefix("    ") {
+                started = true;
+                block.push_str(body);
+                block.push('\n');
+            } else if started && !line.trim().is_empty() {
+                break;
+            }
+        }
+        assert!(started, "no indented example under `{marker}`");
+        block
+    }
+
+    #[test]
     fn malformed_task_reports_a_clear_error() {
         let (_dir, path) = issue_with(&[(1, "finished", "None")]);
         let error = Issue::open(&path).expect_err("bad status");

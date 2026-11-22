@@ -14,7 +14,10 @@ either way. This file adds only the app-specific facts.
   the door has no system-prompt channel, and a prompt naming a skill without
   carrying it sends the session hunting the filesystem. A workflow naming a
   document this build does not ship is refused during preparation, naming the
-  step and the shipped set; add a document here when a graph names one.
+  step and the shipped set; add a document here when a graph names one. A
+  document that quotes an artifact's shape is part of that shape's contract:
+  `split`'s task example is parsed by `artifact`'s tests, so a template that
+  teaches a word the parser refuses fails the suite instead of a run.
 - `src/main.rs` — the thin launcher for the desktop app; `src/lib.rs` is the
   probe boundary, and `src/store.rs` is the filesystem scan behind the board.
 - `src/host.rs` — the engine host: one blocking `Runner` per issue folder on a
