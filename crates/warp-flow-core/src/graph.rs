@@ -9,14 +9,30 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
 /// The only workflow schema this engine understands.
-const SCHEMA: u32 = 1;
+///
+/// Schema 2 made the workflow the repository's only flow document: a gate step
+/// carries its own command, and the merge policy moved onto the merge step
+/// (ADR-0015). A schema-1 file is refused rather than upgraded, because its
+/// gate steps carry only a name and the command that name referred to lived in
+/// a `flow.toml` that no longer exists.
+const SCHEMA: u32 = 2;
+
+/// The steps a run may have in flight at once when the file does not say.
+const DEFAULT_MAX_PARALLEL: u32 = 2;
+
+/// The working directory a gate step gets when it does not name one.
+const DEFAULT_CWD: &str = ".";
+
+/// The timeout a gate step gets when it does not name one.
+const DEFAULT_TIMEOUT_SECS: u64 = 900;
 
 /// What a step does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,18 +41,25 @@ pub enum StepKind {
     /// A harness session performs the step and writes its artifact.
     Harness,
     /// A gate command checks a step's result.
+    ///
+    /// A gate step carries its own `command`, `cwd` and `timeout_secs`: a gate
+    /// is a step, not a separate document (ADR-0015).
     Gate,
     /// The merge queue lands the task's branch into `main`.
     ///
-    /// A merge step is always per task, and it carries no `skill` or `gate`:
-    /// the gates it runs come from the repository's `flow.toml`, not from the
-    /// workflow.
+    /// A merge step is always per task, and it carries no `skill` or `command`:
+    /// the gates it runs are the gate steps it depends on, and its `mode` and
+    /// `push` fields are the repository's merge policy.
     Merge,
     /// The run pauses on a question for a person.
     Question,
 }
 
 /// One node of a workflow graph.
+///
+/// A step's place is its `depends_on` set, not its position in the file
+/// (ADR-0014): several dependencies fork and join, and two steps with no
+/// dependency between them may run at the same time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
@@ -44,12 +67,36 @@ pub struct Step {
     pub id: String,
     /// What kind of step it is.
     pub kind: StepKind,
+    /// Whether the step runs. A disabled step stays in the graph and never
+    /// runs; its dependents inherit its own dependencies, so the pipeline
+    /// closes over it instead of breaking.
+    #[serde(default = "yes")]
+    pub enabled: bool,
     /// The skill document a harness step hands to its session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill: Option<String>,
-    /// The gate a gate step runs; a key in the runner's gate map.
+    /// The harness a harness step's session runs in. Unset means the engine
+    /// picks one from the door's catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gate: Option<String>,
+    pub harness: Option<String>,
+    /// The model a harness step's session asks for. A model belongs to one
+    /// harness, so naming one also chooses the harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// How hard the session is asked to think: one of the chosen model's
+    /// variants. Unset means the model's own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// The shell command a gate step runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The folder a gate step's command runs in, relative to the tree the step
+    /// measures. Unset means that tree's root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// How long a gate step may run before it fails. Unset means 900 seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
     /// The steps that must finish before this one starts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
@@ -59,6 +106,49 @@ pub struct Step {
     /// Whether the step runs once per ready task rather than once per run.
     #[serde(default)]
     pub per_task: bool,
+    /// A merge step's mode: `local` today. Unset means `local`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Whether a merge step may push. Unset means it may not.
+    #[serde(default)]
+    pub push: bool,
+}
+
+/// The default for a field that is on unless the file says otherwise.
+fn yes() -> bool {
+    true
+}
+
+impl Step {
+    /// This step as a runnable gate.
+    ///
+    /// A gate step carries its own command, folder and timeout (ADR-0015), so
+    /// this is the one place the file's fields become the runner's [`Gate`].
+    /// The folder stays relative here: the engine resolves it against the tree
+    /// the step measures, which is the task's worktree for a per-task step.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Workflow`] when the step is not a gate step or has no command.
+    pub fn gate(&self) -> Result<crate::gate::Gate> {
+        if self.kind != StepKind::Gate {
+            return Err(Error::Workflow(format!(
+                "step `{}` is not a gate step",
+                self.id
+            )));
+        }
+        let command = self
+            .command
+            .as_deref()
+            .filter(|command| !command.trim().is_empty())
+            .ok_or_else(|| Error::Workflow(format!("gate step `{}` has no command", self.id)))?;
+        Ok(crate::gate::Gate {
+            name: self.id.clone(),
+            command: command.to_owned(),
+            cwd: PathBuf::from(self.cwd.as_deref().unwrap_or(DEFAULT_CWD)),
+            timeout: Duration::from_secs(self.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS)),
+        })
+    }
 }
 
 /// A complete workflow graph.
@@ -71,9 +161,17 @@ pub struct Workflow {
     pub name: String,
     /// The graph revision; every change appends a new one.
     pub revision: u32,
+    /// How many steps a run may have in flight at once.
+    #[serde(default = "default_max_parallel")]
+    pub max_parallel: u32,
     /// The steps, in the order independent steps should run.
     #[serde(default, rename = "step")]
     pub steps: Vec<Step>,
+}
+
+/// The default for `max_parallel`.
+fn default_max_parallel() -> u32 {
+    DEFAULT_MAX_PARALLEL
 }
 
 impl Workflow {
@@ -167,18 +265,35 @@ impl Workflow {
     ///
     /// A graph is valid when it uses the supported schema, has at least one
     /// step, every id is unique and non-empty, every `depends_on` names a real
-    /// step, a harness step has a skill, a gate step names a gate, a merge step
-    /// is per task and carries neither, and there is no cycle. The cycle is
-    /// reported as the path that closes it.
+    /// step, a harness step has a skill, a gate step has a command, a merge step
+    /// is per task and carries no skill or command, an effort names a model, and
+    /// there is no cycle. The cycle is reported as the path that closes it.
+    ///
+    /// The whole graph is checked, disabled steps included: a step that is off
+    /// today is one a person may switch on tomorrow, and a graph that only
+    /// validates while half of it is disabled is a trap.
     pub fn validate(&self) -> Result<()> {
         if self.schema != SCHEMA {
-            return Err(Error::Workflow(format!(
-                "schema {} is not supported; this engine understands schema {SCHEMA}",
-                self.schema
-            )));
+            return Err(Error::Workflow(if self.schema < SCHEMA {
+                format!(
+                    "schema {} is older than this engine's schema {SCHEMA}; a gate step now \
+                     carries its own command, so the file is rewritten rather than upgraded",
+                    self.schema
+                )
+            } else {
+                format!(
+                    "schema {} is not supported; this engine understands schema {SCHEMA}",
+                    self.schema
+                )
+            }));
         }
         if self.steps.is_empty() {
             return Err(Error::Workflow("the graph has no steps".to_owned()));
+        }
+        if self.max_parallel == 0 {
+            return Err(Error::Workflow(
+                "max_parallel is 0; a run needs to be able to start at least one step".to_owned(),
+            ));
         }
 
         let mut by_id: BTreeMap<&str, &Step> = BTreeMap::new();
@@ -205,12 +320,33 @@ impl Workflow {
             }
             if step.kind == StepKind::Gate
                 && step
-                    .gate
+                    .command
                     .as_deref()
-                    .is_none_or(|gate| gate.trim().is_empty())
+                    .is_none_or(|command| command.trim().is_empty())
             {
                 return Err(Error::Workflow(format!(
-                    "gate step `{}` names no gate",
+                    "gate step `{}` has no command",
+                    step.id
+                )));
+            }
+            if step.kind != StepKind::Gate && step.command.is_some() {
+                return Err(Error::Workflow(format!(
+                    "step `{}` carries a command but is not a gate step",
+                    step.id
+                )));
+            }
+            if step.effort.is_some() && step.model.is_none() {
+                return Err(Error::Workflow(format!(
+                    "step `{}` names an effort but no model; an effort is one of a model's \
+                     variants",
+                    step.id
+                )));
+            }
+            if step.kind != StepKind::Harness
+                && (step.harness.is_some() || step.model.is_some() || step.effort.is_some())
+            {
+                return Err(Error::Workflow(format!(
+                    "step `{}` names a harness, model or effort but is not a harness step",
                     step.id
                 )));
             }
@@ -227,12 +363,18 @@ impl Workflow {
                         step.id
                     )));
                 }
-                if step.gate.is_some() {
-                    return Err(Error::Workflow(format!(
-                        "merge step `{}` names a gate; its gates come from flow.toml",
-                        step.id
-                    )));
+                if let Some(mode) = step.mode.as_deref() {
+                    if mode != "local" {
+                        return Err(Error::Unsupported(
+                            "the `pr` merge mode is not implemented yet; use `mode = \"local\"`",
+                        ));
+                    }
                 }
+            } else if step.mode.is_some() || step.push {
+                return Err(Error::Workflow(format!(
+                    "step `{}` carries a merge policy but is not a merge step",
+                    step.id
+                )));
             }
             for dependency in &step.depends_on {
                 if !by_id.contains_key(dependency.as_str()) {
@@ -247,7 +389,54 @@ impl Workflow {
         self.check_acyclic()
     }
 
-    /// The steps that can run now: not done, and with every dependency done.
+    /// The steps a run may actually start: the enabled ones.
+    ///
+    /// A disabled step is transparent, so a dependent of a disabled step waits
+    /// for what the disabled step waited for. [`Workflow::resolve`] is the
+    /// dependency set that makes that true.
+    pub fn enabled_steps(&self) -> impl Iterator<Item = &Step> {
+        self.steps.iter().filter(|step| step.enabled)
+    }
+
+    /// The dependencies of `step` with disabled steps resolved away.
+    ///
+    /// A disabled step never runs, so waiting for it would wait forever. Its
+    /// dependents inherit its own dependencies instead, transitively, which is
+    /// what lets a person switch a step off without breaking the pipeline.
+    pub fn resolve(&self, step: &Step) -> Vec<String> {
+        let mut resolved = Vec::new();
+        let mut seen = BTreeSet::new();
+        self.resolve_into(step, &mut resolved, &mut seen);
+        resolved
+    }
+
+    /// Collect `step`'s enabled dependencies into `out`, depth first.
+    fn resolve_into(&self, step: &Step, out: &mut Vec<String>, seen: &mut BTreeSet<String>) {
+        for dependency in &step.depends_on {
+            let Some(dependency) = self.step(dependency) else {
+                continue;
+            };
+            if dependency.enabled {
+                if seen.insert(dependency.id.clone()) {
+                    out.push(dependency.id.clone());
+                }
+            } else {
+                self.resolve_into(dependency, out, seen);
+            }
+        }
+    }
+
+    /// Whether the graph has at least one enabled step.
+    ///
+    /// A workflow with nothing switched on is refused at preparation: a run
+    /// that starts and immediately succeeds without doing anything is the worst
+    /// way to learn that every step is off.
+    pub fn has_enabled_step(&self) -> bool {
+        self.steps.iter().any(|step| step.enabled)
+    }
+
+    /// The steps that can run now: enabled, not done, and with every resolved
+    /// dependency done.
     ///
     /// The result keeps declaration order, which is the engine's tie-break
     /// between independent steps.
@@ -255,13 +444,65 @@ impl Workflow {
         self.steps
             .iter()
             .filter(|step| {
-                !done.contains(&step.id)
-                    && step
-                        .depends_on
+                step.enabled
+                    && !done.contains(&step.id)
+                    && self
+                        .resolve(step)
                         .iter()
                         .all(|dependency| done.contains(dependency))
             })
             .collect()
+    }
+
+    /// The graph's waves: the enabled steps grouped by how far they sit from
+    /// the roots, in the order a run reaches them.
+    ///
+    /// A wave is what the editor draws as one band and what the engine may run
+    /// at once. Disabled steps are not in any wave — they never run — but they
+    /// still shape the depth of what follows them, so switching one off does
+    /// not silently reorder the rest.
+    pub fn waves(&self) -> Vec<Vec<&Step>> {
+        let mut depth: BTreeMap<&str, usize> = BTreeMap::new();
+        // Declaration order is a topological order only by accident, so the
+        // depth is computed by walking each step's resolved dependencies.
+        for step in &self.steps {
+            self.depth_of(step, &mut depth, &mut BTreeSet::new());
+        }
+        let mut waves: Vec<Vec<&Step>> = Vec::new();
+        for step in self.enabled_steps() {
+            let level = depth.get(step.id.as_str()).copied().unwrap_or(0);
+            while waves.len() <= level {
+                waves.push(Vec::new());
+            }
+            waves[level].push(step);
+        }
+        waves
+    }
+
+    /// The depth of `step`: one past the deepest of its dependencies.
+    fn depth_of<'a>(
+        &'a self,
+        step: &'a Step,
+        depth: &mut BTreeMap<&'a str, usize>,
+        visiting: &mut BTreeSet<&'a str>,
+    ) -> usize {
+        if let Some(known) = depth.get(step.id.as_str()) {
+            return *known;
+        }
+        // `validate` refuses a cycle, so this guard only keeps a malformed
+        // graph from recursing forever while the editor is mid-edit.
+        if !visiting.insert(step.id.as_str()) {
+            return 0;
+        }
+        let mut level = 0;
+        for dependency in &step.depends_on {
+            if let Some(dependency) = self.step(dependency) {
+                level = level.max(self.depth_of(dependency, depth, visiting) + 1);
+            }
+        }
+        visiting.remove(step.id.as_str());
+        depth.insert(step.id.as_str(), level);
+        level
     }
 
     /// Reject a graph with a cycle, naming the cycle it found.
@@ -342,19 +583,28 @@ mod tests {
         Step {
             id: id.to_owned(),
             kind,
+            enabled: true,
             skill: (kind == StepKind::Harness).then(|| "skill".to_owned()),
-            gate: (kind == StepKind::Gate).then(|| "gate".to_owned()),
+            harness: None,
+            model: None,
+            effort: None,
+            command: (kind == StepKind::Gate).then(|| "cargo test".to_owned()),
+            cwd: None,
+            timeout_secs: None,
             depends_on: depends_on.iter().map(|dep| (*dep).to_owned()).collect(),
             produces: None,
             per_task: false,
+            mode: None,
+            push: false,
         }
     }
 
     fn workflow(steps: Vec<Step>) -> Workflow {
         Workflow {
-            schema: 1,
+            schema: SCHEMA,
             name: "test".to_owned(),
             revision: 1,
+            max_parallel: DEFAULT_MAX_PARALLEL,
             steps,
         }
     }
@@ -363,7 +613,7 @@ mod tests {
     fn a_valid_graph_validates() {
         let workflow = parse(
             r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
@@ -376,7 +626,7 @@ produces = "spec.md"
 [[step]]
 id = "test"
 kind = "gate"
-gate = "test"
+command = "cargo test"
 depends_on = ["code"]
 
 [[step]]
@@ -391,13 +641,114 @@ per_task = true
         assert!(workflow.steps[2].per_task);
         assert!(!workflow.steps[0].per_task);
         assert_eq!(workflow.steps[0].produces.as_deref(), Some("spec.md"));
+        assert_eq!(workflow.steps[1].command.as_deref(), Some("cargo test"));
+        assert_eq!(workflow.max_parallel, DEFAULT_MAX_PARALLEL);
+    }
+
+    #[test]
+    fn a_step_is_enabled_unless_the_file_says_otherwise() {
+        let workflow = parse(
+            r#"
+schema = 2
+name = "implement"
+revision = 1
+
+[[step]]
+id = "on"
+kind = "harness"
+skill = "analyze"
+
+[[step]]
+id = "off"
+kind = "harness"
+skill = "analyze"
+enabled = false
+"#,
+        );
+        assert!(workflow.steps[0].enabled);
+        assert!(!workflow.steps[1].enabled);
+        assert!(workflow.has_enabled_step());
+    }
+
+    #[test]
+    fn a_workflow_with_every_step_disabled_has_no_enabled_step() {
+        let mut off = step("a", StepKind::Harness, &[]);
+        off.enabled = false;
+        let workflow = workflow(vec![off]);
+        workflow
+            .validate()
+            .expect("a disabled graph is still a graph");
+        assert!(!workflow.has_enabled_step());
+    }
+
+    #[test]
+    fn a_disabled_step_is_transparent_to_its_dependents() {
+        let mut middle = step("middle", StepKind::Harness, &["first"]);
+        middle.enabled = false;
+        let workflow = workflow(vec![
+            step("first", StepKind::Harness, &[]),
+            middle,
+            step("last", StepKind::Harness, &["middle"]),
+        ]);
+        let last = workflow.step("last").expect("last");
+        assert_eq!(workflow.resolve(last), vec!["first".to_owned()]);
+    }
+
+    #[test]
+    fn a_chain_of_disabled_steps_resolves_to_the_last_enabled_ancestor() {
+        let mut one = step("one", StepKind::Harness, &["root"]);
+        one.enabled = false;
+        let mut two = step("two", StepKind::Harness, &["one"]);
+        two.enabled = false;
+        let workflow = workflow(vec![
+            step("root", StepKind::Harness, &[]),
+            one,
+            two,
+            step("end", StepKind::Harness, &["two"]),
+        ]);
+        let end = workflow.step("end").expect("end");
+        assert_eq!(workflow.resolve(end), vec!["root".to_owned()]);
+    }
+
+    #[test]
+    fn a_disabled_step_never_becomes_ready() {
+        let mut off = step("off", StepKind::Harness, &[]);
+        off.enabled = false;
+        let workflow = workflow(vec![off, step("on", StepKind::Harness, &[])]);
+        assert_eq!(
+            ids(&workflow.ready(&BTreeSet::new())),
+            vec!["on".to_owned()]
+        );
+    }
+
+    #[test]
+    fn waves_group_steps_by_depth() {
+        let workflow = workflow(vec![
+            step("analyze", StepKind::Harness, &[]),
+            step("split", StepKind::Harness, &["analyze"]),
+            step("docs", StepKind::Harness, &["analyze"]),
+            step("code", StepKind::Harness, &["split", "docs"]),
+        ]);
+        let waves: Vec<Vec<String>> = workflow
+            .waves()
+            .iter()
+            .map(|wave| wave.iter().map(|step| step.id.clone()).collect())
+            .collect();
+        assert_eq!(
+            waves,
+            vec![
+                vec!["analyze".to_owned()],
+                vec!["split".to_owned(), "docs".to_owned()],
+                vec!["code".to_owned()],
+            ]
+        );
     }
 
     #[test]
     fn a_merge_step_parses_and_validates() {
         let workflow = parse(
             r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
@@ -411,12 +762,14 @@ per_task = true
 id = "merge"
 kind = "merge"
 per_task = true
+mode = "local"
 depends_on = ["code"]
 "#,
         );
         workflow.validate().expect("a per-task merge step is valid");
         assert_eq!(workflow.steps[1].kind, StepKind::Merge);
         assert!(workflow.steps[1].per_task);
+        assert_eq!(workflow.steps[1].mode.as_deref(), Some("local"));
     }
 
     #[test]
@@ -437,12 +790,81 @@ depends_on = ["code"]
     }
 
     #[test]
-    fn a_merge_step_carries_no_gate() {
+    fn a_merge_step_carries_no_command() {
         let mut merge = step("merge", StepKind::Merge, &[]);
         merge.per_task = true;
-        merge.gate = Some("test".to_owned());
-        let error = workflow(vec![merge]).validate().expect_err("gate");
-        assert!(error.to_string().contains("names a gate"), "{error}");
+        merge.command = Some("cargo test".to_owned());
+        let error = workflow(vec![merge]).validate().expect_err("command");
+        assert!(error.to_string().contains("is not a gate step"), "{error}");
+    }
+
+    #[test]
+    fn a_gate_step_needs_a_command() {
+        let mut gate = step("check", StepKind::Gate, &[]);
+        gate.command = None;
+        let error = workflow(vec![gate]).validate().expect_err("command");
+        assert!(error.to_string().contains("has no command"), "{error}");
+    }
+
+    #[test]
+    fn a_non_gate_step_carries_no_command() {
+        let mut harness = step("code", StepKind::Harness, &[]);
+        harness.command = Some("cargo test".to_owned());
+        let error = workflow(vec![harness]).validate().expect_err("command");
+        assert!(error.to_string().contains("is not a gate step"), "{error}");
+    }
+
+    #[test]
+    fn an_effort_needs_a_model() {
+        let mut harness = step("code", StepKind::Harness, &[]);
+        harness.effort = Some("high".to_owned());
+        let error = workflow(vec![harness]).validate().expect_err("effort");
+        assert!(error.to_string().contains("no model"), "{error}");
+    }
+
+    #[test]
+    fn a_harness_step_may_name_a_harness_model_and_effort() {
+        let mut harness = step("code", StepKind::Harness, &[]);
+        harness.harness = Some("dsh".to_owned());
+        harness.model = Some("opencode-go/deepseek-v4.1-flash".to_owned());
+        harness.effort = Some("high".to_owned());
+        workflow(vec![harness]).validate().expect("valid");
+    }
+
+    #[test]
+    fn a_non_harness_step_carries_no_model() {
+        let mut gate = step("check", StepKind::Gate, &[]);
+        gate.model = Some("some-model".to_owned());
+        let error = workflow(vec![gate]).validate().expect_err("model");
+        assert!(
+            error.to_string().contains("is not a harness step"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_merge_policy_belongs_to_the_merge_step() {
+        let mut harness = step("code", StepKind::Harness, &[]);
+        harness.push = true;
+        let error = workflow(vec![harness]).validate().expect_err("push");
+        assert!(error.to_string().contains("is not a merge step"), "{error}");
+    }
+
+    #[test]
+    fn the_pr_merge_mode_is_refused() {
+        let mut merge = step("merge", StepKind::Merge, &[]);
+        merge.per_task = true;
+        merge.mode = Some("pr".to_owned());
+        let error = workflow(vec![merge]).validate().expect_err("pr");
+        assert!(error.to_string().contains("not implemented"), "{error}");
+    }
+
+    #[test]
+    fn zero_parallelism_is_rejected() {
+        let mut workflow = workflow(vec![step("a", StepKind::Harness, &[])]);
+        workflow.max_parallel = 0;
+        let error = workflow.validate().expect_err("max_parallel");
+        assert!(error.to_string().contains("max_parallel is 0"), "{error}");
     }
 
     #[test]
@@ -500,11 +922,20 @@ depends_on = ["code"]
     }
 
     #[test]
-    fn an_unknown_schema_is_rejected() {
+    fn a_schema_one_file_is_refused_with_the_migration() {
         let mut workflow = workflow(vec![step("a", StepKind::Harness, &[])]);
-        workflow.schema = 2;
+        workflow.schema = 1;
         let error = workflow.validate().expect_err("schema");
-        assert!(error.to_string().contains("schema 2"), "{error}");
+        assert!(error.to_string().contains("schema 1"), "{error}");
+        assert!(error.to_string().contains("rewritten"), "{error}");
+    }
+
+    #[test]
+    fn a_future_schema_is_rejected() {
+        let mut workflow = workflow(vec![step("a", StepKind::Harness, &[])]);
+        workflow.schema = SCHEMA + 1;
+        let error = workflow.validate().expect_err("schema");
+        assert!(error.to_string().contains("not supported"), "{error}");
     }
 
     #[test]
@@ -514,7 +945,7 @@ depends_on = ["code"]
             step("check", StepKind::Gate, &["analyze"]),
         ]);
         let text = graph.to_toml().expect("write");
-        assert!(text.starts_with("schema = 1\n"), "{text}");
+        assert!(text.starts_with("schema = 2\n"), "{text}");
         assert!(text.contains("name = \"test\""), "{text}");
         assert!(text.contains("[[step]]"), "{text}");
         let back = parse(&text);
@@ -558,7 +989,7 @@ depends_on = ["code"]
     fn an_unknown_field_is_rejected_at_parse_time() {
         let error = Workflow::parse(
             r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 

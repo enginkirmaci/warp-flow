@@ -40,7 +40,7 @@ use crate::theme;
 use super::{ScreenRun, placeholder};
 
 /// The schema every workflow file this editor writes carries.
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
 
 /// The step list's width: the design's 320.
 const LIST_WIDTH: f32 = 320.;
@@ -91,7 +91,7 @@ struct StepFacts {
     /// The run's reading of this step, when it has one.
     state: Option<StepState>,
     skill: Option<String>,
-    gate: Option<String>,
+    command: Option<String>,
     produces: Option<String>,
     depends_on: Vec<String>,
     per_task: bool,
@@ -104,7 +104,7 @@ struct StepFacts {
 struct Fields {
     id: Entity<InputState>,
     skill: Entity<InputState>,
-    gate: Entity<InputState>,
+    command: Entity<InputState>,
     produces: Entity<InputState>,
     depends_on: Entity<InputState>,
 }
@@ -323,7 +323,7 @@ impl WorkflowScreen {
                     meta: step_meta(step),
                     state: state_of(&step.id),
                     skill: step.skill.clone(),
-                    gate: step.gate.clone(),
+                    command: step.command.clone(),
                     produces: step.produces.clone(),
                     depends_on: step.depends_on.clone(),
                     per_task: step.per_task,
@@ -339,7 +339,7 @@ impl WorkflowScreen {
                 meta: log_step_meta(step),
                 state: Some(step.state),
                 skill: None,
-                gate: None,
+                command: None,
                 produces: None,
                 depends_on: Vec::new(),
                 per_task: step.per_task,
@@ -383,11 +383,11 @@ impl WorkflowScreen {
             step.skill.clone().unwrap_or_default(),
             "the skill the session reads",
         );
-        let gate = make(
+        let command = make(
             window,
             cx,
-            step.gate.clone().unwrap_or_default(),
-            "a gate in flow.toml",
+            step.command.clone().unwrap_or_default(),
+            "the shell command a gate step runs",
         );
         let produces = make(
             window,
@@ -399,7 +399,7 @@ impl WorkflowScreen {
         let watched: Vec<(Entity<InputState>, Field)> = vec![
             (id.clone(), Field::Id),
             (skill.clone(), Field::Skill),
-            (gate.clone(), Field::Gate),
+            (command.clone(), Field::Command),
             (produces.clone(), Field::Produces),
             (depends_on.clone(), Field::DependsOn),
         ];
@@ -414,7 +414,7 @@ impl WorkflowScreen {
                 this.edit_step(cx, |step| match which {
                     Field::Id => step.id = text,
                     Field::Skill => step.skill = (!text.is_empty()).then_some(text),
-                    Field::Gate => step.gate = (!text.is_empty()).then_some(text),
+                    Field::Command => step.command = (!text.is_empty()).then_some(text),
                     Field::Produces => step.produces = (!text.is_empty()).then_some(text),
                     Field::DependsOn => {
                         step.depends_on = text
@@ -431,7 +431,7 @@ impl WorkflowScreen {
         let fields = Fields {
             id,
             skill,
-            gate,
+            command,
             produces,
             depends_on,
         };
@@ -450,7 +450,10 @@ impl WorkflowScreen {
         let values = [
             (fields.id.clone(), step.id.clone()),
             (fields.skill.clone(), step.skill.clone().unwrap_or_default()),
-            (fields.gate.clone(), step.gate.clone().unwrap_or_default()),
+            (
+                fields.command.clone(),
+                step.command.clone().unwrap_or_default(),
+            ),
             (
                 fields.produces.clone(),
                 step.produces.clone().unwrap_or_default(),
@@ -479,7 +482,7 @@ impl WorkflowScreen {
             if kind == StepKind::Merge {
                 step.per_task = true;
                 step.skill = None;
-                step.gate = None;
+                step.command = None;
             }
         });
     }
@@ -493,11 +496,19 @@ impl WorkflowScreen {
         let step = Step {
             id: format!("step-{number}"),
             kind: StepKind::Harness,
+            enabled: true,
             skill: Some("code".to_owned()),
-            gate: None,
+            harness: None,
+            model: None,
+            effort: None,
+            command: None,
+            cwd: None,
+            timeout_secs: None,
             depends_on: Vec::new(),
             produces: None,
             per_task: false,
+            mode: None,
+            push: false,
         };
         graph.steps.insert(self.selected.saturating_add(1), step);
         self.selected = (self.selected + 1).min(graph.steps.len().saturating_sub(1));
@@ -935,9 +946,9 @@ impl WorkflowScreen {
         }
         if step.kind == StepKind::Gate {
             rows.push((
-                "Gate",
-                "gate",
-                fields.as_ref().map(|fields| fields.gate.clone()),
+                "Command",
+                "command",
+                fields.as_ref().map(|fields| fields.command.clone()),
             ));
         }
         rows.push((
@@ -1269,7 +1280,7 @@ impl WorkflowScreen {
             rows.insert(1, ("Skill", mono_or_dash(step.skill.as_deref())));
         }
         if step.kind == StepKind::Gate {
-            rows.insert(1, ("Gate", mono_or_dash(step.gate.as_deref())));
+            rows.insert(1, ("Command", mono_or_dash(step.command.as_deref())));
         }
         for (label, value) in rows {
             card = card.child(
@@ -1565,7 +1576,7 @@ impl Render for WorkflowScreen {
 enum Field {
     Id,
     Skill,
-    Gate,
+    Command,
     Produces,
     DependsOn,
 }
@@ -1627,14 +1638,23 @@ fn new_graph() -> Workflow {
         schema: SCHEMA,
         name: "implement".to_owned(),
         revision: 1,
+        max_parallel: 2,
         steps: vec![Step {
             id: "analyze".to_owned(),
             kind: StepKind::Harness,
+            enabled: true,
             skill: Some("analyze".to_owned()),
-            gate: None,
+            harness: None,
+            model: None,
+            effort: None,
+            command: None,
+            cwd: None,
+            timeout_secs: None,
             depends_on: Vec::new(),
             produces: Some("spec.md".to_owned()),
             per_task: false,
+            mode: None,
+            push: false,
         }],
     }
 }

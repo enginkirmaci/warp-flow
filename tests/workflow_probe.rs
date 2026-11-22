@@ -37,7 +37,7 @@ fn scratch_home(name: &str) -> PathBuf {
 }
 
 const WORKFLOW: &str = r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 4
 
@@ -57,7 +57,7 @@ depends_on = ["analyze"]
 [[step]]
 id = "check"
 kind = "gate"
-gate = "test"
+command = "cargo test"
 depends_on = ["code"]
 "#;
 
@@ -76,7 +76,6 @@ fn seed_repo(home: &Path, workflow: Option<&str>) -> (PathBuf, PathBuf) {
             .expect("workflow.toml");
     }
     std::fs::create_dir_all(warp_flow_core::layout::dir(&repo)).expect("the .flow folder");
-    std::fs::write(warp_flow_core::layout::flow_file(&repo), "schema = 1\n").expect("flow.toml");
     for args in [
         vec!["init", "--initial-branch=main", "--quiet"],
         vec!["config", "user.email", "probe@example.com"],

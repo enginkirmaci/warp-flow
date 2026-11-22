@@ -1,8 +1,8 @@
 //! Probe: the first end-to-end chain, against a real throwaway repository.
 //!
-//! A workflow with `analyze`, a per-task `code` harness step and a per-task
-//! `merge` step, a real `.flow/flow.toml` gate (`true`), and two tasks where 02
-//! is blocked by 01. The proof is what survives on disk: two task worktrees, both
+//! A workflow with `analyze`, a per-task `code` harness step, a per-task gate
+//! step (`true`) and a per-task `merge` step, and two tasks where 02 is blocked
+//! by 01. The proof is what survives on disk: two task worktrees, both
 //! branches merged into `main` with `--no-ff` merge commits, both task files
 //! `resolved`, and `run.md` `done`. A second probe makes the second task's
 //! branch conflict with `main` and asserts the run blocks with a repair record
@@ -19,7 +19,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use warp_flow_core::artifact::{Document, Issue, Status};
-use warp_flow_core::config::FlowConfig;
 use warp_flow_core::graph::Workflow;
 use warp_flow_core::harness::{FakeHarness, Scripted};
 use warp_flow_core::layout;
@@ -27,7 +26,7 @@ use warp_flow_core::run::{MemoryLog, RunStatus, Runner, RunnerConfig};
 use warp_flow_core::worktree::{Repo, TaskWorktree};
 
 const WORKFLOW: &str = r#"
-schema = 1
+schema = 2
 name = "chain"
 revision = 1
 
@@ -45,24 +44,20 @@ per_task = true
 depends_on = ["analyze"]
 
 [[step]]
-id = "merge"
-kind = "merge"
-per_task = true
-depends_on = ["code"]
-"#;
-
-const FLOW: &str = r#"
-schema = 1
-
-[merge]
-mode = "local"
-push = false
-
-[[gate]]
-name = "test"
+id = "test"
+kind = "gate"
 command = "true"
 cwd = "."
 timeout_secs = 30
+per_task = true
+depends_on = ["code"]
+
+[[step]]
+id = "merge"
+kind = "merge"
+per_task = true
+mode = "local"
+depends_on = ["test"]
 "#;
 
 /// A temp directory that removes itself.
@@ -159,11 +154,9 @@ impl Fixture {
         self.git(dir, &["commit", "--quiet", "-m", message]);
     }
 
-    /// Write the workflow and the gate file, then commit everything.
+    /// Write the workflow, then commit everything.
     fn write_config(&self) {
         fs::write(layout::pinned_workflow(&self.issue), WORKFLOW).expect("workflow.toml");
-        fs::create_dir_all(layout::dir(&self.root)).expect("the .flow folder");
-        fs::write(layout::flow_file(&self.root), FLOW).expect("flow.toml");
     }
 
     /// Write one task file and return its path.
@@ -190,17 +183,13 @@ impl Fixture {
         Document::read(self.issue.join("run.md")).expect("run.md parses")
     }
 
-    /// The runner the CLI builds: the repository, the flow config, a real gate.
+    /// The runner the CLI builds: the repository and the graph's own gates.
     fn runner(&self, harness: FakeHarness, max_attempts: u32) -> Runner<FakeHarness> {
         let workflow =
             Workflow::read(layout::pinned_workflow(&self.issue)).expect("workflow parses");
-        let flow = FlowConfig::read(layout::flow_file(&self.root)).expect("flow.toml parses");
         let mut config = RunnerConfig::new(&self.issue, workflow, harness);
         config.workdir = self.root.clone();
         config.repo = Some(self.repo());
-        config.push = flow.push();
-        config.gates = flow.gates();
-        config.merge_gates = flow.gates_in_order().to_vec();
         config.max_attempts = max_attempts;
         config.log = Box::new(MemoryLog::new());
         Runner::new(config).expect("runner")
@@ -440,16 +429,19 @@ fn a_conflict_in_the_second_task_blocks_with_a_repair() {
     );
 }
 
-/// The flow file the runner reads parses into the gate it runs.
+/// A gate step in the graph becomes the gate the merge queue runs.
 #[test]
-fn the_flow_config_parses_the_real_flow_file() {
+fn a_gate_step_becomes_the_gate_the_merge_runs() {
     let fixture = Fixture::new();
     fixture.write_config();
     fixture.commit_fixture();
-    let flow = FlowConfig::read(layout::flow_file(&fixture.root)).expect("flow parses");
-    let gate = flow.gates().remove("test").expect("test gate");
+    let workflow = Workflow::read(layout::pinned_workflow(&fixture.issue)).expect("workflow");
+    let gate = workflow
+        .step("test")
+        .expect("test step")
+        .gate()
+        .expect("a gate step becomes a gate");
     assert_eq!(gate.command, "true");
     assert_eq!(gate.cwd, PathBuf::from("."));
     assert_eq!(gate.timeout, Duration::from_secs(30));
-    assert!(!flow.push());
 }

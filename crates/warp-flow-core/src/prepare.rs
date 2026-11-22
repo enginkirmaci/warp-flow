@@ -1,9 +1,13 @@
 //! One way to prepare a run from an issue folder.
 //!
 //! The CLI and the app's host start a run the same way: open the repository,
-//! read `.flow/flow.toml` and the issue's `workflow.toml`, check the gates the
-//! graph names, read the issue's tasks, and only then contact a harness. This
-//! module owns that sequence once so the two drivers cannot drift (S4a).
+//! read the issue's `workflow.toml`, check the skills its steps name, read the
+//! issue's tasks, and only then contact a harness. This module owns that
+//! sequence once so the two drivers cannot drift (S4a).
+//!
+//! A repository has one flow document (ADR-0015): the workflow carries its gate
+//! steps' commands and its merge step's policy, so there is no second file to
+//! read and no cross-file name to reconcile.
 //!
 //! A workflow's template belongs to the repository: `Repos › Workflow` edits
 //! `<repo>/.flow/workflow.toml` and appends a revision, and a run copies the
@@ -18,16 +22,13 @@
 //! while any other uncommitted change would make the merge queue refuse its own
 //! run later (decision 13).
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::artifact::{Document, Issue};
-use crate::config::FlowConfig;
 use crate::control::Control;
-use crate::gate::Gate;
-use crate::graph::{StepKind, Workflow};
+use crate::graph::Workflow;
 use crate::harness::Harness;
 use crate::layout;
 use crate::run::{LogSink, Runner, RunnerConfig};
@@ -45,8 +46,6 @@ pub struct Prepared {
     pub issue: PathBuf,
     /// The repository the run drives.
     pub repo: Repo,
-    /// The repository's gates and merge policy.
-    pub flow: FlowConfig,
     /// The workflow this run's issue folder carries.
     pub workflow: Workflow,
     /// The file the workflow was read from: the issue's copy, or the
@@ -63,26 +62,30 @@ pub struct Prepared {
 /// # Errors
 ///
 /// Returns [`Error::Run`] when `issue` is not inside a git repository, when the
-/// repository or the issue folder cannot be read, or when a gate step names a
-/// gate `flow.toml` does not define; the workflow's own parse and validation
-/// errors come from [`Workflow::read`] and [`Workflow::validate`].
+/// repository or the issue folder cannot be read, or when the workflow has no
+/// enabled step; the workflow's own parse and validation errors come from
+/// [`Workflow::read`] and [`Workflow::validate`].
 pub fn prepare(issue: &Path) -> Result<Prepared> {
     // Everything a run needs is validated before the harness is contacted, so
-    // a bad workflow or gate file cannot leave a session behind.
+    // a bad workflow cannot leave a session behind.
     let repo = Repo::open(issue)?;
-    let flow = FlowConfig::read(layout::flow_file(&repo.root))?;
     let workflow_path = resolve_workflow(issue, &repo.root);
     let workflow = Workflow::read(&workflow_path)?;
     workflow.validate()?;
+    // A workflow with nothing switched on would start and immediately succeed
+    // without doing anything, which is the worst way to learn every step is off.
+    if !workflow.has_enabled_step() {
+        return Err(Error::Run(format!(
+            "{} has no enabled step; enable one in Repos › Workflow",
+            workflow_path.display()
+        )));
+    }
     let state = Issue::open(issue)?;
-    let gates = flow.gates();
-    check_gates(&workflow, &gates)?;
     check_skills(&workflow)?;
     Ok(Prepared {
         issue: issue.to_path_buf(),
         title: title_of(issue),
         repo,
-        flow,
         workflow,
         workflow_path,
         state,
@@ -137,8 +140,8 @@ impl Prepared {
     /// `log` and its control seam reading `control`.
     ///
     /// Every field the CLI used to assemble by hand is set here: the issue
-    /// folder, the repository work directory, the gates in `flow.toml` order,
-    /// and the merge policy.
+    /// folder and the repository work directory. The gates and the merge policy
+    /// are the graph's own now, so they travel with `self.workflow`.
     pub fn config<H>(
         &self,
         harness: H,
@@ -148,9 +151,6 @@ impl Prepared {
         let mut config = RunnerConfig::new(self.issue.clone(), self.workflow.clone(), harness);
         config.workdir = self.repo.root.clone();
         config.repo = Some(self.repo.clone());
-        config.push = self.flow.push();
-        config.gates = self.flow.gates();
-        config.merge_gates = self.flow.gates_in_order().to_vec();
         config.control = control;
         config.log = log;
         config
@@ -195,33 +195,17 @@ impl Prepared {
     }
 }
 
-/// Reject a gate step whose name `flow.toml` does not define, before any run.
-fn check_gates(workflow: &Workflow, gates: &BTreeMap<String, Gate>) -> Result<()> {
-    for step in &workflow.steps {
-        if step.kind != StepKind::Gate {
-            continue;
-        }
-        let Some(name) = step.gate.as_deref() else {
-            continue;
-        };
-        if !gates.contains_key(name) {
-            return Err(Error::Run(format!(
-                "step `{}` runs gate `{name}`, which `flow.toml` does not define",
-                step.id
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// Reject a harness step whose skill this build does not ship, before any run.
 ///
 /// The prompt carries the skill document itself (ADR-0008), so a name without
 /// one is a misconfigured workflow, not a session's problem: catching it here
 /// names the step a person can fix instead of spending three attempts on a
 /// session that goes looking for the document and runs out of time.
+///
+/// A disabled step is skipped: it will not run, so a skill this build does not
+/// ship is not a reason to refuse the run.
 fn check_skills(workflow: &Workflow) -> Result<()> {
-    for step in &workflow.steps {
+    for step in workflow.enabled_steps() {
         let Some(name) = step.skill.as_deref() else {
             continue;
         };
@@ -326,29 +310,16 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 mod tests {
     use super::*;
     use crate::test_support::TempDir;
-    use std::time::Duration;
-
-    const FLOW: &str = r#"
-schema = 1
-
-[merge]
-mode = "local"
-push = false
-
-[[gate]]
-name = "check"
-command = "true"
-"#;
 
     const WORKFLOW: &str = r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
 [[step]]
 id = "check"
 kind = "gate"
-gate = "check"
+command = "true"
 
 [[step]]
 id = "code"
@@ -382,7 +353,6 @@ depends_on = ["check"]
         run_git(&root, &["config", "user.name", "Engine Probe"]);
         run_git(&root, &["config", "commit.gpgsign", "false"]);
         fs::create_dir_all(layout::dir(&root)).expect("the .flow folder");
-        fs::write(layout::flow_file(&root), FLOW).expect("flow.toml");
 
         let issue = root.join(".scratch/demo");
         fs::create_dir_all(issue.join("issues")).expect("issue folder");
@@ -416,9 +386,7 @@ depends_on = ["check"]
         assert_eq!(prepared.workflow.name, "implement");
         assert_eq!(prepared.workflow.steps.len(), 2);
         assert_eq!(prepared.state.tasks().len(), 1);
-        assert_eq!(prepared.flow.gates_in_order().len(), 1);
         assert!(!prepared.resume(), "a fresh issue has no run.md");
-        assert!(!prepared.flow.push());
 
         let config = prepared.config(
             crate::harness::FakeHarness::new(),
@@ -427,8 +395,6 @@ depends_on = ["check"]
         );
         assert_eq!(config.workdir, root);
         assert_eq!(config.repo.map(|repo| repo.root), Some(root));
-        assert_eq!(config.gates.len(), 1);
-        assert_eq!(config.merge_gates.len(), 1);
         assert_eq!(config.issue, issue);
         assert_eq!(config.max_attempts, crate::run::DEFAULT_MAX_ATTEMPTS);
     }
@@ -545,23 +511,47 @@ depends_on = ["check"]
     }
 
     #[test]
-    fn a_gate_the_flow_file_does_not_define_is_refused() {
+    fn a_gate_step_without_a_command_is_refused() {
         let dir = TempDir::new();
-        let (root, issue) = fixture(&dir);
+        let (_root, issue) = fixture(&dir);
         fs::write(
             layout::pinned_workflow(&issue),
-            "schema = 1\nname = \"implement\"\nrevision = 1\n\n[[step]]\n\
-             id = \"check\"\nkind = \"gate\"\ngate = \"missing\"\n",
+            "schema = 2\nname = \"implement\"\nrevision = 1\n\n[[step]]\n\
+             id = \"check\"\nkind = \"gate\"\n",
         )
         .expect("workflow.toml");
-        let error = prepare(&issue).expect_err("unknown gate");
-        assert!(
-            error
-                .to_string()
-                .contains("which `flow.toml` does not define"),
-            "{error}"
-        );
-        let _ = root;
+        let error = prepare(&issue).expect_err("no command");
+        assert!(error.to_string().contains("has no command"), "{error}");
+    }
+
+    #[test]
+    fn a_workflow_with_no_enabled_step_is_refused() {
+        let dir = TempDir::new();
+        let (_root, issue) = fixture(&dir);
+        fs::write(
+            layout::pinned_workflow(&issue),
+            "schema = 2\nname = \"implement\"\nrevision = 1\n\n[[step]]\n\
+             id = \"code\"\nkind = \"harness\"\nskill = \"code\"\nenabled = false\n",
+        )
+        .expect("workflow.toml");
+        let error = prepare(&issue).expect_err("nothing enabled");
+        assert!(error.to_string().contains("no enabled step"), "{error}");
+    }
+
+    #[test]
+    fn a_disabled_step_naming_an_unshipped_skill_does_not_refuse_the_run() {
+        // A step that will not run is not a reason to refuse the run: the
+        // skill check follows the enabled steps.
+        let dir = TempDir::new();
+        let (_root, issue) = fixture(&dir);
+        fs::write(
+            layout::pinned_workflow(&issue),
+            "schema = 2\nname = \"implement\"\nrevision = 1\n\n[[step]]\n\
+             id = \"ghost\"\nkind = \"harness\"\nskill = \"not-shipped\"\nenabled = false\n\n\
+             [[step]]\nid = \"code\"\nkind = \"harness\"\nskill = \"code\"\n",
+        )
+        .expect("workflow.toml");
+        prepare(&issue).expect("a disabled step is not checked");
     }
 
     #[test]
@@ -572,7 +562,7 @@ depends_on = ["check"]
         let (_root, issue) = fixture(&dir);
         fs::write(
             layout::pinned_workflow(&issue),
-            "schema = 1\nname = \"implement\"\nrevision = 1\n\n[[step]]\n\
+            "schema = 2\nname = \"implement\"\nrevision = 1\n\n[[step]]\n\
              id = \"one\"\nkind = \"harness\"\nskill = \"code\"\ndepends_on = [\"two\"]\n\n\
              [[step]]\nid = \"two\"\nkind = \"harness\"\nskill = \"code\"\n\
              depends_on = [\"one\"]\n",
@@ -583,42 +573,19 @@ depends_on = ["check"]
     }
 
     #[test]
-    fn the_gate_order_is_the_flow_files_order() {
+    fn a_gate_step_carries_its_own_command_and_defaults() {
         let dir = TempDir::new();
-        let (root, issue) = fixture(&dir);
-        fs::write(
-            layout::flow_file(&root),
-            r#"
-schema = 1
-
-[[gate]]
-name = "zeta"
-command = "true"
-
-[[gate]]
-name = "alpha"
-command = "true"
-"#,
-        )
-        .expect("flow.toml");
-        fs::write(
-            layout::pinned_workflow(&issue),
-            "schema = 1\nname = \"implement\"\nrevision = 1\n\n[[step]]\n\
-             id = \"check\"\nkind = \"gate\"\ngate = \"zeta\"\n",
-        )
-        .expect("workflow.toml");
-        run_git(&root, &["add", ".flow"]);
-        run_git(&root, &["add", ".scratch"]);
-        run_git(&root, &["commit", "--quiet", "-m", "reorder"]);
-
+        let (_root, issue) = fixture(&dir);
         let prepared = prepare(&issue).expect("prepares");
-        let order: Vec<&str> = prepared
-            .flow
-            .gates_in_order()
-            .iter()
-            .map(|gate| gate.name.as_str())
-            .collect();
-        assert_eq!(order, ["zeta", "alpha"]);
-        assert!(prepared.flow.gates_in_order()[0].timeout > Duration::ZERO);
+        let gate = prepared
+            .workflow
+            .step("check")
+            .expect("check")
+            .gate()
+            .expect("a gate step becomes a gate");
+        assert_eq!(gate.name, "check");
+        assert_eq!(gate.command, "true");
+        assert_eq!(gate.cwd, std::path::PathBuf::from("."));
+        assert!(gate.timeout > std::time::Duration::ZERO);
     }
 }

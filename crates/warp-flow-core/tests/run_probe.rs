@@ -8,11 +8,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use warp_flow_core::artifact::{Document, Issue, Status};
 use warp_flow_core::control::{Control, Signal};
-use warp_flow_core::gate::Gate;
 use warp_flow_core::graph::Workflow;
 use warp_flow_core::harness::{FakeHarness, Scripted};
 use warp_flow_core::layout;
@@ -89,9 +88,6 @@ impl World {
             Workflow::read(layout::pinned_workflow(&self.issue)).expect("workflow parses");
         let mut config = RunnerConfig::new(&self.issue, workflow, harness);
         config.workdir = self.root.clone();
-        config
-            .gates
-            .insert("test".to_owned(), test_gate(&self.root));
         Runner::new(config).expect("runner")
     }
 
@@ -116,15 +112,6 @@ fn resolved(text: &str) -> String {
     text.replace("**Status:** ready-for-agent", "**Status:** resolved")
 }
 
-fn test_gate(root: &Path) -> Gate {
-    Gate {
-        name: "test".to_owned(),
-        command: "true".to_owned(),
-        cwd: root.to_path_buf(),
-        timeout: Duration::from_secs(5),
-    }
-}
-
 fn position(body: &str, row: &str) -> usize {
     body.find(row)
         .unwrap_or_else(|| panic!("run.md is missing `{row}` in:\n{body}"))
@@ -132,14 +119,16 @@ fn position(body: &str, row: &str) -> usize {
 
 /// A task lane: a gate per task after coding, then a merge that resolves it.
 const LANE: &str = r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
 [[step]]
 id = "test"
 kind = "gate"
-gate = "test"
+command = "true"
+cwd = "."
+timeout_secs = 5
 per_task = true
 
 [[step]]
@@ -248,27 +237,22 @@ fn a_task_never_starts_while_its_blocker_is_unresolved() {
 fn a_failing_gate_writes_repairs_and_blocks_after_the_limit() {
     let world = World::new(
         r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
 [[step]]
 id = "guard"
 kind = "gate"
-gate = "guard"
+command = "false"
+cwd = "."
+timeout_secs = 5
 per_task = true
 "#,
     );
     world.task(1, "Guard the rail", "None");
-    let gate = Gate {
-        name: "guard".to_owned(),
-        command: "false".to_owned(),
-        cwd: world.root.clone(),
-        timeout: Duration::from_secs(5),
-    };
     let workflow = Workflow::read(layout::pinned_workflow(&world.issue)).expect("workflow parses");
     let mut config = RunnerConfig::new(&world.issue, workflow, FakeHarness::new());
-    config.gates.insert("guard".to_owned(), gate);
     config.max_attempts = 2;
     config.workdir = world.root.clone();
     let log = MemoryLog::new();
@@ -326,7 +310,7 @@ per_task = true
 
 /// The workflow a waiting run leaves behind: one harness step, then a question.
 const WAITING_WORKFLOW: &str = r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
@@ -370,9 +354,6 @@ fn a_resume_whose_control_already_says_abandon_runs_no_step() {
         let mut config = RunnerConfig::new(&world.issue, workflow, FakeHarness::new());
         config.workdir = world.root.clone();
         config
-            .gates
-            .insert("test".to_owned(), test_gate(&world.root));
-        config
     };
     config.control = Box::new(AlreadyAbandoning);
     let mut resumed = Runner::resume(config).expect("resume");
@@ -406,7 +387,7 @@ impl Control for AlreadyAbandoning {
 fn a_question_pauses_the_run_and_writes_the_file() {
     let world = World::new(
         r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 

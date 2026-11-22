@@ -18,7 +18,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use warp_flow_core::artifact::Document;
-use warp_flow_core::config::MergeMode;
 use warp_flow_core::control::KeepGoing;
 use warp_flow_core::door::DoorHarness;
 use warp_flow_core::graph::StepKind;
@@ -244,34 +243,34 @@ fn print_plan(prepared: &Prepared, max_attempts: u32) {
     let repo = &prepared.repo;
     let issue = &prepared.issue;
     let workflow = &prepared.workflow;
-    let flow = &prepared.flow;
     let issue_state = &prepared.state;
     println!("repo: {}", repo.root.display());
     println!("issue: {}", issue.display());
     println!("workflow: {} revision {}", workflow.name, workflow.revision);
-    println!("merge: {} (push: {})", mode_name(flow.mode()), flow.push());
+    println!("max parallel: {}", workflow.max_parallel);
     println!("max attempts: {max_attempts}");
     println!("resume: {}", if prepared.resume() { "yes" } else { "no" });
-
-    println!("gates:");
-    for gate in flow.gates_in_order() {
-        println!(
-            "  {}: `{}` in {} ({}s timeout)",
-            gate.name,
-            gate.command,
-            gate.cwd.display(),
-            gate.timeout.as_secs()
-        );
-    }
 
     println!("steps:");
     for step in &workflow.steps {
         let mut line = format!("  {}: {}", step.id, kind_name(step.kind));
+        if !step.enabled {
+            line.push_str(" (disabled)");
+        }
         if step.per_task {
             line.push_str(" per task");
         }
         if !step.depends_on.is_empty() {
             line.push_str(&format!(" (after {})", step.depends_on.join(", ")));
+        }
+        if let Some(command) = &step.command {
+            line.push_str(&format!(" `{command}`"));
+        }
+        if let Some(model) = &step.model {
+            line.push_str(&format!(" model {model}"));
+        }
+        if let Some(effort) = &step.effort {
+            line.push_str(&format!(" effort {effort}"));
         }
         println!("{line}");
     }
@@ -297,14 +296,6 @@ fn print_plan(prepared: &Prepared, max_attempts: u32) {
         );
     }
     println!("dry run: nothing was run");
-}
-
-/// The word `flow.toml` uses for a merge mode.
-fn mode_name(mode: MergeMode) -> &'static str {
-    match mode {
-        MergeMode::Local => "local",
-        MergeMode::Pr => "pr",
-    }
 }
 
 /// The word the graph uses for a step kind.

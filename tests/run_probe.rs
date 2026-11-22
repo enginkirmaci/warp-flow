@@ -85,7 +85,7 @@ fn seed_workflow(repo: &Path, id: &str, steps: &str) {
     let dir = issue_dir(repo, id);
     std::fs::write(
         warp_flow_core::layout::pinned_workflow(&dir),
-        format!("schema = 1\nname = \"implement\"\nrevision = 3\n\n{steps}"),
+        format!("schema = 2\nname = \"implement\"\nrevision = 3\n\n{steps}"),
     )
     .expect("workflow.toml");
 }
@@ -321,7 +321,7 @@ fn the_run_screen_has_a_band_per_step_and_a_lane_per_task(cx: &mut TestAppContex
         "run-bands",
         "[[step]]\nid = \"analyze\"\nkind = \"harness\"\nskill = \"analyze\"\nproduces = \"spec.md\"\n\n\
          [[step]]\nid = \"code\"\nkind = \"harness\"\nskill = \"code\"\nper_task = true\ndepends_on = [\"analyze\"]\n\n\
-         [[step]]\nid = \"test\"\nkind = \"gate\"\ngate = \"test\"\ndepends_on = [\"code\"]\n",
+         [[step]]\nid = \"test\"\nkind = \"gate\"\ncommand = \"cargo test\"\ndepends_on = [\"code\"]\n",
     );
     for number in 1..=3 {
         seed_task(

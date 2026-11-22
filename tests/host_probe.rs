@@ -55,22 +55,8 @@ impl Drop for ScratchDir {
     }
 }
 
-const FLOW: &str = r#"
-schema = 1
-
-[merge]
-mode = "local"
-push = false
-
-[[gate]]
-name = "check"
-command = "touch checked.txt"
-cwd = "."
-timeout_secs = 30
-"#;
-
 const WORKFLOW: &str = r#"
-schema = 1
+schema = 2
 name = "probe"
 revision = 1
 
@@ -82,12 +68,14 @@ skill = "code"
 [[step]]
 id = "check"
 kind = "gate"
-gate = "check"
+command = "touch checked.txt"
+cwd = "."
+timeout_secs = 30
 depends_on = ["work"]
 "#;
 
 const QUESTION_WORKFLOW: &str = r#"
-schema = 1
+schema = 2
 name = "probe"
 revision = 1
 
@@ -113,7 +101,6 @@ impl Fixture {
         run_git(&repo, &["config", "user.name", "Engine Probe"]);
         run_git(&repo, &["config", "commit.gpgsign", "false"]);
         fs::create_dir_all(warp_flow_core::layout::dir(&repo)).expect("the .flow folder");
-        fs::write(warp_flow_core::layout::flow_file(&repo), FLOW).expect("flow.toml");
         fs::write(repo.join("readme.md"), "probe\n").expect("readme");
 
         let issue = repo.join(".scratch/demo");

@@ -130,8 +130,6 @@ pub struct RunnerConfig<H> {
     pub workflow: Workflow,
     /// The harness that performs harness steps.
     pub harness: H,
-    /// Gates by name; a gate step's `gate` field is a key here.
-    pub gates: BTreeMap<String, Gate>,
     /// How many attempts one step gets before the run blocks.
     pub max_attempts: u32,
     /// The directory harness steps work in.
@@ -142,25 +140,18 @@ pub struct RunnerConfig<H> {
     /// that is the S1 behavior the engine's unit tests still use. With a
     /// repository, a per-task step runs in the task's worktree.
     pub repo: Option<Repo>,
-    /// Whether the merge queue may push `main` after it merges.
-    pub push: bool,
     /// What tells the engine to pause or abandon at a step boundary.
     ///
     /// [`RunnerConfig::new`] installs [`KeepGoing`], so a caller that does not
     /// care about control behaves exactly as it did before the seam existed.
     pub control: Box<dyn Control>,
-    /// The gates in `.flow/flow.toml`'s declaration order, for the merge queue.
-    ///
-    /// Empty means [`RunnerConfig::gates`]' own (name-sorted) order, which is
-    /// the shape tests that configure gates by hand construct.
-    pub merge_gates: Vec<Gate>,
     /// Where the engine writes its log lines.
     pub log: Box<dyn LogSink>,
 }
 
 impl<H> RunnerConfig<H> {
-    /// A config with no gates, the default attempt budget, the issue folder as
-    /// the work directory, and a sink that drops the log.
+    /// A config with the default attempt budget, the issue folder as the work
+    /// directory, and a sink that drops the log.
     pub fn new(issue: impl Into<PathBuf>, workflow: Workflow, harness: H) -> Self {
         let issue = issue.into();
         Self {
@@ -168,12 +159,9 @@ impl<H> RunnerConfig<H> {
             issue,
             workflow,
             harness,
-            gates: BTreeMap::new(),
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             repo: None,
-            push: false,
             control: Box::new(KeepGoing),
-            merge_gates: Vec::new(),
             log: Box::new(NullLog),
         }
     }
@@ -184,13 +172,10 @@ pub struct Runner<H> {
     issue: PathBuf,
     workflow: Workflow,
     harness: H,
-    gates: BTreeMap<String, Gate>,
     max_attempts: u32,
     workdir: PathBuf,
     repo: Option<Repo>,
-    push: bool,
     control: Box<dyn Control>,
-    merge_gates: Vec<Gate>,
     log: Box<dyn LogSink>,
     status: RunStatus,
     /// Task worktrees already created or found, by task number.
@@ -223,13 +208,10 @@ impl<H: Harness> Runner<H> {
             issue,
             workflow,
             harness,
-            gates,
             max_attempts,
             workdir,
             repo,
-            push,
             control,
-            merge_gates,
             log,
         } = config;
 
@@ -238,17 +220,6 @@ impl<H: Harness> Runner<H> {
         }
         workflow.validate()?;
         for step in &workflow.steps {
-            if step.kind == StepKind::Gate {
-                let name = step.gate.as_deref().ok_or_else(|| {
-                    Error::Workflow(format!("gate step `{}` names no gate", step.id))
-                })?;
-                if !gates.contains_key(name) {
-                    return Err(Error::Run(format!(
-                        "step `{}` runs gate `{name}`, which is not configured",
-                        step.id
-                    )));
-                }
-            }
             if step.kind == StepKind::Merge && repo.is_none() {
                 return Err(Error::Run(format!(
                     "step `{}` merges a task branch, but the runner has no repository",
@@ -269,13 +240,10 @@ impl<H: Harness> Runner<H> {
             issue,
             workflow,
             harness,
-            gates,
             max_attempts,
             workdir,
             repo,
-            push,
             control,
-            merge_gates,
             log,
             status: RunStatus::Running,
             worktrees: BTreeMap::new(),
@@ -696,18 +664,15 @@ impl<H: Harness> Runner<H> {
         }
     }
 
-    /// Run the gate behind a gate step, in the task's worktree when it has one.
+    /// Run the command behind a gate step, in the task's worktree when it has
+    /// one.
+    ///
+    /// A gate step carries its own command, folder and timeout (ADR-0015), so
+    /// there is no name to look up and no second file that could disagree.
     fn attempt_gate(&mut self, step: &Step, task: Option<&Task>) -> Result<Option<Failure>> {
-        let name = step
-            .gate
-            .as_deref()
-            .ok_or_else(|| Error::Run(format!("gate step `{}` names no gate", step.id)))?;
-        let mut gate = self
-            .gates
-            .get(name)
-            .cloned()
-            .ok_or_else(|| Error::Run(format!("gate `{name}` is not configured")))?;
-        // `flow.toml` writes `cwd` relative to the tree the step measures: the
+        let name = step.id.clone();
+        let mut gate = step.gate()?;
+        // A gate step writes `cwd` relative to the tree the step measures: the
         // task's worktree for a per-task step, the configured workdir otherwise.
         // The file's own folder (`.flow/`) is not part of that: a gate measures
         // the repository, never the folder its configuration lives in.
@@ -849,8 +814,8 @@ impl<H: Harness> Runner<H> {
                 repo: repo.clone(),
                 worktree: worktree.clone(),
                 main: "main".to_owned(),
-                gates: self.merge_gates(),
-                push: self.push,
+                gates: self.merge_gates(step)?,
+                push: step.push,
             })?;
 
             match outcome {
@@ -923,14 +888,26 @@ impl<H: Harness> Runner<H> {
         }
     }
 
-    /// The gates the merge queue runs, in `.flow/flow.toml` order when it is
-    /// known.
-    fn merge_gates(&self) -> Vec<Gate> {
-        if self.merge_gates.is_empty() {
-            self.gates.values().cloned().collect()
-        } else {
-            self.merge_gates.clone()
+    /// The gates the merge queue runs for `step`: the gate steps it depends on,
+    /// in graph order.
+    ///
+    /// A rebase changes the branch the gates measured, so the merge re-runs
+    /// them on the rebased tree. Which gates those are is the graph's answer
+    /// (ADR-0015): a gate step the merge does not depend on does not gate the
+    /// merge. Disabled gate steps are skipped, and a gate step's own `cwd` is
+    /// resolved against the worktree the merge measures.
+    fn merge_gates(&self, step: &Step) -> Result<Vec<Gate>> {
+        let mut gates = Vec::new();
+        for dependency in self.workflow.resolve(step) {
+            let Some(dependency) = self.workflow.step(&dependency) else {
+                continue;
+            };
+            if dependency.kind != StepKind::Gate {
+                continue;
+            }
+            gates.push(dependency.gate()?);
         }
+        Ok(gates)
     }
 
     /// Write `resolved` on a task; the merge step is the only caller.
@@ -1400,7 +1377,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let workflow = workflow(
             r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
@@ -1455,7 +1432,7 @@ depends_on = ["analyze"]
         );
         let workflow = workflow(
             r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
@@ -1501,7 +1478,7 @@ produces = "spec.md"
         );
         let workflow = workflow(
             r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
@@ -1548,24 +1525,20 @@ depends_on = ["analyze"]
         let issue = issue(&dir);
         let workflow = workflow(
             r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
 [[step]]
 id = "check"
 kind = "gate"
-gate = "check"
+command = "if [ -f repaired ]; then exit 0; else touch repaired; exit 1; fi"
+cwd = "."
+timeout_secs = 5
 "#,
         );
-        let gate = Gate {
-            name: "check".to_owned(),
-            command: "if [ -f repaired ]; then exit 0; else touch repaired; exit 1; fi".to_owned(),
-            cwd: dir.path().to_path_buf(),
-            timeout: Duration::from_secs(5),
-        };
         let mut config = RunnerConfig::new(&issue, workflow, FakeHarness::new());
-        config.gates = BTreeMap::from([("check".to_owned(), gate)]);
+        config.workdir = dir.path().to_path_buf();
         config.max_attempts = 3;
         let mut runner = Runner::new(config).expect("runner");
 
@@ -1591,24 +1564,20 @@ gate = "check"
         let issue = issue(&dir);
         let workflow = workflow(
             r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
 [[step]]
 id = "check"
 kind = "gate"
-gate = "check"
+command = "exit 7"
+cwd = "."
+timeout_secs = 5
 "#,
         );
-        let gate = Gate {
-            name: "check".to_owned(),
-            command: "exit 7".to_owned(),
-            cwd: dir.path().to_path_buf(),
-            timeout: Duration::from_secs(5),
-        };
         let mut config = RunnerConfig::new(&issue, workflow, FakeHarness::new());
-        config.gates = BTreeMap::from([("check".to_owned(), gate)]);
+        config.workdir = dir.path().to_path_buf();
         config.max_attempts = 2;
         let mut runner = Runner::new(config).expect("runner");
 
@@ -1659,7 +1628,7 @@ gate = "check"
         );
         let workflow = workflow(
             r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
@@ -1697,7 +1666,7 @@ skill = "code"
         let issue = issue(&dir);
         let workflow = workflow(
             r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
@@ -1740,7 +1709,7 @@ kind = "question"
         .expect("task");
         let workflow = workflow(
             r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
@@ -1759,25 +1728,26 @@ per_task = true
     }
 
     #[test]
-    fn an_unconfigured_gate_is_refused_before_the_run() {
+    fn a_gate_step_without_a_command_is_refused_before_the_run() {
+        // A gate step carries its own command now (ADR-0015), so the refusal
+        // happens at validation rather than at a lookup against a second file.
         let dir = TempDir::new();
-        let issue = issue(&dir);
-        let workflow = workflow(
+        let _issue = issue(&dir);
+        let error = Workflow::parse(
             r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
 [[step]]
 id = "check"
 kind = "gate"
-gate = "check"
 "#,
-        );
-        let error = Runner::new(RunnerConfig::new(&issue, workflow, FakeHarness::new()))
-            .err()
-            .expect("gate missing");
-        assert!(error.to_string().contains("not configured"), "{error}");
+        )
+        .expect("parses")
+        .validate()
+        .expect_err("no command");
+        assert!(error.to_string().contains("has no command"), "{error}");
     }
 
     #[test]
@@ -1786,7 +1756,7 @@ gate = "check"
         let issue = issue(&dir);
         let workflow = workflow(
             r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
@@ -1856,7 +1826,7 @@ skill = "analyze"
     }
 
     const MERGE_WORKFLOW: &str = r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
@@ -1874,10 +1844,20 @@ per_task = true
 depends_on = ["analyze"]
 
 [[step]]
+id = "test"
+kind = "gate"
+command = "true"
+cwd = "."
+timeout_secs = 5
+per_task = true
+depends_on = ["code"]
+
+[[step]]
 id = "merge"
 kind = "merge"
 per_task = true
-depends_on = ["code"]
+mode = "local"
+depends_on = ["test"]
 "#;
 
     #[test]
@@ -1914,16 +1894,6 @@ depends_on = ["code"]
         let mut config = RunnerConfig::new(&issue, workflow, harness);
         config.workdir = root.clone();
         config.repo = Some(repo);
-        config.gates.insert(
-            "test".to_owned(),
-            Gate {
-                name: "test".to_owned(),
-                command: "true".to_owned(),
-                cwd: PathBuf::from("."),
-                timeout: Duration::from_secs(5),
-            },
-        );
-        config.merge_gates = config.gates.values().cloned().collect();
         config.max_attempts = 2;
         config.log = Box::new(MemoryLog::new());
         let mut runner = Runner::new(config).expect("runner");
@@ -2055,15 +2025,6 @@ depends_on = ["code"]
         let mut config = RunnerConfig::new(&issue, workflow, CommittingHarness::default());
         config.workdir = root.clone();
         config.repo = Some(Repo::open(&root).expect("repo opens"));
-        config.gates.insert(
-            "test".to_owned(),
-            Gate {
-                name: "test".to_owned(),
-                command: "true".to_owned(),
-                cwd: PathBuf::from("."),
-                timeout: Duration::from_secs(5),
-            },
-        );
         config.max_attempts = 2;
         let mut runner = Runner::new(config).expect("runner");
 
@@ -2092,7 +2053,7 @@ depends_on = ["code"]
         let issue = issue(&dir);
         let workflow = workflow(
             r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
@@ -2159,7 +2120,7 @@ depends_on = ["analyze"]
         let issue = issue(&dir);
         let workflow = workflow(
             r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
@@ -2206,7 +2167,7 @@ skill = "analyze"
     #[test]
     fn resume_continues_past_an_answered_question() {
         const QUESTION_WORKFLOW: &str = r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
@@ -2274,19 +2235,23 @@ kind = "question"
     /// Two sequential gate steps that both pass, so a run that is not
     /// interrupted finishes.
     const TWO_GATES: &str = r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 1
 
 [[step]]
 id = "first"
 kind = "gate"
-gate = "check"
+command = "true"
+cwd = "."
+timeout_secs = 5
 
 [[step]]
 id = "second"
 kind = "gate"
-gate = "check"
+command = "true"
+cwd = "."
+timeout_secs = 5
 depends_on = ["first"]
 "#;
 
@@ -2294,15 +2259,6 @@ depends_on = ["first"]
     fn two_gate_config(issue: &Path, control: Box<dyn Control>) -> RunnerConfig<FakeHarness> {
         let workflow = workflow(TWO_GATES);
         let mut config = RunnerConfig::new(issue, workflow, FakeHarness::new());
-        config.gates.insert(
-            "check".to_owned(),
-            Gate {
-                name: "check".to_owned(),
-                command: "true".to_owned(),
-                cwd: PathBuf::from("."),
-                timeout: Duration::from_secs(5),
-            },
-        );
         config.control = control;
         config.log = Box::new(MemoryLog::new());
         config
@@ -2362,15 +2318,6 @@ depends_on = ["first"]
         let issue = issue(&dir);
         let workflow = workflow(TWO_GATES);
         let mut config = RunnerConfig::new(&issue, workflow, FakeHarness::new());
-        config.gates.insert(
-            "check".to_owned(),
-            Gate {
-                name: "check".to_owned(),
-                command: "true".to_owned(),
-                cwd: PathBuf::from("."),
-                timeout: Duration::from_secs(5),
-            },
-        );
         config.control = Box::new(ScriptedControl::new([Signal::Continue, Signal::Pause]));
         let log = MemoryLog::new();
         config.log = Box::new(log.clone());
@@ -2393,15 +2340,6 @@ depends_on = ["first"]
         let log = MemoryLog::new();
         let workflow = workflow(TWO_GATES);
         let mut config = RunnerConfig::new(&issue, workflow, FakeHarness::new());
-        config.gates.insert(
-            "check".to_owned(),
-            Gate {
-                name: "check".to_owned(),
-                command: "true".to_owned(),
-                cwd: PathBuf::from("."),
-                timeout: Duration::from_secs(5),
-            },
-        );
         config.control = Box::new(ScriptedControl::new([Signal::Abandon]));
         config.log = Box::new(log.clone());
         let mut runner = Runner::new(config).expect("runner");

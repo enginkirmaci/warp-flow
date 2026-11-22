@@ -1379,8 +1379,8 @@ fn step_detail(step: &Step) -> String {
     if let Some(produces) = &step.produces {
         parts.push(format!("produces: {produces}"));
     }
-    if let Some(gate) = &step.gate {
-        parts.push(format!("gate: {gate}"));
+    if let Some(command) = &step.command {
+        parts.push(format!("command: {command}"));
     }
     if step.kind == StepKind::Merge {
         parts.push("merge queue".to_owned());
@@ -1705,14 +1705,14 @@ mod tests {
         fs::write(
             layout::pinned_workflow(&dir),
             r#"
-schema = 1
+schema = 2
 name = "implement"
 revision = 2
 
 [[step]]
 id = "review"
 kind = "gate"
-gate = "test"
+command = "cargo test"
 depends_on = ["code"]
 
 [[step]]
@@ -1834,11 +1834,19 @@ produces = "spec.md"
         let step = Step {
             id: "split".to_owned(),
             kind: StepKind::Harness,
+            enabled: true,
             skill: Some("split".to_owned()),
-            gate: None,
+            harness: None,
+            model: None,
+            effort: None,
+            command: None,
+            cwd: None,
+            timeout_secs: None,
             depends_on: Vec::new(),
             produces: None,
             per_task: false,
+            mode: None,
+            push: false,
         };
         let rows = vec![row("analyze", "-", 1, "done")];
 
