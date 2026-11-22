@@ -88,3 +88,33 @@ withdraws the door and asks a blocking engine to stop.
 
 Unit tests live beside the module; end-to-end runs use a fake harness so the
 whole engine can be exercised in a temp directory with no model and no network.
+
+### Build output
+
+`target/` is a **symlink** to the suite's shared build cache
+(`~/.cache/warp-suite/target`), so a standalone `cargo build` here and a build
+through `warp-suite/apps/<app>` reuse one dependency tree instead of compiling
+the gpui graph twice. Two consequences:
+
+- `[profile.dev] debug = "line-tables-only"` in this app's `Cargo.toml` must
+  stay identical to warp-suite's root `[profile.dev]`. Cargo keys a crate's
+  fingerprint on the resolved profile, so a different setting makes every
+  shared dependency compile a second time. Set `debug = 2` temporarily only
+  when a session needs gdb/lldb variable inspection.
+- `cargo clean` here removes the **symlink**, not the cache: the next build
+  then creates a real `target/` on the slow disk. Re-link with
+  `ln -s ~/.cache/warp-suite/target target` (or run
+  `warp-suite/scripts/dev/link-apps.sh`, which manages these links).
+
+`.vscode/` carries the F5 setup for this checkout: a `cargo build` task and a
+gdb (Linux) / cppvsdbg (Windows) launch config that reads the binary from
+`target/debug/`.
+
+`.cargo/config.toml` (gitignored, machine-local) points the warpui-kit crates
+at the sibling `warp-suite/kits/` checkout with cargo's `paths` override, so a
+build here uses the same kit sources as a build through
+`warp-suite/apps/<app>` and the two share the compiled kit artifacts. Kit
+breakpoints resolve to `kits/`, not to a `~/.cargo/git/checkouts` copy.
+`Cargo.toml` and `Cargo.lock` keep the pinned tag, so CI's `--locked` build is
+unaffected; delete the file to build against the tag again.
+

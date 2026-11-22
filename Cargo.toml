@@ -1,6 +1,6 @@
 [package]
 name = "warp-flow"
-version = "0.1.40"
+version = "0.1.41"
 edition = "2024"
 description = "warp-flow — workflow engine for the warp-suite"
 license = "GPL-3.0"
@@ -50,6 +50,21 @@ gpui-kit = { version = "0.9", features = ["test-support"] }
 
 [build-dependencies]
 warpui-kit-build = { git = "https://github.com/enginkirmaci/warp-suite", tag = "kits-v0.2.135", package = "warpui-kit-build" }
+
+# Dev/test profile: line tables only.
+#
+# This must stay identical to warp-suite's root [profile.dev]: cargo keys a
+# crate's fingerprint on the resolved profile, so a different debuginfo setting
+# here makes every shared dependency compile a second time instead of reusing
+# the artifact the suite build already put in the shared target directory.
+# Full debuginfo=2 also puts ~1 GB of DWARF into the app binary and dominates
+# link time. line-tables-only keeps file:line in panic backtraces — including
+# gpui frames — at a fraction of the bytes, and [profile.test] inherits it, so
+# the probes get the same treatment. Set debug = 2 here temporarily when a
+# session needs gdb/lldb variable inspection; that rebuild only touches the dev
+# fingerprints.
+[profile.dev]
+debug = "line-tables-only"
 
 [profile.release]
 lto = "thin"
