@@ -26,13 +26,11 @@ use crate::ui::window::FlowApp;
 
 pub mod artifacts;
 pub mod diff;
-pub mod gates;
 pub mod settings;
 pub mod workflow;
 
 pub use artifacts::ArtifactsScreen;
 pub use diff::DiffScreen;
-pub use gates::GatesScreen;
 pub use settings::{SettingsGroup, SettingsScreen};
 pub use workflow::WorkflowScreen;
 
@@ -48,8 +46,6 @@ pub enum Screen {
     Diff,
     /// The workflow graph, editable.
     Workflow,
-    /// The repository's gates, editable, and the repositories themselves.
-    Gates,
     /// This app's settings.
     Settings,
 }
@@ -86,9 +82,9 @@ impl ScreenRun {
     }
 }
 
-/// The repository the Repos section's tabs edit. It carries no run on purpose:
-/// gates and the workflow template belong to the repository, so a repository
-/// with no runs still has both in reach.
+/// The repository the Repos section's tab edits. It carries no run on purpose:
+/// the workflow template belongs to the repository, so a repository with no
+/// runs still has it in reach.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScreenRepo {
     /// The repository root.
@@ -97,33 +93,29 @@ pub struct ScreenRepo {
     pub driving: bool,
 }
 
-/// The five screen entities, held by the window and told which run they show.
+/// The four screen entities, held by the window and told which run they show.
 pub struct Screens {
     artifacts: Entity<ArtifactsScreen>,
     diff: Entity<DiffScreen>,
     workflow: Entity<WorkflowScreen>,
-    gates: Entity<GatesScreen>,
     settings: Entity<SettingsScreen>,
 }
 
 impl Screens {
     /// Build every screen over the app's host and settings.
     ///
-    /// `window` is the frame that owns them: the gates screen writes the
-    /// window's settings (a repository added or forgotten), and the window is
-    /// what rescans and repaints the board, so that screen needs a way back to
-    /// it. A probe that builds the screens without a window passes `None`.
+    /// `window` is the frame that owns them. A probe that builds the screens
+    /// without a window passes `None`.
     pub fn new(
         host: Arc<Host>,
         settings: store::Settings,
-        window: Option<WeakEntity<FlowApp>>,
+        _window: Option<WeakEntity<FlowApp>>,
         cx: &mut App,
     ) -> Self {
         Self {
             artifacts: cx.new(|cx| ArtifactsScreen::new(Arc::clone(&host), cx)),
             diff: cx.new(|cx| DiffScreen::new(Arc::clone(&host), cx)),
             workflow: cx.new(|cx| WorkflowScreen::new(Arc::clone(&host), cx)),
-            gates: cx.new(|cx| GatesScreen::new(Arc::clone(&host), settings.clone(), window, cx)),
             settings: cx.new(|cx| SettingsScreen::new(settings, cx)),
         }
     }
@@ -135,35 +127,21 @@ impl Screens {
             .update(cx, |view, cx| view.show_group(group, cx));
     }
 
-    /// The gates screen, for a probe that drives the repository list.
-    #[doc(hidden)]
-    pub fn gates_for_probe(&self) -> Entity<GatesScreen> {
-        self.gates.clone()
-    }
-
     /// The artifacts screen, for a probe that reads the run's documents.
     #[doc(hidden)]
     pub fn artifacts_for_probe(&self) -> Entity<ArtifactsScreen> {
         self.artifacts.clone()
     }
 
-    /// Point `screen` — one of the repository's two editors — at `repo`.
+    /// Point `screen` — the repository's editor — at `repo`.
     ///
     /// The repository detail is a window a person edits, so it never needs a
     /// run: a repository with no runs, or one whose runs are all landed, still
-    /// has gates to edit and a template to revise.
+    /// has a template to revise.
     pub fn show_repo(&mut self, screen: Screen, repo: ScreenRepo, cx: &mut App) {
-        match screen {
-            Screen::Gates => {
-                self.gates.update(cx, |view, cx| {
-                    view.show_repository(repo.repo, repo.driving, cx)
-                });
-            }
-            Screen::Workflow => {
-                self.workflow
-                    .update(cx, |view, cx| view.show_repository(repo.repo, cx));
-            }
-            _ => {}
+        if screen == Screen::Workflow {
+            self.workflow
+                .update(cx, |view, cx| view.show_repository(repo.repo, cx));
         }
     }
 
@@ -181,9 +159,6 @@ impl Screens {
             Screen::Workflow => {
                 self.workflow.update(cx, |view, cx| view.show(run, cx));
             }
-            Screen::Gates => {
-                self.gates.update(cx, |view, cx| view.show(run, cx));
-            }
             Screen::Settings => {
                 self.settings.update(cx, |view, cx| view.show(run, cx));
             }
@@ -198,7 +173,6 @@ impl Screens {
             Screen::Artifacts => self.artifacts.clone().into_any_element(),
             Screen::Diff => self.diff.clone().into_any_element(),
             Screen::Workflow => self.workflow.clone().into_any_element(),
-            Screen::Gates => self.gates.clone().into_any_element(),
             Screen::Settings => self.settings.clone().into_any_element(),
         }
     }

@@ -41,8 +41,7 @@ pub struct MergeRequest {
     /// The gates to run in the task worktree after the rebase.
     ///
     /// A relative [`Gate::cwd`] is resolved against the worktree root, so a
-    /// `.flow/flow.toml` gate written with `cwd = "."` measures the rebased
-    /// task.
+    /// gate step written with `cwd = "."` measures the rebased task.
     pub gates: Vec<Gate>,
     /// Whether to push the main branch to its configured upstream afterwards.
     pub push: bool,

@@ -132,7 +132,7 @@ fn task(number: u32, title: &str) -> Task {
     }
 }
 
-/// A gate written the way `flow.toml` writes one: `cwd` relative to the
+/// A gate written the way a gate step writes one: `cwd` relative to the
 /// worktree root.
 fn gate(name: &str, command: &str) -> Gate {
     Gate {

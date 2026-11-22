@@ -509,8 +509,9 @@ pub struct RepoView {
     pub dirty: bool,
     /// Why the repository or its `.scratch/` could not be read.
     pub note: Option<String>,
-    /// How many gates the repository's `.flow/flow.toml` defines. The Repos
-    /// list counts them the way a person reads the file, without opening it.
+    /// How many gate steps the repository's `.flow/workflow.toml` defines. The
+    /// Repos list counts them the way a person reads the file, without opening
+    /// it.
     pub gates: usize,
     pub runs: Vec<Run>,
 }
@@ -645,10 +646,16 @@ fn scan_repo(path: &Path) -> RepoView {
     };
     let scan_root = root.clone().unwrap_or_else(|| path.to_path_buf());
     let dirty = root.as_deref().is_some_and(git_dirty);
-    // the repository's own gates, read once per scan: the Repos list shows the
-    // count, and a bad file is a note on the rows rather than a failed scan
-    let gates = warp_flow_core::config::FlowConfig::read(layout::flow_file(&scan_root))
-        .map(|config| config.gates_in_order().len())
+    // the repository's own gate steps, read once per scan: the Repos list shows
+    // the count, and a bad file is a note on the rows rather than a failed scan
+    let gates = Workflow::read(layout::workflow_file(&scan_root))
+        .map(|workflow| {
+            workflow
+                .steps
+                .iter()
+                .filter(|step| step.kind == StepKind::Gate)
+                .count()
+        })
         .unwrap_or(0);
 
     let scratch = scan_root.join(".scratch");
@@ -1550,6 +1557,32 @@ pub fn display_path(path: &Path) -> String {
     }
 }
 
+/// Resolve a typed path against the home a leading `~` names, then against the
+/// process's directory, the same way a remembered `--repo` argument resolves.
+pub fn resolve_path(typed: &str) -> PathBuf {
+    let home = paths::home();
+    let path = match typed.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None if typed == "~" => home,
+        None => PathBuf::from(typed),
+    };
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&path))
+            .unwrap_or(path)
+    }
+}
+
+/// Whether two repository paths name the same folder.
+pub fn same_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1758,28 +1791,28 @@ produces = "spec.md"
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The Repos list counts a repository's gates without opening the file: the
-    /// scan reads `.flow/flow.toml` once and the row says how many steps will
-    /// run.
+    /// The Repos list counts a repository's gate steps without opening the
+    /// file: the scan reads `.flow/workflow.toml` once and the row says how many
+    /// gate steps will run.
     #[test]
-    fn a_repository_counts_the_gates_its_flow_file_defines() {
+    fn a_repository_counts_the_gate_steps_its_workflow_defines() {
         let dir = scratch_dir("gates-count");
         fs::create_dir_all(dir.join(".scratch")).expect("scratch");
         fs::create_dir_all(layout::dir(&dir)).expect("the .flow folder");
         fs::write(
-            layout::flow_file(&dir),
-            "schema = 1\n\n[merge]\nmode = \"local\"\npush = false\n\n\
-             [[gate]]\nname = \"fmt\"\ncommand = \"cargo fmt --check\"\n\n\
-             [[gate]]\nname = \"test\"\ncommand = \"cargo test\"\n",
+            layout::workflow_file(&dir),
+            "schema = 2\nname = \"implement\"\nrevision = 1\n\n\
+             [[step]]\nid = \"fmt\"\nkind = \"gate\"\ncommand = \"cargo fmt --check\"\n\n\
+             [[step]]\nid = \"test\"\nkind = \"gate\"\ncommand = \"cargo test\"\n",
         )
-        .expect("flow.toml");
+        .expect("workflow.toml");
 
         let snapshot = scan(std::slice::from_ref(&dir));
         assert_eq!(snapshot.repos.len(), 1);
-        assert_eq!(snapshot.repos[0].gates, 2, "both gates are counted");
+        assert_eq!(snapshot.repos[0].gates, 2, "both gate steps are counted");
 
-        // a repository with no flow.toml is a zero, not a failure
-        fs::remove_file(layout::flow_file(&dir)).expect("remove flow.toml");
+        // a repository with no workflow.toml is a zero, not a failure
+        fs::remove_file(layout::workflow_file(&dir)).expect("remove workflow.toml");
         let snapshot = scan(std::slice::from_ref(&dir));
         assert_eq!(snapshot.repos[0].gates, 0);
 

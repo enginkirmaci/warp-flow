@@ -17,8 +17,8 @@ use std::cell::RefCell;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Bounds, Context, Entity, FocusHandle, FontWeight, MouseButton, ScrollHandle,
-    SharedString, Window, div, px,
+    AnyElement, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight, MouseButton,
+    ScrollHandle, SharedString, Window, div, px,
 };
 use gpui_kit::component::input::InputState;
 use warpui_kit_core::list_nav::ListKey;
@@ -92,7 +92,7 @@ impl Section {
     pub fn screen(self) -> Option<Screen> {
         match self {
             Self::Runs => None,
-            Self::Repos => Some(Screen::Gates),
+            Self::Repos => Some(Screen::Workflow),
             Self::About => None,
             Self::Settings => Some(Screen::Settings),
         }
@@ -153,22 +153,23 @@ impl RunTab {
     }
 }
 
-/// The repository detail's two tabs: the gates the runs must pass, and the
-/// workflow template they read.
+/// The repository detail's one tab: the workflow template its runs read.
+///
+/// It was two — Gates and Workflow — until a gate became a step (ADR-0015):
+/// the gates are steps in the same graph, so there is one document and one
+/// screen to edit it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepoTab {
-    Gates,
     Workflow,
 }
 
 impl RepoTab {
     /// Every tab, in the strip's order.
-    pub const ALL: [Self; 2] = [Self::Gates, Self::Workflow];
+    pub const ALL: [Self; 1] = [Self::Workflow];
 
     /// A stable key for debug selectors and state.
     pub fn key(self) -> &'static str {
         match self {
-            Self::Gates => "gates",
             Self::Workflow => "workflow",
         }
     }
@@ -176,7 +177,6 @@ impl RepoTab {
     /// The tab's word.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Gates => "Gates",
             Self::Workflow => "Workflow",
         }
     }
@@ -184,12 +184,11 @@ impl RepoTab {
     /// The screen this tab renders.
     pub fn screen(self) -> Screen {
         match self {
-            Self::Gates => Screen::Gates,
             Self::Workflow => Screen::Workflow,
         }
     }
 
-    /// The tab for `screen`, when `screen` is one of the repository's two.
+    /// The tab for `screen`, when `screen` is the repository's.
     pub fn from_screen(screen: Screen) -> Option<Self> {
         Self::ALL.into_iter().find(|tab| tab.screen() == screen)
     }
@@ -297,6 +296,13 @@ pub struct FlowApp {
     pub(crate) run_issue: Option<PathBuf>,
     /// The engine log panel's scrolling content.
     pub(crate) run_log_scroll: ScrollHandle,
+    /// Whether the list pane's Add-repository popover is open, and the path
+    /// field it holds. The list pane is the one place a repository is added or
+    /// forgotten now that the Gates tab is gone (ADR-0015).
+    pub(crate) add_repo_open: bool,
+    pub(crate) add_repo_field: Option<Entity<InputState>>,
+    /// Why the last add or remove could not happen, in the list's own words.
+    pub(crate) add_repo_note: Option<String>,
     window_title: String,
 }
 
@@ -394,6 +400,9 @@ impl FlowApp {
             run_abandon_confirm: None,
             run_issue: None,
             run_log_scroll: ScrollHandle::new(),
+            add_repo_open: false,
+            add_repo_field: None,
+            add_repo_note: None,
             window_title: String::new(),
         };
         app.start_scan(cx);
@@ -409,8 +418,8 @@ impl FlowApp {
     /// executor. This gpui rev does not service cross-thread channel wakeups
     /// on foreground tasks, so the scan polls instead of waiting for a push.
     ///
-    /// A run of the loop is stamped with a generation: [`Self::reload_settings`]
-    /// starts a new one with the new repository list and the old loop notices
+    /// A run of the loop is stamped with a generation: a repository added or
+    /// forgotten starts a new one with the new list, and the old loop notices
     /// the stamp on its next tick and stops, so two loops never scan at once.
     fn start_scan(&mut self, cx: &mut Context<Self>) {
         let repos = self.settings.repos.clone();
@@ -447,39 +456,6 @@ impl FlowApp {
             }
         })
         .detach();
-    }
-
-    /// Re-read the settings the screens may have changed (a repository added or
-    /// forgotten), drop a selection that no longer exists, and rescan at once.
-    ///
-    /// The Repos & gates screen calls this after it saves, so the rail's rows
-    /// and the board's cards follow the click instead of a relaunch.
-    pub(crate) fn reload_settings(&mut self, cx: &mut Context<Self>) {
-        let settings = store::Settings::load();
-        if settings.repos == self.settings.repos
-            && settings.reduce_motion == self.settings.reduce_motion
-        {
-            return;
-        }
-        self.settings = settings;
-        let known = |repo: &Path| self.settings.repos.iter().any(|known| known == repo);
-        if self.selected_repo.as_ref().is_some_and(|repo| !known(repo)) {
-            self.selected_repo = None;
-        }
-        if self
-            .selected_run
-            .as_ref()
-            .is_some_and(|key| !known(&key.repo))
-        {
-            self.selected_run = None;
-            self.screen = None;
-        }
-        if self.cursor.as_ref().is_some_and(|key| !known(&key.repo)) {
-            self.cursor = None;
-        }
-        // the new list is scanned now, not on the next two-second poll
-        self.start_scan(cx);
-        cx.notify();
     }
 
     /// Adopt a finished scan. The snapshot is the only data compared: an
@@ -599,7 +575,7 @@ impl FlowApp {
                 .and_then(RunTab::from_screen)
                 .or_else(|| self.selected_run.is_some().then_some(RunTab::Run))
                 .map(RunTab::screen),
-            Section::Repos => Some(self.repo_tab().map_or(Screen::Gates, RepoTab::screen)),
+            Section::Repos => Some(self.repo_tab().map_or(Screen::Workflow, RepoTab::screen)),
             Section::About => None,
             Section::Settings => Some(Screen::Settings),
         };
@@ -629,7 +605,7 @@ impl FlowApp {
         self.open_screen(Some(tab.screen()), window, cx);
     }
 
-    /// Open one of the repository detail's two tabs.
+    /// Open the repository detail's tab.
     pub(crate) fn open_repo_tab(
         &mut self,
         tab: RepoTab,
@@ -829,6 +805,105 @@ impl FlowApp {
                 .any(|run| &run.key == selected)
         {
             self.close_detail(cx);
+        }
+        cx.notify();
+    }
+
+    /// Open or close the list pane's Add-repository popover.
+    pub(crate) fn toggle_add_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_repo_open = !self.add_repo_open;
+        self.add_repo_note = None;
+        if self.add_repo_open {
+            let field = match self.add_repo_field.clone() {
+                Some(field) => field,
+                None => {
+                    let field = cx.new(|cx| {
+                        InputState::new(window, cx).placeholder("~/Developments/some-repo")
+                    });
+                    self.add_repo_field = Some(field.clone());
+                    field
+                }
+            };
+            let handle = field.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        }
+        cx.notify();
+    }
+
+    /// Append the typed path to the remembered repositories and select it.
+    ///
+    /// A folder that is not a git repository is still accepted, with a note: it
+    /// is the owner's configuration, and hiding it would explain nothing.
+    pub(crate) fn add_repository(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(field) = self.add_repo_field.clone() else {
+            return;
+        };
+        let typed = field.read(cx).value().trim().to_owned();
+        if typed.is_empty() {
+            self.add_repo_note = Some("Type a folder path first.".to_owned());
+            cx.notify();
+            return;
+        }
+        let path = store::resolve_path(&typed);
+        if !path.is_dir() {
+            self.add_repo_note = Some(format!("{} is not a folder.", store::display_path(&path)));
+            cx.notify();
+            return;
+        }
+        if self
+            .settings
+            .repos
+            .iter()
+            .any(|repo| store::same_path(repo, &path))
+        {
+            self.add_repo_note = Some(format!(
+                "{} is already in the list.",
+                store::display_path(&path)
+            ));
+            cx.notify();
+            return;
+        }
+        self.add_repo_note = Some(match warp_flow_core::worktree::Repo::open(&path) {
+            Ok(_) => format!("Added {}.", store::display_path(&path)),
+            Err(_) => format!(
+                "Added {} — it is not a git repository, so a run here has no branch to merge.",
+                store::display_path(&path)
+            ),
+        });
+        self.settings.repos.push(path.clone());
+        self.settings.save();
+        field.update(cx, |state, cx| state.set_value("", window, cx));
+        self.add_repo_open = false;
+        // the in-memory list already holds the new folder, so a reload would
+        // see no change and skip the scan; the scan is the point
+        self.start_scan(cx);
+        self.adopt_repo(Some(path), cx);
+    }
+
+    /// Forget one repository from this window. The checkout is never touched.
+    pub(crate) fn remove_repository(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .settings
+            .repos
+            .iter()
+            .position(|repo| store::same_path(repo, path))
+        else {
+            return;
+        };
+        let removed = self.settings.repos.remove(index);
+        self.settings.save();
+        self.add_repo_note = Some(format!(
+            "Removed {} from this window; the folder is untouched.",
+            store::display_path(&removed)
+        ));
+        self.start_scan(cx);
+        if self
+            .selected_repo
+            .as_ref()
+            .is_some_and(|selected| store::same_path(selected, &removed))
+        {
+            let next = self.settings.repos.first().cloned();
+            self.adopt_repo(next, cx);
         }
         cx.notify();
     }
@@ -1072,6 +1147,62 @@ impl FlowApp {
     #[doc(hidden)]
     pub fn settings_for_probe(&self) -> &store::Settings {
         &self.settings
+    }
+
+    /// Add `path` as a remembered repository, for a probe that drives the list
+    /// without typing into the popover.
+    ///
+    /// The button's own checks come first: a folder that exists, and no
+    /// duplicate. Saving is what the button does, so the window is told the
+    /// same way.
+    #[doc(hidden)]
+    pub fn add_repository_for_probe(
+        &mut self,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> std::result::Result<(), String> {
+        let path = path.canonicalize().unwrap_or(path);
+        if !path.is_dir() {
+            return Err(format!("{} is not a folder.", path.display()));
+        }
+        if self
+            .settings
+            .repos
+            .iter()
+            .any(|known| store::same_path(known, &path))
+        {
+            return Err(format!(
+                "{} is already a repository of this window.",
+                store::display_path(&path)
+            ));
+        }
+        self.settings.repos.push(path.clone());
+        self.settings.save();
+        self.start_scan(cx);
+        self.adopt_repo(Some(path), cx);
+        Ok(())
+    }
+
+    /// Forget `path` for a probe, by the path rather than the row's index.
+    #[doc(hidden)]
+    pub fn remove_repository_for_probe(
+        &mut self,
+        path: &Path,
+        cx: &mut Context<Self>,
+    ) -> std::result::Result<(), String> {
+        if !self
+            .settings
+            .repos
+            .iter()
+            .any(|known| store::same_path(known, path))
+        {
+            return Err(format!(
+                "{} is not a repository of this window.",
+                store::display_path(path)
+            ));
+        }
+        self.remove_repository(path, cx);
+        Ok(())
     }
 }
 

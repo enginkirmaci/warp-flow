@@ -101,16 +101,23 @@ impl FlowApp {
                             }),
                     )
                     .child(
-                        controls::icon_button("flow-list-add", "Add a repository")
-                            .debug_selector(|| "flow-list-add".into())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_repo_tab(crate::ui::window::RepoTab::Gates, window, cx);
-                            }))
-                            .child(icon(
-                                "icons/icon-plus.svg",
-                                px(theme::icon_medium()),
-                                theme::text_muted(),
-                            )),
+                        div()
+                            .relative()
+                            .child(
+                                controls::icon_button("flow-list-add", "Add a repository")
+                                    .debug_selector(|| "flow-list-add".into())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_add_repo(window, cx);
+                                    }))
+                                    .child(icon(
+                                        "icons/icon-plus.svg",
+                                        px(theme::icon_medium()),
+                                        theme::text_muted(),
+                                    )),
+                            )
+                            .when(self.add_repo_open, |slot| {
+                                slot.child(self.render_add_repo_popover(cx))
+                            }),
                     ),
             )
             .child(
@@ -176,6 +183,68 @@ impl FlowApp {
                     ),
             )
             .into_any_element()
+    }
+
+    /// The Add-repository popover: a path field and the button that appends it.
+    ///
+    /// The list pane is the one place a repository is added or forgotten now
+    /// that the Gates tab is gone (ADR-0015). A folder that is not a git
+    /// repository is still accepted, with a note: it is the owner's
+    /// configuration, and hiding it would explain nothing.
+    fn render_add_repo_popover(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut card = controls::popover_card()
+            .id("flow-add-repo")
+            .debug_selector(|| "flow-add-repo".into())
+            .absolute()
+            .top(px(30.))
+            .right_0()
+            .w(px(300.))
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.add_repo_open = false;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .text_size(px(theme::font_meta()))
+                    .text_color(theme::text_muted())
+                    .child("Add a repository"),
+            );
+        if let Some(field) = &self.add_repo_field {
+            card = card.child(
+                div()
+                    .px(px(8.))
+                    .pb(px(6.))
+                    .child(warpui_kit_core::field::mono_input(field)),
+            );
+        }
+        card = card.child(div().px(px(8.)).pb(px(4.)).flex().justify_end().child(
+            controls::button(
+                "flow-add-repo-submit",
+                "Add",
+                controls::BtnKind::Primary(theme::on_accent()),
+                theme::accent(),
+                theme::font_control(),
+                true,
+                cx.listener(|this, _, window, cx| {
+                    this.add_repository(window, cx);
+                }),
+            ),
+        ));
+        if let Some(note) = &self.add_repo_note {
+            card = card.child(
+                div()
+                    .debug_selector(|| "flow-add-repo-note".into())
+                    .px(px(8.))
+                    .pb(px(6.))
+                    .text_size(px(theme::font_meta()))
+                    .text_color(theme::text_muted())
+                    .child(note.clone()),
+            );
+        }
+        card.into_any_element()
     }
 
     /// The list's first row: every run at once, the default scope.
@@ -404,9 +473,9 @@ fn repo_row_frame(id: impl Into<gpui::ElementId>, selected: bool) -> gpui::State
     row
 }
 
-/// The Repos section's second line: the repository's own path and how many gates
-/// its `.flow/flow.toml` defines. A repository row in that section is a place, not a
-/// run count, so it reads the way `Repos › Gates` will open.
+/// The Repos section's second line: the repository's own path and how many gate
+/// steps its `.flow/workflow.toml` defines. A repository row in that section is
+/// a place, not a run count, so it reads the way `Repos › Workflow` will open.
 fn repo_facts_line(repo: &store::RepoView) -> AnyElement {
     let path = repo
         .root

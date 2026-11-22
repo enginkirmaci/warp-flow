@@ -267,8 +267,8 @@ impl FlowApp {
 
     // ---- the repository ---------------------------------------------------
 
-    /// The repository detail: the head, the Gates and Workflow tabs, and the
-    /// open tab's screen.
+    /// The repository detail: the head, the Workflow tab, and the screen it
+    /// opens.
     pub(crate) fn render_repo_detail(
         &mut self,
         _window: &mut Window,
@@ -277,7 +277,7 @@ impl FlowApp {
         let Some(repo) = self.repo_in_focus() else {
             return self.render_no_run();
         };
-        let tab = self.repo_tab().unwrap_or(RepoTab::Gates);
+        let tab = self.repo_tab().unwrap_or(RepoTab::Workflow);
         let name = crate::ui::window::repo_label(&repo);
         let body = self.screens.render(tab.screen());
         div()
@@ -363,7 +363,6 @@ impl FlowApp {
                             .flex()
                             .items_end()
                             .gap_0p5()
-                            .child(repo_tab(RepoTab::Gates, tab, cx))
                             .child(repo_tab(RepoTab::Workflow, tab, cx)),
                     )
                     .child(div().h(px(1.)).w_full().bg(theme::hairline())),
@@ -462,7 +461,6 @@ fn repo_tab(tab: RepoTab, open: RepoTab, cx: &mut Context<FlowApp>) -> AnyElemen
             this.open_repo_tab(tab, window, cx);
         }))
         .tooltip(tooltip_text(match tab {
-            RepoTab::Gates => "The gates a run must pass",
             RepoTab::Workflow => "The workflow template a run reads",
         }))
         .into_any_element()

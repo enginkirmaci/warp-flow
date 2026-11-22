@@ -7,7 +7,7 @@
 //! the conflict bar and the diff's 44 path bar over `warpui-kit-diff`.
 //!
 //! The screen is read-only. Git, the task file, the run's conflict record and
-//! the repository's `.flow/flow.toml` are read on the background executor when `show`
+//! the repository's `.flow/workflow.toml` are read on the background executor when `show`
 //! hands the screen a new [`ScreenRun`] or the task cursor moves; a frame only
 //! reads loaded state. The picker owns its cursor and arrows in the screen's own
 //! [`FocusHandle`], never a window-level handler.
@@ -44,7 +44,6 @@ use crate::store::{self, Column, StepState, TaskRow};
 use crate::theme;
 
 use super::ScreenRun;
-use super::gates::read_gates;
 
 /// One changes-rail row, and one changes group header.
 const RAIL_ROW_HEIGHT: f32 = 34.;
@@ -1203,7 +1202,7 @@ impl DiffScreen {
                     div().py(px(8.)).child(quiet_line(
                         self.gates_note
                             .as_deref()
-                            .unwrap_or("No gates in .flow/flow.toml yet."),
+                            .unwrap_or("No gate steps in .flow/workflow.toml yet."),
                     )),
                 );
             }
@@ -1883,44 +1882,52 @@ fn conflict_paths(body: &str) -> Vec<String> {
     paths
 }
 
-/// The repository's gates joined with this run's last outcome for each.
+/// The repository's gate steps joined with this run's last outcome for each.
+///
+/// A gate is a step (ADR-0015), so the card reads the same graph the run does
+/// rather than a second file that could disagree with it.
 fn read_gate_views(repo: &Path, run: &store::Run) -> GateRead {
-    match read_gates(repo) {
-        Ok(gates) if gates.is_empty() => GateRead {
-            gates: Vec::new(),
-            note: Some("No gates in .flow/flow.toml yet.".to_owned()),
-        },
-        Ok(gates) => GateRead {
-            gates: gates
-                .into_iter()
-                .map(|gate| {
-                    let (state, outcome) = gate_outcome(run, &gate.name);
-                    GateView {
-                        name: gate.name,
-                        command: gate.command,
-                        timeout_secs: gate.timeout.as_secs(),
-                        state,
-                        outcome,
-                    }
-                })
-                .collect(),
-            note: None,
-        },
-        Err(error) => GateRead {
-            gates: Vec::new(),
-            note: Some(error),
-        },
+    let path = warp_flow_core::layout::workflow_file(repo);
+    let workflow = match warp_flow_core::graph::Workflow::read(&path) {
+        Ok(workflow) => workflow,
+        Err(error) => {
+            return GateRead {
+                gates: Vec::new(),
+                note: Some(format!("{}", error)),
+            };
+        }
+    };
+    let gates: Vec<GateView> = workflow
+        .steps
+        .iter()
+        .filter(|step| step.kind == StepKind::Gate)
+        .map(|step| {
+            let (state, outcome) = gate_outcome(run, &step.id);
+            GateView {
+                name: step.id.clone(),
+                command: step.command.clone().unwrap_or_default(),
+                timeout_secs: step.timeout_secs.unwrap_or(900),
+                state,
+                outcome,
+            }
+        })
+        .collect();
+    if gates.is_empty() {
+        GateRead {
+            gates,
+            note: Some("No gate steps in .flow/workflow.toml yet.".to_owned()),
+        }
+    } else {
+        GateRead { gates, note: None }
     }
 }
 
 /// What the run last did with `gate`: the newest log row of a step that names
 /// it, classified the way the run screen classifies outcomes.
 fn gate_outcome(run: &store::Run, gate: &str) -> (StepState, String) {
-    let wanted = format!("gate: {gate}");
     let mut latest: Option<&store::RunRow> = None;
     for step in &run.steps {
-        if step.kind != Some(StepKind::Gate) || !step.detail.split(" · ").any(|part| part == wanted)
-        {
+        if step.kind != Some(StepKind::Gate) || step.id != gate {
             continue;
         }
         for row in &run.rows {

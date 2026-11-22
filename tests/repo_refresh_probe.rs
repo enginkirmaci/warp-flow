@@ -1,6 +1,7 @@
-//! Headless probe for ticket 05: a repository added in the Repos & gates screen
-//! reaches the rail and the board without a relaunch, and one removed takes its
-//! run away.
+//! Headless probe: a repository added from the list pane's Add popover reaches
+//! the rail and the board without a relaunch, and one removed takes its run
+//! away. The list pane is the one place repositories are managed now that the
+//! Gates tab is gone (ADR-0015).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -125,20 +126,16 @@ fn a_repository_added_in_the_screen_reaches_the_board_at_once(cx: &mut TestAppCo
     );
 
     // select the first run, then open the repository section from the rail: its
-    // Gates tab is the repository's flow.toml
+    // one tab is the repository's workflow
     click(cx, "flow-card-repo-a-alpha-run");
     click(cx, "flow-rail-repos");
     assert!(
-        cx.debug_bounds("flow-gates-head").is_some(),
-        "the gates screen is showing"
+        cx.debug_bounds("flow-workflow").is_some(),
+        "the workflow screen is showing"
     );
     handle
         .update(cx, |app, _window, cx| {
-            app.screens_for_probe()
-                .gates_for_probe()
-                .update(cx, |screen, cx| {
-                    screen.add_repository_for_probe(second.clone(), cx)
-                })
+            app.add_repository_for_probe(second.clone(), cx)
         })
         .expect("the window is open")
         .expect("the repository is added");
@@ -158,27 +155,15 @@ fn a_repository_added_in_the_screen_reaches_the_board_at_once(cx: &mut TestAppCo
         "the window selected the repository the screen added"
     );
 
-    // a row clicked in the same list moves the gate editor with the head: the
-    // two views read one selection
+    // a row clicked in the same list moves the workflow editor with the head:
+    // the two views read one selection
     click(cx, "flow-repo-repo-a");
-    let (selected, pointed) = handle
-        .read_with(cx, |app, cx| {
-            (
-                app.selected_repo_for_probe().map(Path::to_path_buf),
-                app.screens_for_probe()
-                    .gates_for_probe()
-                    .read(cx)
-                    .selected_for_probe()
-                    .map(Path::to_path_buf),
-            )
+    let selected = handle
+        .read_with(cx, |app, _| {
+            app.selected_repo_for_probe().map(Path::to_path_buf)
         })
         .expect("the window is open");
     assert_eq!(selected.as_deref(), Some(first.as_path()));
-    assert_eq!(
-        pointed.as_deref(),
-        Some(first.as_path()),
-        "the gate editor reads the repository the row selected"
-    );
     click(cx, "flow-repo-repo-b");
 
     click(cx, "flow-rail-runs");
@@ -204,11 +189,7 @@ fn a_repository_added_in_the_screen_reaches_the_board_at_once(cx: &mut TestAppCo
     click(cx, "flow-rail-repos");
     handle
         .update(cx, |app, _window, cx| {
-            app.screens_for_probe()
-                .gates_for_probe()
-                .update(cx, |screen, cx| {
-                    screen.remove_repository_for_probe(&second, cx)
-                })
+            app.remove_repository_for_probe(&second, cx)
         })
         .expect("the window is open")
         .expect("the repository is forgotten");
