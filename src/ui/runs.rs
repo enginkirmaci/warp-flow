@@ -1,11 +1,11 @@
 //! The run column: the detail's 320 work list, the board read downwards.
 //!
-//! A 17/600 scope title with Refresh, the one summary line, the filter menu,
-//! then a 32 band per non-empty lane and the 64 rows under it. Waiting on you
-//! takes `changes` and Blocked takes `danger`; the other lanes stay quiet,
-//! because they are not wrong, they only wait. The column owns the keyboard
-//! cursor and keeps it in view: the same keys the six-column board answered, on
-//! one axis and one lane at a time.
+//! A 17/600 scope title with Refresh, the one summary line, the filter menu and
+//! the column's one filled primary — New run — then a 32 band per non-empty
+//! lane and the 64 rows under it. Waiting on you takes `changes` and Blocked
+//! takes `danger`; the other lanes stay quiet, because they are not wrong, they
+//! only wait. The column owns the keyboard cursor and keeps it in view: the
+//! same keys the six-column board answered, on one axis and one lane at a time.
 //!
 //! Every row carries the ⋯ menu at its right: the two copies, the run folder
 //! and Station, one state action and Abandon behind its second click. The menu
@@ -27,6 +27,7 @@ use warpui_kit_core::{A11y as _, controls, icon, motion};
 
 use crate::store::{Column, Run, RunFilter, RunKey};
 use crate::theme;
+use crate::ui::new_run;
 use crate::ui::window::{FlowApp, PAGE};
 
 /// The name a run row's group gets, so the age (and the busy tag) can hand the
@@ -307,7 +308,9 @@ impl FlowApp {
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .child(self.filter_button(cx)),
+                    .child(self.filter_button(cx))
+                    .child(div().flex_1())
+                    .child(new_run::button(self, cx)),
             );
         if self.filter != RunFilter::All {
             head = head.child(

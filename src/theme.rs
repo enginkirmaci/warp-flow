@@ -9,9 +9,9 @@ pub use warpui_kit_core::shell::scaled;
 
 // The live palette readers, re-exported as the app's own vocabulary.
 pub use warpui_kit_core::palette::{
-    ADD, DANGER, WARN, accent, accent_hover, accent_ink, accent_soft, border_light, hairline,
-    line_strong, on_accent, panel, popup, raised, surface, text, text_dim, text_muted, tint, well,
-    window_chrome,
+    ADD, DANGER, SCRIM, WARN, accent, accent_hover, accent_ink, accent_soft, border_light,
+    hairline, line_strong, on_accent, panel, popup, raised, surface, text, text_dim, text_muted,
+    tint, well, window_chrome,
 };
 
 // ---- entity hues ------------------------------------------------------------

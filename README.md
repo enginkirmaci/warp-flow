@@ -35,6 +35,11 @@ section's detail holds the 320 run column — the board read downwards, one lane
 band per state the issue folders fall into — beside the open run. The `Repos`
 section holds the selected repository's gates and workflow template.
 
+The run column's **New run** is the one screen action that creates an issue
+folder: a title and the request become `.scratch/<slug>/spec.md` (a title
+already in use gets `-2`, `-3`, …), the next scan lands the run in Triage, and
+the window opens it with **Start run** in reach.
+
 The rail is `Runs`, `Repos`, then `About` and `Settings` at its foot. Opening a
 run puts its four tabs in the run's head:
 

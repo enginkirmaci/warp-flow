@@ -31,7 +31,9 @@ either way. This file adds only the app-specific facts.
   `warpui_kit_core::shell`: rail 76, list 432 (320–560), detail padding 24,
   reading 760, control 34, field 36, tab 42. Keep the state grouping: a lane
   band per non-empty `store::Column`, Waiting on you in `CHANGES`, Blocked in
-  `DANGER`, the rest quiet.
+  `DANGER`, the rest quiet. `new_run.rs` is the column's one filled primary: it
+  asks for a title and a request, writes `.scratch/<slug>/spec.md`, and hands
+  the window the run key to open once the next scan holds it.
 - `src/ui/screens/` — the run's five screens, one entity each: `artifacts.rs`,
   `diff.rs`, `workflow.rs`, `gates.rs`, `settings.rs`. `mod.rs` owns the
   `Screen` vocabulary, the `ScreenRun` a screen is handed, and the two rules

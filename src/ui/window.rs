@@ -6,7 +6,8 @@
 //! Each surface lives in its own module and renders through `impl FlowApp`:
 //! [`crate::ui::chrome`] (title bar and rail), [`crate::ui::repos`] (the list),
 //! [`crate::ui::runs`] (the run column) and [`crate::ui::detail`] (the run's head,
-//! tabs, strip and tab bodies). The run tab's own content is [`crate::ui::run`].
+//! tabs, strip and tab bodies). The run tab's own content is [`crate::ui::run`],
+//! and [`crate::ui::new_run`] is the form that writes a new issue folder.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -238,6 +239,12 @@ pub struct FlowApp {
     /// family's modal, opened by the Legal card's View license.
     pub(crate) about_license_open: bool,
     pub(crate) about_license: Option<Entity<LiveEditorState>>,
+    /// The New run form, while it is open. It owns its two fields and the
+    /// folder name the title currently resolves to.
+    pub(crate) new_run: Option<crate::ui::new_run::NewRunForm>,
+    /// The run a just-created issue folder becomes. The next scan that holds
+    /// it selects and opens it, so a create lands on the run, not the board.
+    pub(crate) pending_run: Option<RunKey>,
     /// Whether the list pane's edge is being dragged. The pointer's window
     /// position drives the width until the button comes up, and the width is
     /// remembered on release.
@@ -363,6 +370,8 @@ impl FlowApp {
             list_resizing: false,
             about_license_open: false,
             about_license: None,
+            new_run: None,
+            pending_run: None,
             selected_repo: None,
             selected_run: None,
             cursor: None,
@@ -489,7 +498,35 @@ impl FlowApp {
         // adopted: one source of truth, and the door never runs a scan.
         self.board.publish(self.snapshot.clone());
         self.reconcile_selection(cx);
+        self.select_pending_run(cx);
         self.refresh_screens(cx);
+        cx.notify();
+    }
+
+    /// Open the run a New run form just wrote, once the scan holds it.
+    ///
+    /// A create writes the issue folder and asks for a scan; the folder is not
+    /// a run until that scan reads it. The key is taken whatever happens, so a
+    /// create that a racing scan missed does not reopen a later run by
+    /// accident: the row is on the board on the next tick either way.
+    fn select_pending_run(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.pending_run.take() else {
+            return;
+        };
+        if self.snapshot.find(&key).is_none() {
+            return;
+        }
+        self.selected_repo = Some(key.repo.clone());
+        self.cursor = Some(key.clone());
+        self.selected_run = Some(key);
+        self.section = Section::Runs;
+        self.screen = Some(Screen::Run);
+        self.run_question = None;
+        self.run_multi.clear();
+        self.run_answer_error = None;
+        self.run_action_error = None;
+        self.run_abandon_confirm = None;
+        self.run_issue = None;
         cx.notify();
     }
 
@@ -1038,6 +1075,12 @@ impl Render for FlowApp {
         if let Some(list) = list {
             stage = stage.child(list);
         }
+        // The New run form is a blocking surface over the whole window, so it
+        // is a root child after the stage: it paints over the panes it stops.
+        let new_run = self
+            .new_run
+            .is_some()
+            .then(|| self.render_new_run(window, cx));
         div()
             .size_full()
             .flex()
@@ -1093,6 +1136,7 @@ impl Render for FlowApp {
                     .child(self.render_rail(cx))
                     .child(stage.child(detail)),
             )
+            .children(new_run)
     }
 }
 
