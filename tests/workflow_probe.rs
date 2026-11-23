@@ -1369,6 +1369,24 @@ fn the_default_document_has_every_step_disabled(cx: &mut TestAppContext) {
         assert!(gate.timeout_secs.is_some_and(|secs| secs > 0));
         assert!(gate.per_task, "a gate measures every task");
     }
+    // The bump is a gate too: the script does the mechanical work, so the
+    // default document offers no session for it, and it runs once for the run
+    // instead of once per task.
+    let bump = graph.step("bump").expect("the bump is in the document");
+    assert_eq!(bump.kind, StepKind::Gate);
+    assert_eq!(command("bump"), "python3 scripts/bump.py");
+    assert_eq!(bump.cwd.as_deref(), Some("."));
+    assert_eq!(bump.timeout_secs, Some(300));
+    assert!(!bump.per_task, "the bump runs once, not once per task");
+    assert_eq!(bump.depends_on, Some(Vec::new()), "the join names nothing");
+    for (field, value) in [
+        ("skill", &bump.skill),
+        ("harness", &bump.harness),
+        ("model", &bump.model),
+        ("effort", &bump.effort),
+    ] {
+        assert!(value.is_none(), "the bump gate names no {field}");
+    }
     let merge = graph.step("merge").expect("the merge step");
     assert_eq!(merge.kind, StepKind::Merge);
     assert_eq!(merge.mode.as_deref(), Some("local"));
