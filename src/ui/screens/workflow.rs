@@ -320,13 +320,31 @@ impl WorkflowScreen {
             }
         });
         let graph = read.as_ref().ok().cloned();
+        // A file that exists but will not parse is not a file that is absent.
+        // Offering the shipped shape over a broken one would let Save replace
+        // a graph of nine steps with a graph of one, so the editor refuses to
+        // work until the file is fixed outside it.
+        let broken = graph.is_none() && path.is_file();
         self.selected = 0;
         self.loaded = graph.clone();
-        self.dirty = graph.is_none();
+        self.dirty = graph.is_none() && !broken;
         self.status = None;
-        self.error = error;
+        self.error = error.map(|error| {
+            if broken {
+                format!(
+                    "{error}\nThe file is left alone until it parses: fix it outside Warp Flow, \
+                     then reopen this tab."
+                )
+            } else {
+                error
+            }
+        });
         self.fields = None;
-        let working = graph.clone().or_else(|| Some(new_graph()));
+        let working = if broken {
+            None
+        } else {
+            graph.clone().or_else(|| Some(new_graph()))
+        };
         self.revisions = working
             .as_ref()
             .map(|graph| {
@@ -1052,11 +1070,38 @@ impl WorkflowScreen {
                         .flex_1()
                         .min_w_0()
                         .bg(theme::panel())
-                        .child(empty_state(
-                            "icons/icon-flow.svg",
-                            "No steps",
-                            "Add a step to give the repository's runs something to do.",
-                        )),
+                        .child(match &self.error {
+                            // A file that would not parse: say so, and never
+                            // the "add a step" invitation — that one leads to a
+                            // save that would overwrite the file.
+                            Some(error) if self.graph.is_none() => div()
+                                .debug_selector(|| "flow-workflow-unreadable".into())
+                                .flex()
+                                .flex_col()
+                                .gap(px(10.))
+                                .px(px(theme::scaled(shell::DETAIL_PADDING)))
+                                .py(px(24.))
+                                .child(
+                                    div()
+                                        .text_size(px(theme::font_screen_title()))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme::text())
+                                        .child("workflow.toml could not be read"),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(theme::code_font())
+                                        .text_size(px(theme::font_mono_meta()))
+                                        .text_color(theme::DANGER)
+                                        .child(error.clone()),
+                                )
+                                .into_any_element(),
+                            _ => empty_state(
+                                "icons/icon-flow.svg",
+                                "No steps",
+                                "Add a step to give the repository's runs something to do.",
+                            ),
+                        }),
                 )
                 .into_any_element();
         };
@@ -2164,9 +2209,9 @@ impl Render for WorkflowScreen {
         if self.read_only {
             return self.render_read_only(cx);
         }
-        if self.graph.is_none() {
-            return placeholder("workflow");
-        }
+        // No early return for a missing graph: a repository's template that
+        // would not parse has no working copy, and the editor is the one place
+        // that can say so instead of a blank placeholder.
         self.render_editor(window, cx)
     }
 }

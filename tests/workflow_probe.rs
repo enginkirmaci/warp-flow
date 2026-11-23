@@ -545,3 +545,45 @@ fn a_gate_step_edits_its_folder_and_timeout(cx: &mut TestAppContext) {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A file that will not parse is left alone: the editor refuses to offer the
+/// shipped shape over it, because Save would replace nine steps with one.
+#[gpui_kit::gpui::test]
+fn a_broken_template_is_not_overwritten(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("broken");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let (repo, _issue) = seed_repo(&home, Some(WORKFLOW));
+    let path = warp_flow_core::layout::workflow_file(&repo);
+    let broken = "schema = 2\nname = \"implement\"\nrevision = 4\n\n[[step]]\nid = \"a\"\n\
+                  kind = \"nonsense\"\n";
+    std::fs::write(&path, broken).expect("a broken template");
+
+    let host = Arc::new(Host::new());
+    let handle = cx.open_window(size(px(1200.), px(860.)), |_window, cx| {
+        let screen = cx.new(|cx| WorkflowScreen::new(Arc::clone(&host), cx));
+        screen.update(cx, |screen, cx| {
+            screen.show_repository(repo.clone(), cx);
+        });
+        ScreenHost(screen)
+    });
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    // no working graph, so nothing Save could write
+    let graph = handle
+        .read_with(cx, |host, cx| host.0.read(cx).graph_for_probe().cloned())
+        .expect("the window is open");
+    assert!(graph.is_none(), "a broken file has no working copy");
+    assert!(
+        cx.debug_bounds("flow-workflow-unreadable").is_some(),
+        "the screen says the file could not be read"
+    );
+
+    // and the file is byte-for-byte what it was
+    let after = std::fs::read_to_string(&path).expect("the file is still there");
+    assert_eq!(after, broken, "the file was never touched");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
