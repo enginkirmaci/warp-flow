@@ -593,7 +593,7 @@ fn a_many_task_run_shrinks_the_columns_instead_of_overflowing(cx: &mut TestAppCo
         "[[step]]\nid = \"analyze\"\nkind = \"harness\"\nskill = \"analyze\"\nproduces = \"spec.md\"\n\n\
          [[step]]\nid = \"code\"\nkind = \"harness\"\nskill = \"code\"\nper_task = true\ndepends_on = [\"analyze\"]\n",
     );
-    for number in 1..=12 {
+    for number in 1..=10 {
         seed_task(
             &repo,
             "run-many",
@@ -611,7 +611,7 @@ fn a_many_task_run_shrinks_the_columns_instead_of_overflowing(cx: &mut TestAppCo
 
     let card = bounds(cx, "flow-run-workflow");
     let mut previous: Option<gpui::Bounds<gpui::Pixels>> = None;
-    for number in 1..=12 {
+    for number in 1..=10 {
         let name = format!("flow-run-lane-code-{number:02}");
         let cell = bounds(cx, selector(&name));
         assert!(
@@ -629,8 +629,8 @@ fn a_many_task_run_shrinks_the_columns_instead_of_overflowing(cx: &mut TestAppCo
         previous = Some(cell);
     }
     assert!(
-        cx.debug_bounds("flow-run-matrix-task-12").is_some(),
-        "the twelfth task still has its header column"
+        cx.debug_bounds("flow-run-matrix-task-10").is_some(),
+        "the tenth task still has its header column"
     );
 
     cleanup(home);

@@ -216,7 +216,7 @@ pub fn row(
             div()
                 .flex_shrink_0()
                 .w(px(label_width))
-                .text_size(px(theme::font_meta()))
+                .text_size(px(theme::font_label()))
                 .text_color(theme::text_dim())
                 .child(select.label.to_owned()),
         )
@@ -267,7 +267,7 @@ pub fn panel(
                 })
                 .px(px(8.))
                 .py(px(6.))
-                .text_size(px(theme::font_meta()))
+                .text_size(px(theme::font_sub()))
                 .text_color(theme::text_muted())
                 .child(note.clone()),
         );
@@ -407,7 +407,7 @@ fn option_row(
         .children(hint.map(|hint| {
             div()
                 .flex_shrink_0()
-                .text_size(px(theme::font_micro()))
+                .text_size(px(theme::font_sub()))
                 .text_color(theme::text_muted())
                 .child(hint.to_owned())
         }))

@@ -144,7 +144,7 @@ fn the_shell_routes_its_sections_and_a_runs_tabs(cx: &mut TestAppContext) {
     let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
     settle(cx);
 
-    // the run column owns the detail until a run is picked, and the rail is the
+    // the runs list owns the detail until a run is picked, and the rail is the
     // two work sections and Settings at its foot: About is a Settings group now
     assert!(cx.debug_bounds("flow-board").is_some());
     assert!(
@@ -163,12 +163,12 @@ fn the_shell_routes_its_sections_and_a_runs_tabs(cx: &mut TestAppContext) {
         "About is not a rail item: it is the last Settings group"
     );
 
-    // picking a run opens its pane: the column stays, the four tabs appear
+    // picking a run opens its pane: the list stays, the four tabs appear
     click(cx, "flow-card-repo-a-demo-run");
     assert!(cx.debug_bounds("flow-detail").is_some());
     assert!(
         cx.debug_bounds("flow-board").is_some(),
-        "the run column stays beside the run"
+        "the runs list stays beside the run"
     );
     for tab in ["run", "diff", "artifacts", "workflow"] {
         assert!(
@@ -317,8 +317,12 @@ fn ctrl_backslash_folds_the_list_away_and_back(cx: &mut TestAppContext) {
         "Ctrl+\\ folds the list pane away"
     );
     assert!(
-        cx.debug_bounds("flow-board").is_some(),
-        "the run column takes the width the list leaves"
+        cx.debug_bounds("flow-board").is_none(),
+        "the runs are that list: folding it takes them with it"
+    );
+    assert!(
+        cx.debug_bounds("flow-no-run").is_some(),
+        "the detail takes the width the list leaves"
     );
 
     cx.simulate_keystrokes("ctrl-\\");

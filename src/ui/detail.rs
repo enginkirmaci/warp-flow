@@ -11,9 +11,10 @@ use gpui::{AnyElement, Context, FontWeight, SharedString, Window, div, px, relat
 
 use warpui_kit_core::{A11y as _, controls, icon, shell};
 
-use crate::store::{self, Run};
+use crate::store::{self, Run, RunState};
 use crate::theme;
-use crate::ui::runs::{plural, state_hue, state_icon};
+use crate::ui::plural;
+use crate::ui::runs::{state_hue, state_icon};
 use crate::ui::screens::Screen;
 use crate::ui::window::{FlowApp, RunTab};
 
@@ -26,17 +27,27 @@ impl FlowApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(run) = self
-            .selected_run
-            .as_ref()
-            .and_then(|key| self.snapshot.find(key))
-            .cloned()
-        else {
+        let Some(key) = self.selected_run.clone() else {
+            return self.render_no_run();
+        };
+        // The run is borrowed from the scan, never cloned into the frame: a
+        // `Run` carries its spec, task rows and steps. Only the three cheap
+        // fields the screen mutates around are copied, and the borrow ends
+        // before the frame starts.
+        let Some(prep) = self.snapshot.find(&key).map(|run| crate::ui::run::RunPrep {
+            dir: run.dir.clone(),
+            key: run.key.clone(),
+            question: run.question.clone(),
+        }) else {
+            return self.render_no_run();
+        };
+        self.prepare_run_body(prep, window, cx);
+        let Some(run) = self.snapshot.find(&key) else {
             return self.render_no_run();
         };
         let tab = self.run_tab().unwrap_or(RunTab::Run);
         let body = match tab {
-            RunTab::Run => self.render_run_body(run.clone(), window, cx),
+            RunTab::Run => self.render_run_body(run, window, cx),
             other => self.screens.render(other.screen()),
         };
         div()
@@ -49,7 +60,7 @@ impl FlowApp {
             .h_full()
             .min_h_0()
             .bg(theme::panel())
-            .child(self.render_run_head(&run, tab, cx))
+            .child(self.render_run_head(run, tab, cx))
             .child(
                 div()
                     .flex()
@@ -72,7 +83,7 @@ impl FlowApp {
             .flex_wrap()
             .items_center()
             .gap(px(6.))
-            .text_size(px(theme::font_meta()))
+            .text_size(px(theme::font_sub()))
             .text_color(theme::text_muted())
             .child(
                 div()
@@ -109,32 +120,20 @@ impl FlowApp {
             .gap_0p5()
             .child(run_tab(
                 RunTab::Run,
-                Some(format!(
-                    "{} {}",
-                    run.attempts,
-                    plural(run.attempts, "attempt")
-                )),
+                Some(plural(run.attempts, "attempt")),
                 tab,
                 cx,
             ))
             .child(run_tab(
                 RunTab::TaskDiff,
-                Some(format!(
-                    "{} {}",
-                    run.tasks_total,
-                    plural(run.tasks_total, "task")
-                )),
+                Some(plural(run.tasks_total, "task")),
                 tab,
                 cx,
             ))
             .child(run_tab(RunTab::Artifacts, None, tab, cx))
             .child(run_tab(
                 RunTab::Workflow,
-                Some(format!(
-                    "{} {}",
-                    run.steps.len(),
-                    plural(run.steps.len(), "step")
-                )),
+                Some(plural(run.steps.len(), "step")),
                 tab,
                 cx,
             ));
@@ -168,7 +167,7 @@ impl FlowApp {
                             .text_color(theme::text())
                             .child(run.title.clone()),
                     )
-                    .child(state_pill(run))
+                    .child(state_pill(run, self.driving(&run.key)))
                     .child(self.render_run_actions(run, cx))
                     .child(
                         controls::icon_button("flow-run-back-button", "Close the run")
@@ -284,7 +283,7 @@ impl FlowApp {
                             .flex()
                             .items_center()
                             .gap(px(6.))
-                            .text_size(px(theme::font_meta()))
+                            .text_size(px(theme::font_sub()))
                             .text_color(theme::text_muted())
                             .child(icon(
                                 "icons/icon-folder.svg",
@@ -312,14 +311,19 @@ impl FlowApp {
     }
 }
 
-/// The state pill: the lane's word in its hue, with the spinner while the run
-/// is being driven.
-fn state_pill(run: &Run) -> AnyElement {
+/// The state pill: the lane's word in its hue, with the spinner only while
+/// this window's worker is driving the run. A record that says `running` with
+/// no worker behind it is a takeover — a spinner there would claim motion the
+/// window cannot see.
+fn state_pill(run: &Run, driving: bool) -> AnyElement {
     let hue = state_hue(run.column);
     let word = if run.question.is_some() {
         "waiting on you".to_owned()
-    } else if matches!(run.status.as_str(), "paused" | "abandoned" | "done") {
-        run.status.clone()
+    } else if matches!(
+        run.status,
+        RunState::Paused | RunState::Abandoned | RunState::Done
+    ) {
+        run.status.as_str().to_owned()
     } else {
         run.column.state_word().to_owned()
     };
@@ -335,7 +339,7 @@ fn state_pill(run: &Run) -> AnyElement {
         .text_color(hue)
         .text_size(px(theme::font_meta()))
         .font_weight(FontWeight::MEDIUM)
-        .child(if run.column == store::Column::Running {
+        .child(if driving && run.column == store::Column::Running {
             motion_spinner()
         } else {
             icon(state_icon(run.column), px(theme::icon_tiny()), hue).into_any_element()

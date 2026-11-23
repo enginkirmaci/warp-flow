@@ -137,7 +137,165 @@ fn absolute(path: &Path) -> PathBuf {
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// The board's six columns, in display order.
+/// The state an issue folder is in, read from its `run.md`, else its
+/// `spec.md`.
+///
+/// This is the one vocabulary the window, the door and the board compare
+/// against. The file strings are the protocol's, so the variants keep them
+/// exactly; a status this build does not know is [`RunState::Unknown`], which
+/// takes the Triage lane rather than inventing a state.
+///
+/// It is not [`Column`]: six lanes are the board's reading of a run, and a
+/// paused run and a fresh one may share a lane while needing different words
+/// and different actions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunState {
+    NeedsTriage,
+    NeedsInfo,
+    ReadyForAgent,
+    ReadyForHuman,
+    Running,
+    Waiting,
+    Paused,
+    Blocked,
+    Done,
+    Merged,
+    Abandoned,
+    Wontfix,
+    /// A status this build does not know. It is not an error: the file may be
+    /// newer than the window, and Triage is where a person looks at it.
+    Unknown,
+}
+
+impl RunState {
+    /// The state a status string names.
+    pub fn parse(text: &str) -> Self {
+        match text {
+            "needs-triage" => Self::NeedsTriage,
+            "needs-info" => Self::NeedsInfo,
+            "ready-for-agent" => Self::ReadyForAgent,
+            "ready-for-human" => Self::ReadyForHuman,
+            "running" => Self::Running,
+            "waiting" => Self::Waiting,
+            "paused" => Self::Paused,
+            "blocked" => Self::Blocked,
+            "done" => Self::Done,
+            "merged" => Self::Merged,
+            "abandoned" => Self::Abandoned,
+            "wontfix" => Self::Wontfix,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// The state a scan reads: `run.md`'s status, else `spec.md`'s, else the
+    /// Triage it starts in. The one place the two file sources are combined.
+    pub fn read(run_md: Option<&str>, spec_md: Option<&str>) -> Self {
+        run_md
+            .or(spec_md)
+            .map(Self::parse)
+            .unwrap_or(Self::NeedsTriage)
+    }
+
+    /// The string the protocol records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NeedsTriage => "needs-triage",
+            Self::NeedsInfo => "needs-info",
+            Self::ReadyForAgent => "ready-for-agent",
+            Self::ReadyForHuman => "ready-for-human",
+            Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::Paused => "paused",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Merged => "merged",
+            Self::Abandoned => "abandoned",
+            Self::Wontfix => "wontfix",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// The word a state pill prints when the lane's word would hide the state.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::ReadyForAgent | Self::ReadyForHuman => "ready",
+            Self::NeedsTriage | Self::NeedsInfo | Self::Unknown => "triage",
+            other => other.as_str(),
+        }
+    }
+
+    /// A run that cannot advance without a person or a new run: nothing is
+    /// offered but the record.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Done | Self::Merged | Self::Abandoned | Self::Wontfix
+        )
+    }
+
+    /// The state the engine stops in because a person asked it to.
+    pub fn is_paused(self) -> bool {
+        self == Self::Paused
+    }
+
+    /// The state the record says while a worker is, or was, working.
+    pub fn is_running(self) -> bool {
+        self == Self::Running
+    }
+
+    /// The state a stopped run is in when no step can advance.
+    pub fn is_blocked(self) -> bool {
+        self == Self::Blocked
+    }
+
+    /// A run that has not started yet: the queue may pick it up.
+    pub fn is_ready(self) -> bool {
+        matches!(
+            self,
+            Self::NeedsTriage | Self::NeedsInfo | Self::ReadyForAgent | Self::ReadyForHuman
+        )
+    }
+
+    /// The lane this state falls into. An open question outranks the record:
+    /// the person is the one thing the run waits for.
+    pub fn column(self, question_open: bool) -> Column {
+        if question_open {
+            return Column::Waiting;
+        }
+        match self {
+            Self::NeedsTriage | Self::NeedsInfo | Self::Unknown => Column::Triage,
+            Self::ReadyForAgent | Self::ReadyForHuman => Column::Ready,
+            Self::Running => Column::Running,
+            Self::Waiting | Self::Paused => Column::Waiting,
+            Self::Blocked | Self::Abandoned | Self::Wontfix => Column::Blocked,
+            Self::Done | Self::Merged => Column::Merged,
+        }
+    }
+}
+
+impl std::fmt::Display for RunState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<warp_flow_core::run::RunStatus> for RunState {
+    fn from(status: warp_flow_core::run::RunStatus) -> Self {
+        use warp_flow_core::run::RunStatus;
+        match status {
+            RunStatus::Running => Self::Running,
+            RunStatus::Waiting => Self::Waiting,
+            RunStatus::Paused => Self::Paused,
+            RunStatus::Abandoned => Self::Abandoned,
+            RunStatus::Blocked => Self::Blocked,
+            RunStatus::Done => Self::Done,
+        }
+    }
+}
+
+/// The board's six lanes: the states the issue folders fall into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Column {
@@ -150,13 +308,26 @@ pub enum Column {
 }
 
 impl Column {
-    /// Every column, left to right.
+    /// Every lane, left to right: the order the six-column board laid them
+    /// out, kept for the keys a probe reads.
     pub const ALL: [Self; 6] = [
         Self::Triage,
         Self::Ready,
         Self::Running,
         Self::Waiting,
         Self::Blocked,
+        Self::Merged,
+    ];
+
+    /// The lanes in the order the runs list stacks them: the two that need a
+    /// person first, then the work in flight, what has not started, and the
+    /// landed runs last.
+    pub const BOARD: [Self; 6] = [
+        Self::Waiting,
+        Self::Blocked,
+        Self::Running,
+        Self::Ready,
+        Self::Triage,
         Self::Merged,
     ];
 
@@ -202,24 +373,11 @@ impl Column {
         }
     }
 
-    /// Map `run.md`'s status onto a column. An open question is "Waiting on
-    /// you" whatever the status says; an unknown or missing status is Triage,
-    /// the lane that needs a person.
-    pub fn from_status(status: &str, question_open: bool) -> Self {
-        if question_open {
-            return Self::Waiting;
-        }
-        match status {
-            "needs-triage" | "needs-info" => Self::Triage,
-            "ready-for-agent" | "ready-for-human" => Self::Ready,
-            "running" => Self::Running,
-            // A paused run is a person's to resume, which is what the Waiting
-            // column means; the run screen says the phase in a word.
-            "waiting" | "paused" => Self::Waiting,
-            "blocked" | "abandoned" | "wontfix" => Self::Blocked,
-            "done" | "merged" => Self::Merged,
-            _ => Self::Triage,
-        }
+    /// The lane a state falls into. Kept as a named helper because the board's
+    /// key order and the state model meet here, and a reader looking for the
+    /// mapping should find one function, not a `match` in every consumer.
+    pub fn from_state(state: RunState, question_open: bool) -> Self {
+        state.column(question_open)
     }
 }
 
@@ -402,8 +560,9 @@ pub struct Run {
     /// from one that has never started.
     pub has_run: bool,
     pub title: String,
-    /// The raw status string, straight from `run.md` or `spec.md`.
-    pub status: String,
+    /// The state the record names, from `run.md`, else `spec.md`. Typed, so
+    /// every consumer compares one vocabulary instead of the file's strings.
+    pub status: RunState,
     pub column: Column,
     /// `run.md`'s `step`, else the last log row's step.
     pub step: String,
@@ -567,12 +726,6 @@ impl RepoView {
             })
             .filter(|(_, count)| *count > 0)
             .collect()
-    }
-
-    /// The summary the repository row's second line shows: at most three
-    /// states, waiting and blocked first.
-    pub fn summary(&self) -> Vec<(Column, usize)> {
-        self.state_counts().into_iter().take(3).collect()
     }
 
     /// How many runs in this repository need a person.
@@ -749,20 +902,15 @@ fn scan_run(
         .map(|doc| doc.body.clone())
         .unwrap_or_default();
     let title = first_heading(&spec).unwrap_or_else(|| id.clone());
-    let spec_status = spec_doc
-        .as_ref()
-        .and_then(|doc| doc.value("status"))
-        .map(str::to_owned);
+    let spec_status = spec_doc.as_ref().and_then(|doc| doc.value("status"));
 
     // run.md: status, step, workflow and the log table.
     let run_doc = read_doc(&dir.join("run.md"), &mut note);
     let run_body = run_doc.as_ref().map(|doc| doc.body.as_str()).unwrap_or("");
-    let status = run_doc
-        .as_ref()
-        .and_then(|doc| doc.value("status"))
-        .map(str::to_owned)
-        .or(spec_status)
-        .unwrap_or_else(|| "needs-triage".to_owned());
+    let status = RunState::read(
+        run_doc.as_ref().and_then(|doc| doc.value("status")),
+        spec_status,
+    );
     let rows = table_rows(run_body);
     let attempts = rows.len();
     let stop_reason = run_body
@@ -803,7 +951,7 @@ fn scan_run(
     let sessions = read_sessions(&dir.join("sessions"), &mut note);
     let repairs = read_repairs(&dir.join("repairs"), &mut note);
     let steps = match &graph {
-        Some(graph) => step_views(graph, &rows, &task_rows, &open_questions, &status, &step),
+        Some(graph) => step_views(graph, &rows, &task_rows, &open_questions, status, &step),
         None => log_steps(&rows, &open_questions),
     };
 
@@ -815,7 +963,7 @@ fn scan_run(
         dir: dir.to_path_buf(),
         has_run: dir.join("run.md").is_file(),
         title,
-        column: Column::from_status(&status, question.is_some()),
+        column: Column::from_state(status, question.is_some()),
         status,
         step,
         workflow,
@@ -1198,7 +1346,7 @@ fn step_views(
     rows: &[RunRow],
     tasks: &[TaskRow],
     questions: &[Question],
-    run_status: &str,
+    run_status: RunState,
     run_step: &str,
 ) -> Vec<StepView> {
     topological_steps(workflow)
@@ -1279,7 +1427,7 @@ fn lane_view(
     tasks: &[TaskRow],
     rows: &[RunRow],
     questions: &[Question],
-    run_status: &str,
+    run_status: RunState,
     run_step: &str,
 ) -> LaneView {
     // A resolved task has landed: its lane is done whatever an older log row
@@ -1301,7 +1449,7 @@ fn lane_view(
     // `running:` names is working whatever its last row says — a retried lane
     // still carries the attempt that failed as its newest row. A resolved
     // task's lane stays done: the task file is not the log.
-    if !resolved && run_status == "running" && running_names(run_step, &step.id, task.number, tasks)
+    if !resolved && run_status.is_running() && running_names(run_step, &step.id, task.number, tasks)
     {
         state = StepState::Running;
     }
@@ -1321,14 +1469,14 @@ fn step_state(
     task: Option<u32>,
     rows: &[RunRow],
     questions: &[Question],
-    run_status: &str,
+    run_status: RunState,
     run_step: &str,
 ) -> StepState {
     let open = question_open(step, task, questions);
     // The record's present beats the log, so it is read before the rows: a
     // retried step's newest row is still the attempt that failed. A lane's
     // task suffix is read by `running_names`, in `lane_view`.
-    if task.is_none() && run_status == "running" && running_has(run_step, &step.id) {
+    if task.is_none() && run_status.is_running() && running_has(run_step, &step.id) {
         return StepState::Running;
     }
     if let Some(row) = latest_row(rows, &step.id, task) {
@@ -1677,7 +1825,7 @@ mod tests {
 
     #[test]
     fn every_run_status_lands_in_its_column() {
-        let column = |status: &str| Column::from_status(status, false);
+        let column = |status: &str| Column::from_state(RunState::parse(status), false);
         assert_eq!(column("needs-triage"), Column::Triage);
         assert_eq!(column("needs-info"), Column::Triage);
         assert_eq!(column("ready-for-agent"), Column::Ready);
@@ -1711,11 +1859,66 @@ mod tests {
             "merged",
         ] {
             assert_eq!(
-                Column::from_status(status, true),
+                Column::from_state(RunState::parse(status), true),
                 Column::Waiting,
                 "{status} with a question is Waiting on you"
             );
         }
+    }
+
+    #[test]
+    fn the_state_vocabulary_round_trips_through_the_protocol() {
+        // every name the protocol writes reads back as itself, and the board
+        // never has to compare the raw string again
+        for state in [
+            RunState::NeedsTriage,
+            RunState::NeedsInfo,
+            RunState::ReadyForAgent,
+            RunState::ReadyForHuman,
+            RunState::Running,
+            RunState::Waiting,
+            RunState::Paused,
+            RunState::Blocked,
+            RunState::Done,
+            RunState::Merged,
+            RunState::Abandoned,
+            RunState::Wontfix,
+        ] {
+            assert_eq!(RunState::parse(state.as_str()), state);
+        }
+    }
+
+    #[test]
+    fn run_md_beats_spec_md_and_the_missing_both_are_triage() {
+        assert_eq!(
+            RunState::read(Some("blocked"), Some("done")),
+            RunState::Blocked
+        );
+        assert_eq!(
+            RunState::read(None, Some("ready-for-agent")),
+            RunState::ReadyForAgent
+        );
+        assert_eq!(RunState::read(None, None), RunState::NeedsTriage);
+        assert_eq!(RunState::parse("something-new"), RunState::Unknown);
+    }
+
+    #[test]
+    fn terminal_states_are_not_startable_and_not_paused_or_blocked() {
+        for state in [
+            RunState::Done,
+            RunState::Merged,
+            RunState::Abandoned,
+            RunState::Wontfix,
+        ] {
+            assert!(state.is_terminal(), "{state} is terminal");
+            assert!(!state.is_paused());
+            assert!(!state.is_blocked());
+            assert!(!state.is_running());
+        }
+        assert!(RunState::Paused.is_paused());
+        assert!(RunState::Blocked.is_blocked());
+        assert!(RunState::Running.is_running());
+        assert!(RunState::ReadyForAgent.is_ready());
     }
 
     #[test]
@@ -2012,12 +2215,12 @@ depends_on = []
         let rows = vec![row("code", "-", 1, "done")];
 
         assert_eq!(
-            step_state(&step, None, &rows, &[], "running", "analyze"),
+            step_state(&step, None, &rows, &[], RunState::Running, "analyze"),
             StepState::Running,
             "a run mid-step names that step while its session works"
         );
         assert_eq!(
-            step_state(&step, None, &rows, &[], "blocked", "analyze"),
+            step_state(&step, None, &rows, &[], RunState::Blocked, "analyze"),
             StepState::Idle,
             "a stopped run shows no step as running"
         );
@@ -2045,7 +2248,7 @@ depends_on = []
                 None,
                 &blocked_analyze_rows(),
                 &[],
-                "running",
+                RunState::Running,
                 "analyze"
             ),
             StepState::Running,
@@ -2064,7 +2267,7 @@ depends_on = []
                 None,
                 &blocked_analyze_rows(),
                 &[],
-                "blocked",
+                RunState::Blocked,
                 "analyze"
             ),
             StepState::Failed,
@@ -2080,12 +2283,30 @@ depends_on = []
         let tasks = vec![task(1, &[]), task(2, &[])];
         let rows = vec![row("code", "01", 1, "failed")];
         assert_eq!(
-            lane_view(&step, &tasks[0], &tasks, &rows, &[], "running", "code@01").state,
+            lane_view(
+                &step,
+                &tasks[0],
+                &tasks,
+                &rows,
+                &[],
+                RunState::Running,
+                "code@01",
+            )
+            .state,
             StepState::Running,
             "the record says task 01 is working, whatever its last row says"
         );
         assert_eq!(
-            lane_view(&step, &tasks[0], &tasks, &rows, &[], "blocked", "code@01").state,
+            lane_view(
+                &step,
+                &tasks[0],
+                &tasks,
+                &rows,
+                &[],
+                RunState::Blocked,
+                "code@01",
+            )
+            .state,
             StepState::Failed,
             "a stopped run keeps the lane's failed row"
         );
@@ -2125,7 +2346,9 @@ depends_on = []
         let lanes = |running: &str| -> Vec<StepState> {
             tasks
                 .iter()
-                .map(|task| lane_view(&step, task, &tasks, &[], &[], "running", running).state)
+                .map(|task| {
+                    lane_view(&step, task, &tasks, &[], &[], RunState::Running, running).state
+                })
                 .collect()
         };
 
@@ -2156,7 +2379,18 @@ depends_on = []
         let rows = vec![row("code", "02", 1, "done")];
         let lanes: Vec<StepState> = tasks
             .iter()
-            .map(|task| lane_view(&step, task, &tasks, &rows, &[], "running", "code@01").state)
+            .map(|task| {
+                lane_view(
+                    &step,
+                    task,
+                    &tasks,
+                    &rows,
+                    &[],
+                    RunState::Running,
+                    "code@01",
+                )
+                .state
+            })
             .collect();
         assert_eq!(lanes, vec![StepState::Running, StepState::Done]);
     }

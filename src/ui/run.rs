@@ -28,7 +28,20 @@ use crate::store::{
     self, LaneView, LogGroup, Question, Run, RunRow, StepState, StepView, TaskRow, outcome_state,
 };
 use crate::theme;
+use crate::ui::actions::{self, Flag, Primary};
 use crate::ui::window::{FlowApp, RunTab, attempt_word, ensure_document, tag};
+
+/// The per-run state the Run tab prepares before it draws: the folder the
+/// host's verbs take, the key the document slot compares, and the open
+/// question. It is copied from the scan (cheap fields, plus the question only
+/// while one is open) so the frame can borrow the run from the snapshot and
+/// still mutate this window's state, instead of cloning a whole `Run` every
+/// frame.
+pub(crate) struct RunPrep {
+    pub dir: PathBuf,
+    pub key: crate::store::RunKey,
+    pub question: Option<Question>,
+}
 
 impl FlowApp {
     // ---- entry points ------------------------------------------------------
@@ -38,12 +51,7 @@ impl FlowApp {
     pub(crate) fn close_run_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.screen = None;
         self.selected_run = None;
-        self.run_question = None;
-        self.run_multi.clear();
-        self.run_answer_error = None;
-        self.run_action_error = None;
-        self.run_abandon_confirm = None;
-        self.run_issue = None;
+        self.run_ui.reset();
         window.focus(&self.board_focus, cx);
         cx.notify();
     }
@@ -59,6 +67,14 @@ impl FlowApp {
         if event.keystroke.key == "escape" {
             self.close_run_screen(window, cx);
             cx.stop_propagation();
+            return;
+        }
+        if let Some(direction) = warpui_kit_core::pane_nav::direction(event)
+            && self
+                .pane_nav
+                .move_from(&self.run_focus, direction, window, cx)
+        {
+            cx.stop_propagation();
         }
     }
 
@@ -73,12 +89,12 @@ impl FlowApp {
     ) {
         let answer = answer.trim().to_owned();
         if answer.is_empty() {
-            self.run_answer_error = Some("Pick an option or write an answer.".to_owned());
+            self.run_ui.answer_error = Some("Pick an option or write an answer.".to_owned());
             cx.notify();
             return;
         }
-        let Some(issue) = self.run_issue.clone() else {
-            self.run_answer_error =
+        let Some(issue) = self.run_ui.issue.clone() else {
+            self.run_ui.answer_error =
                 Some("The run screen lost its issue folder; reopen the run.".to_owned());
             cx.notify();
             return;
@@ -91,13 +107,13 @@ impl FlowApp {
         // keeps its fill for the frame in between.
         match self.host.answer(&issue, &question.path, &answer) {
             Ok(AnswerOutcome::Resumed | AnswerOutcome::Recorded) => {
-                self.run_answer_error = None;
+                self.run_ui.answer_error = None;
                 self.answer_field
                     .update(cx, |state, cx| state.set_value("", window, cx));
                 cx.notify();
             }
             Err(error) => {
-                self.run_answer_error = Some(error);
+                self.run_ui.answer_error = Some(error);
                 cx.notify();
             }
         }
@@ -113,7 +129,8 @@ impl FlowApp {
     ) {
         let typed = self.answer_field.read(cx).value().trim().to_owned();
         let picked: Vec<String> = self
-            .run_multi
+            .run_ui
+            .multi
             .iter()
             .filter(|choice| question.options.iter().any(|option| option == *choice))
             .cloned()
@@ -123,26 +140,26 @@ impl FlowApp {
         } else if !typed.is_empty() {
             typed
         } else if question.kind == "approve" {
-            self.run_multi.first().cloned().unwrap_or_default()
+            self.run_ui.multi.first().cloned().unwrap_or_default()
         } else {
             picked.first().cloned().unwrap_or_default()
         };
         if answer.trim().is_empty() {
-            self.run_answer_error = Some("Pick an option or write an answer.".to_owned());
+            self.run_ui.answer_error = Some("Pick an option or write an answer.".to_owned());
             cx.notify();
             return;
         }
-        self.run_abandon_confirm = None;
+        self.run_ui.abandon_confirm = None;
         self.submit_answer(question, answer, window, cx);
     }
 
     // ---- driving the run ---------------------------------------------------
 
     /// Start a fresh run for the open screen's issue.
-    fn start_run(&mut self, issue: PathBuf, cx: &mut Context<Self>) {
+    pub(crate) fn start_run(&mut self, issue: PathBuf, cx: &mut Context<Self>) {
         match self.host.start(&issue) {
-            Ok(()) => self.run_action_error = None,
-            Err(error) => self.run_action_error = Some(error),
+            Ok(()) => self.run_ui.action_error = None,
+            Err(error) => self.run_ui.action_error = Some(error),
         }
         cx.notify();
     }
@@ -150,8 +167,8 @@ impl FlowApp {
     /// Ask the host to pause the open run at its next step boundary.
     pub(crate) fn pause_run(&mut self, issue: PathBuf, cx: &mut Context<Self>) {
         match self.host.pause(&issue) {
-            Ok(()) => self.run_action_error = None,
-            Err(error) => self.run_action_error = Some(error),
+            Ok(()) => self.run_ui.action_error = None,
+            Err(error) => self.run_ui.action_error = Some(error),
         }
         cx.notify();
     }
@@ -160,8 +177,8 @@ impl FlowApp {
     /// process is driving: the same takeover `warp-flow-cli run` does.
     pub(crate) fn resume_run(&mut self, issue: PathBuf, cx: &mut Context<Self>) {
         match self.host.resume(&issue) {
-            Ok(()) => self.run_action_error = None,
-            Err(error) => self.run_action_error = Some(error),
+            Ok(()) => self.run_ui.action_error = None,
+            Err(error) => self.run_ui.action_error = Some(error),
         }
         cx.notify();
     }
@@ -172,28 +189,28 @@ impl FlowApp {
     /// that in words so `Retry gate` is not a promise the engine cannot keep.
     pub(crate) fn retry_run(&mut self, issue: PathBuf, cx: &mut Context<Self>) {
         match self.host.resume(&issue) {
-            Ok(()) => self.run_action_error = None,
-            Err(error) => self.run_action_error = Some(error),
+            Ok(()) => self.run_ui.action_error = None,
+            Err(error) => self.run_ui.action_error = Some(error),
         }
         cx.notify();
     }
 
     /// Abandon the open run at its next step boundary, after the confirmation.
     pub(crate) fn abandon_run(&mut self, issue: PathBuf, cx: &mut Context<Self>) {
-        self.run_abandon_confirm = None;
+        self.run_ui.abandon_confirm = None;
         match self.host.abandon(&issue) {
-            Ok(()) => self.run_action_error = None,
-            Err(error) => self.run_action_error = Some(error),
+            Ok(()) => self.run_ui.action_error = None,
+            Err(error) => self.run_ui.action_error = Some(error),
         }
         cx.notify();
     }
 
     /// Tick or untick one `multi` choice.
     fn toggle_multi(&mut self, label: String) {
-        if let Some(index) = self.run_multi.iter().position(|choice| choice == &label) {
-            self.run_multi.remove(index);
+        if let Some(index) = self.run_ui.multi.iter().position(|choice| choice == &label) {
+            self.run_ui.multi.remove(index);
         } else {
-            self.run_multi.push(label);
+            self.run_ui.multi.push(label);
         }
     }
 
@@ -201,32 +218,55 @@ impl FlowApp {
 
     /// The Run tab's body: what the engine is doing, what it waits on, and the
     /// attempts and sessions it recorded.
-    pub(crate) fn render_run_body(
+    /// Prepare the Run tab for `prep`: the host's key, the pick reset and the
+    /// question's rendered document. Everything here mutates this window's
+    /// state, so it runs before the frame borrows the run to draw it.
+    pub(crate) fn prepare_run_body(
         &mut self,
-        run: Run,
+        prep: RunPrep,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) {
         // The host keys its runs by the issue folder; every action below uses
         // this one, which the scan resolved before the frame.
-        self.run_issue = Some(run.dir.clone());
-        if run.question.is_none() {
-            // The card closed: the pick it held has no meaning on the next one.
-            self.run_multi.clear();
+        // The card closed, or the pane moved to another run: the pick the last
+        // card held has no meaning on the next one. A frame on the same open
+        // question keeps its ticks.
+        let switched = self.run_ui.issue.as_deref() != Some(prep.dir.as_path());
+        if switched || prep.question.is_none() {
+            self.run_ui.multi.clear();
         }
-        let host = self.host_snapshot.run(&run.dir).cloned();
-        let phase = host.as_ref().map(|host_run| host_run.phase);
-        let question = run.question.clone();
-        let question_doc = question.as_ref().and_then(|question| {
+        self.run_ui.issue = Some(prep.dir);
+        if let Some(question) = &prep.question {
             // Only the body is the editor's source; the path is not content.
             ensure_document(
-                &mut self.run_question,
-                &run.key,
+                &mut self.run_ui.question,
+                &prep.key,
                 question_markdown(&question.body),
                 window,
                 cx,
-            )
-        });
+            );
+        } else {
+            self.run_ui.question = None;
+        }
+    }
+
+    /// The Run tab's body, borrowed from the snapshot: the scan's reading of
+    /// the run, with nothing copied.
+    pub(crate) fn render_run_body(
+        &self,
+        run: &Run,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let host = self.host_snapshot.run(&run.dir).cloned();
+        let phase = host.as_ref().map(|host_run| host_run.phase);
+        let question = run.question.as_ref();
+        let question_doc = self
+            .run_ui
+            .question
+            .as_ref()
+            .map(crate::ui::window::DocSlot::editor);
 
         let mut column = div()
             .flex()
@@ -236,44 +276,38 @@ impl FlowApp {
             .max_w(px(theme::scaled(shell::READING_WIDTH)))
             .mx_auto();
 
-        for error in run_error_lines(self.run_action_error.as_deref(), host.as_ref()) {
+        for error in run_error_lines(self.run_ui.action_error.as_deref(), host.as_ref()) {
             column = column.child(action_error_line(&error));
         }
 
-        let issue_on_top = question.is_none()
-            && !run.has_run
-            && !is_blocked(&run, phase)
-            && !is_paused(&run, phase);
+        let issue_on_top =
+            question.is_none() && !run.has_run && !is_blocked(run, phase) && !is_paused(run, phase);
 
-        if let Some(card) = self.render_state_card(
-            &run,
-            host.as_ref(),
-            question.as_ref(),
-            question_doc.as_ref(),
-            window,
-            cx,
-        ) {
+        if let Some(card) =
+            self.render_state_card(run, host.as_ref(), question, question_doc, window, cx)
+        {
             column = column.child(card);
         }
 
         if !run.steps.is_empty() {
-            column = column.child(self.render_workflow_card(&run, phase));
+            column =
+                column.child(self.render_workflow_card(run, phase, self.reading_width(window)));
         } else {
             if let Some(note) = &run.workflow_note {
                 column = column.child(workflow_note_row(note));
             }
             if !issue_on_top {
-                column = column.child(self.render_issue_card(&run, phase));
+                column = column.child(self.render_issue_card(run, phase));
             }
         }
 
         column = column
-            .child(self.render_tasks_card(&run))
-            .child(self.render_attempts_card(&run, cx));
-        if let Some(log) = self.render_engine_log(&run, host.as_ref()) {
+            .child(self.render_tasks_card(run))
+            .child(self.render_attempts_card(run, cx));
+        if let Some(log) = self.render_engine_log(run, host.as_ref()) {
             column = column.child(log);
         }
-        column = column.child(self.render_sessions_card(&run));
+        column = column.child(self.render_sessions_card(run));
 
         let body = div()
             .id("flow-run-scroll")
@@ -304,6 +338,24 @@ impl FlowApp {
             .bg(theme::panel())
             .child(body)
             .into_any_element()
+    }
+
+    /// How wide the run body actually is, in the live window: the reading
+    /// measure when there is room, less when the list and padding take it.
+    ///
+    /// The matrix used the constant 760 even in a 1100 px window, where the
+    /// body is 544: its columns were sized for a measure it did not have, so
+    /// the last task columns were clipped instead of fitting.
+    fn reading_width(&self, window: &Window) -> f32 {
+        let window = f32::from(window.bounds().size.width);
+        let rail = theme::scaled(shell::RAIL_WIDTH);
+        let list = if self.list_hidden {
+            0.
+        } else {
+            shell::clamp_list_width(self.list_width)
+        };
+        let padding = 2. * theme::scaled(shell::DETAIL_PADDING);
+        (window - rail - list - padding).clamp(320., theme::scaled(shell::READING_WIDTH))
     }
 
     // ---- the state's one card ---------------------------------------------
@@ -346,10 +398,11 @@ impl FlowApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let picked = picked_option(question, &self.run_multi);
+        let picked = picked_option(question, &self.run_ui.multi);
         let typed = self.answer_field.read(cx).value().to_string();
         let ticked = self
-            .run_multi
+            .run_ui
+            .multi
             .iter()
             .any(|choice| question.options.iter().any(|option| option == choice));
         let answer_enabled = picked.is_some() || ticked || !typed.trim().is_empty();
@@ -404,8 +457,11 @@ impl FlowApp {
                     .text_size(px(theme::font_meta()))
                     .line_height(relative(1.43))
                     .text_color(theme::text_muted())
-                    .child(warpui_kit_markdown::render_read_only_document_in_card(
-                        body, cx,
+                    .child(warpui_kit_core::text_menu::attach(
+                        "flow-run-question-menu",
+                        warpui_kit_markdown::render_read_only_document_in_card(body, cx),
+                        warpui_kit_core::text_menu::focus(cx),
+                        Some("Ctrl C".into()),
                     )),
             );
         }
@@ -419,14 +475,14 @@ impl FlowApp {
                     ("Yes", "flow-answer-yes", "yes"),
                     ("No", "flow-answer-no", "no"),
                 ] {
-                    let picked_here = self.run_multi.iter().any(|pick| pick == choice);
+                    let picked_here = self.run_ui.multi.iter().any(|pick| pick == choice);
                     let question = question.clone();
                     let answer = choice.to_owned();
                     let on_click = cx.listener(
                         move |this, _, window: &mut Window, cx: &mut Context<Self>| {
-                            this.run_abandon_confirm = None;
-                            this.run_multi.clear();
-                            this.run_multi.push(answer.clone());
+                            this.run_ui.abandon_confirm = None;
+                            this.run_ui.multi.clear();
+                            this.run_ui.multi.push(answer.clone());
                             this.submit_answer(question.clone(), answer.clone(), window, cx);
                         },
                     );
@@ -447,9 +503,9 @@ impl FlowApp {
                     let choice = option.clone();
                     let on_click = cx.listener(
                         move |this, _, window: &mut Window, cx: &mut Context<Self>| {
-                            this.run_abandon_confirm = None;
-                            this.run_multi.clear();
-                            this.run_multi.push(choice.clone());
+                            this.run_ui.abandon_confirm = None;
+                            this.run_ui.multi.clear();
+                            this.run_ui.multi.push(choice.clone());
                             this.submit_answer(question.clone(), choice.clone(), window, cx);
                         },
                     );
@@ -465,11 +521,11 @@ impl FlowApp {
             "multi" if !question.options.is_empty() => {
                 has_options = true;
                 for (index, option) in question.options.iter().enumerate() {
-                    let picked_here = self.run_multi.contains(option);
+                    let picked_here = self.run_ui.multi.contains(option);
                     let choice = option.clone();
                     let on_click = cx.listener(
                         move |this, _, _window: &mut Window, cx: &mut Context<Self>| {
-                            this.run_abandon_confirm = None;
+                            this.run_ui.abandon_confirm = None;
                             this.toggle_multi(choice.clone());
                             cx.notify();
                         },
@@ -507,7 +563,7 @@ impl FlowApp {
             ),
         );
 
-        let armed = self.run_abandon_confirm.as_ref() == Some(&run.key);
+        let armed = self.run_ui.abandon_confirm.as_ref() == Some(&run.key);
         let key = run.key.clone();
         let issue = run.dir.clone();
         let abandon = ghost_button(
@@ -520,10 +576,10 @@ impl FlowApp {
             Some("icons/icon-close.svg"),
             armed,
             cx.listener(move |this, _, _, cx| {
-                if this.run_abandon_confirm.as_ref() == Some(&key) {
+                if this.run_ui.abandon_confirm.as_ref() == Some(&key) {
                     this.abandon_run(issue.clone(), cx);
                 } else {
-                    this.run_abandon_confirm = Some(key.clone());
+                    this.run_ui.abandon_confirm = Some(key.clone());
                     cx.notify();
                 }
             }),
@@ -544,12 +600,12 @@ impl FlowApp {
                 .child(answer)
                 .child(abandon),
         );
-        if let Some(error) = &self.run_answer_error {
+        if let Some(error) = &self.run_ui.answer_error {
             card = card.child(
                 div()
                     .debug_selector(|| "flow-answer-error".into())
                     .mt(px(8.))
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_sub()))
                     .text_color(theme::DANGER)
                     .child(error.clone()),
             );
@@ -557,7 +613,7 @@ impl FlowApp {
         card.child(
             div()
                 .mt(px(10.))
-                .text_size(px(theme::font_meta()))
+                .text_size(px(theme::font_sub()))
                 .line_height(relative(1.43))
                 .text_color(theme::text_muted())
                 .child(
@@ -570,9 +626,9 @@ impl FlowApp {
 
     /// The blocked card: the failing step, why it stopped, the last failing
     /// line and the budget the retry spends. Its controls are the head's
-    /// `Retry gate` and `Abandon`.
+    /// primary (a gate's Retry gate, a harness step's Retry step) and Abandon.
     fn render_blocked_card(&self, run: &Run, host: Option<&RunSnapshot>) -> AnyElement {
-        let failed = failed_step(run);
+        let failed = actions::failed_step(run);
         let head_right = failed.map(step_label).unwrap_or_else(|| run.key.id.clone());
         let headline = match failed {
             Some(step) => format!("The {} failed and the run cannot advance", step_label(step)),
@@ -655,7 +711,7 @@ impl FlowApp {
             .child(
                 div()
                     .mt(px(6.))
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_sub()))
                     .line_height(relative(1.43))
                     .text_color(theme::text_muted())
                     .child(why),
@@ -690,17 +746,22 @@ impl FlowApp {
             );
         }
 
+        // The footer names the same verb the head shows: a harness block must
+        // not read "Retry gate", and a run with no failing step continues.
+        let retry_word = actions::plan(run, host.map(|host| host.phase))
+            .primary
+            .map_or("Resume", Primary::word);
         let footer = match failed {
             Some(_) => mono_sentence(
                 &format!(
-                    "Retry gate starts the step again with a fresh {budget}-attempt budget \
+                    "{retry_word} starts the step again with a fresh {budget}-attempt budget \
                      ({spent} recorded); Abandon writes "
                 ),
                 "status: abandoned",
                 " without running it.",
             ),
             None => mono_sentence(
-                "Retry gate resumes the run from its record; Abandon writes ",
+                &format!("{retry_word} continues the run from its record; Abandon writes "),
                 "status: abandoned",
                 " without running it.",
             ),
@@ -716,7 +777,7 @@ impl FlowApp {
         if let Some(busy) = phase.and_then(|phase| busy_word("flow-run-issue-spinner", phase)) {
             trailing.push(busy);
         }
-        trailing.push(quiet_pill("icons/icon-box.svg", &run.status));
+        trailing.push(quiet_pill("icons/icon-box.svg", run.status.as_str()));
 
         let card = card()
             .id("flow-run-issue-card")
@@ -745,7 +806,7 @@ impl FlowApp {
         if run.has_run {
             body = body.child(
                 div()
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_sub()))
                     .line_height(relative(1.43))
                     .text_color(theme::text_muted())
                     .child("The run's record names no steps yet."),
@@ -765,9 +826,9 @@ impl FlowApp {
     /// The workflow as one matrix: the run's tasks across as columns, its steps
     /// down as rows, and one compact state cell where a `per_task` step meets a
     /// task. A step that runs once carries its single pill instead of cells.
-    fn render_workflow_card(&self, run: &Run, phase: Option<Phase>) -> AnyElement {
+    fn render_workflow_card(&self, run: &Run, phase: Option<Phase>, available: f32) -> AnyElement {
         let columns = matrix_columns(run);
-        let column_width = matrix_column_width(columns.len());
+        let column_width = matrix_column_width(columns.len(), available);
         let mut head = Vec::new();
         if let Some(busy) = phase.and_then(|phase| busy_word("flow-run-workflow-spinner", phase)) {
             head.push(busy);
@@ -788,7 +849,25 @@ impl FlowApp {
             .id("flow-run-workflow-card")
             .debug_selector(|| "flow-run-workflow".into())
             .child(card_head("Workflow", head))
-            .child(step_matrix(run, &columns, column_width));
+            // The matrix keeps a readable minimum per task column; when the
+            // reading column cannot hold them all, it scrolls sideways rather
+            // than clipping the last tasks off the card (a run with twenty
+            // tasks used to lose seven of them).
+            .child(
+                div()
+                    .id("flow-run-matrix-scroll")
+                    .debug_selector(|| "flow-run-matrix-scroll".into())
+                    .w_full()
+                    .min_w_0()
+                    .overflow_x_scroll()
+                    .track_scroll(&self.matrix_scroll)
+                    .child(
+                        div()
+                            .min_w(px(matrix_width(columns.len(), column_width)))
+                            .w_full()
+                            .child(step_matrix(run, &columns, column_width)),
+                    ),
+            );
         if let Some(note) = &run.workflow_note {
             card = card.child(workflow_note_row(note));
         }
@@ -812,7 +891,7 @@ impl FlowApp {
                 .px(px(16.))
                 .pt(px(8.))
                 .pb(px(12.))
-                .text_size(px(theme::font_meta()))
+                .text_size(px(theme::font_sub()))
                 .line_height(relative(1.43))
                 .text_color(theme::text_muted());
             if any_per_task {
@@ -857,7 +936,9 @@ impl FlowApp {
                 .id(SharedString::from(level_selector.clone()))
                 .debug_selector(move || level_selector.clone())
                 .flex()
+                .flex_wrap()
                 .items_center()
+                .min_w_0()
                 .gap(px(6.));
             for (index, number) in level.iter().enumerate() {
                 if index > 0 {
@@ -897,7 +978,7 @@ impl FlowApp {
                 .child(
                     div()
                         .debug_selector(|| "flow-run-task-rule".into())
-                        .text_size(px(theme::font_meta()))
+                        .text_size(px(theme::font_sub()))
                         .line_height(relative(1.43))
                         .text_color(theme::text_muted())
                         .child(rule),
@@ -1017,7 +1098,7 @@ impl FlowApp {
             })
             .flex_shrink_0()
             .cursor_pointer()
-            .text_size(px(theme::font_meta()))
+            .text_size(px(theme::font_control()))
             .text_color(theme::accent_ink())
             .hover(|style| style.text_color(theme::text()))
             .tooltip(tooltip_text("Open the run record"))
@@ -1162,7 +1243,7 @@ impl FlowApp {
                     div()
                         .px(px(16.))
                         .py(px(10.))
-                        .text_size(px(theme::font_meta()))
+                        .text_size(px(theme::font_sub()))
                         .text_color(theme::text_muted())
                         .child(
                             "No session recorded yet. A harness step writes one when it settles.",
@@ -1180,7 +1261,7 @@ impl FlowApp {
                 .px(px(16.))
                 .pt(px(8.))
                 .pb(px(6.))
-                .text_size(px(theme::font_meta()))
+                .text_size(px(theme::font_row_meta()))
                 .text_color(theme::text_muted());
             head = head.child(
                 div()
@@ -1289,29 +1370,13 @@ impl FlowApp {
 
     // ---- the head's action row ---------------------------------------------
 
-    /// The run's head actions, derived from the host's phase first and its
-    /// record second, because a run that is being driven is the host's to say.
-    ///
-    /// One primary per state: Start run for triage/ready, Resume for paused,
-    /// Retry gate for blocked — and none for a waiting run (the question card's
-    /// Answer is the run's primary), a driving run or a landed one. Terminal
-    /// runs keep their Start button, parked with the reason in its tooltip.
+    /// The run's head actions: whatever [`crate::ui::actions::plan`] says its
+    /// state earns, drawn. The decision is not made here, so the head and the
+    /// ⋯ menu cannot disagree about a finished run, a blocked harness step or
+    /// a run this window is not driving.
     pub(crate) fn render_run_actions(&self, run: &Run, cx: &mut Context<Self>) -> AnyElement {
         let host_run = self.host_snapshot.run(&run.dir);
-        let phase = host_run.map(|host_run| host_run.phase);
-        let driving = phase.is_some_and(Phase::is_driving);
-        let terminal = matches!(
-            run.status.as_str(),
-            "done" | "merged" | "abandoned" | "wontfix"
-        ) || matches!(phase, Some(Phase::Done) | Some(Phase::Abandoned));
-        let has_record = run.has_run
-            || host_run
-                .and_then(|host_run| host_run.status.as_deref())
-                .is_some();
-        let question_open = run.question.is_some();
-        let record_status = host_run
-            .and_then(|host_run| host_run.status.clone())
-            .unwrap_or_else(|| run.status.clone());
+        let plan = actions::plan(run, host_run.map(|host_run| host_run.phase));
         let issue = run.dir.clone();
 
         let mut row = div()
@@ -1323,133 +1388,48 @@ impl FlowApp {
             .justify_end()
             .gap(px(6.));
 
-        if driving {
-            // A start that is in flight disables both actions, with the reason
-            // in each tooltip; once the engine reports, they are live again.
-            let starting = phase == Some(Phase::Starting);
-            let (pause_enabled, pause_reason) = match phase {
-                Some(Phase::Pausing) => {
-                    (false, Some("The run is pausing at the next step boundary."))
-                }
-                Some(Phase::Starting) => (false, Some("The engine is starting.")),
-                _ => (true, None),
-            };
+        if let Some(primary) = plan.primary {
+            let click_issue = issue.clone();
+            row = row.child(action_button(
+                primary.id(),
+                primary.word(),
+                primary.filled(),
+                Some(primary.icon()),
+                true,
+                plan.primary_reason,
+                cx.listener(move |this, _, _, cx| match primary {
+                    Primary::Start => this.start_run(click_issue.clone(), cx),
+                    Primary::Resume => this.resume_run(click_issue.clone(), cx),
+                    Primary::Retry { .. } => this.retry_run(click_issue.clone(), cx),
+                }),
+            ));
+        }
+        if let Some(pause) = plan.pause {
             let pause_issue = issue.clone();
             row = row.child(action_button(
                 "flow-run-pause",
                 "Pause",
                 false,
                 None,
-                pause_enabled,
-                pause_reason,
+                pause.enabled,
+                pause.reason,
                 cx.listener(move |this, _, _, cx| this.pause_run(pause_issue.clone(), cx)),
             ));
-            row = row.child(self.abandon_control(run, starting, cx));
-        } else if terminal {
-            row = row.child(action_button(
-                "flow-run-start",
-                "Start",
-                false,
-                None,
-                false,
-                Some("This run is done; there is nothing to start."),
-                nothing,
-            ));
-        } else if is_blocked(run, phase) {
-            let retry_issue = issue.clone();
-            row = row.child(action_button(
-                "flow-run-retry",
-                "Retry gate",
-                true,
-                Some("icons/icon-refresh.svg"),
-                true,
-                Some("Run the blocked step again from its record."),
-                cx.listener(move |this, _, _, cx| this.retry_run(retry_issue.clone(), cx)),
-            ));
-            row = row.child(self.abandon_control(run, false, cx));
-        } else if question_open {
-            // The question card owns the run's one filled primary and its
-            // Abandon; the head stays empty so the two never compete.
-        } else if is_paused(run, phase) {
-            let resume_issue = issue.clone();
-            row = row.child(action_button(
-                "flow-run-resume",
-                "Resume",
-                true,
-                Some("icons/icon-play.svg"),
-                true,
-                Some("Continue the paused run from its record."),
-                cx.listener(move |this, _, _, cx| this.resume_run(resume_issue.clone(), cx)),
-            ));
-            row = row.child(self.abandon_control(run, false, cx));
-        } else if phase == Some(Phase::Failed) && has_record {
-            let resume_issue = issue.clone();
-            row = row.child(action_button(
-                "flow-run-resume",
-                "Resume",
-                false,
-                None,
-                true,
-                Some("The engine stopped; resume to try again."),
-                cx.listener(move |this, _, _, cx| this.resume_run(resume_issue.clone(), cx)),
-            ));
-            row = row.child(self.abandon_control(run, false, cx));
-        } else if phase == Some(Phase::Waiting) || (phase.is_none() && record_status == "waiting") {
-            let resume_issue = issue.clone();
-            row = row.child(action_button(
-                "flow-run-resume",
-                "Resume",
-                false,
-                None,
-                true,
-                Some("The question is answered; continue the run."),
-                cx.listener(move |this, _, _, cx| this.resume_run(resume_issue.clone(), cx)),
-            ));
-            row = row.child(self.abandon_control(run, false, cx));
-        } else if has_record && record_status == "running" {
-            // Somebody else's run: Resume is the takeover, not a primary.
-            let resume_issue = issue.clone();
-            row = row.child(action_button(
-                "flow-run-resume",
-                "Resume",
-                false,
-                None,
-                true,
-                Some("Not driven by this window; Resume takes it over."),
-                cx.listener(move |this, _, _, cx| this.resume_run(resume_issue.clone(), cx)),
-            ));
-            row = row.child(self.abandon_control(run, false, cx));
-        } else if has_record && record_status == "blocked" {
-            let retry_issue = issue.clone();
-            row = row.child(action_button(
-                "flow-run-retry",
-                "Retry gate",
-                true,
-                Some("icons/icon-refresh.svg"),
-                true,
-                Some("Run the blocked step again from its record."),
-                cx.listener(move |this, _, _, cx| this.retry_run(retry_issue.clone(), cx)),
-            ));
-            row = row.child(self.abandon_control(run, false, cx));
-        } else {
-            let start_issue = issue.clone();
-            row = row.child(action_button(
-                "flow-run-start",
-                "Start run",
-                true,
-                Some("icons/icon-play.svg"),
-                true,
-                None,
-                cx.listener(move |this, _, _, cx| this.start_run(start_issue.clone(), cx)),
-            ));
+        }
+        // A question card owns both the run's one primary and its Abandon; two
+        // Abandons on one screen are the same act twice.
+        if let Some(abandon) = plan.abandon
+            && run.question.is_none()
+        {
+            row = row.child(self.abandon_control(run, abandon, cx));
         }
         row.into_any_element()
     }
 
     /// Abandon for a run no worker is driving, behind the same one-step
     /// confirmation the driving case uses.
-    fn abandon_control(&self, run: &Run, disabled: bool, cx: &mut Context<Self>) -> AnyElement {
-        if self.run_abandon_confirm.as_ref() == Some(&run.key) {
+    fn abandon_control(&self, run: &Run, flag: Flag, cx: &mut Context<Self>) -> AnyElement {
+        if self.run_ui.abandon_confirm.as_ref() == Some(&run.key) {
             return self.render_abandon_confirm(&run.dir, cx);
         }
         let key = run.key.clone();
@@ -1458,10 +1438,10 @@ impl FlowApp {
             "Abandon",
             false,
             None,
-            !disabled,
-            disabled.then_some("The engine is starting."),
+            flag.enabled,
+            flag.reason,
             cx.listener(move |this, _, _, cx| {
-                this.run_abandon_confirm = Some(key.clone());
+                this.run_ui.abandon_confirm = Some(key.clone());
                 cx.notify();
             }),
         )
@@ -1478,7 +1458,7 @@ impl FlowApp {
             .gap(px(5.))
             .child(
                 div()
-                    .text_size(px(theme::font_micro()))
+                    .text_size(px(theme::font_label()))
                     .text_color(theme::DANGER)
                     .child("Abandon?"),
             )
@@ -1501,7 +1481,7 @@ impl FlowApp {
                 true,
                 None,
                 cx.listener(|this, _, _, cx| {
-                    this.run_abandon_confirm = None;
+                    this.run_ui.abandon_confirm = None;
                     cx.notify();
                 }),
             ))
@@ -1530,9 +1510,10 @@ const MATRIX_CELL: f32 = 24.;
 const MATRIX_ROW_HEIGHT: f32 = 26.;
 const MATRIX_HEADER_HEIGHT: f32 = 26.;
 
-/// A task column: wide enough for the header's number and a truncated title,
-/// never narrower than one cell and its gutter.
-const MATRIX_COLUMN_MAX: f32 = 68.;
+/// A task column: wide enough for the header's number and a readable title. A
+/// run with one or two tasks gets the whole measure; past that the columns
+/// shrink to share it, down to [`MATRIX_COLUMN_MIN`].
+const MATRIX_COLUMN_MAX: f32 = 120.;
 const MATRIX_COLUMN_MIN: f32 = 30.;
 /// Below this width the header drops the title and keeps the task number only.
 const MATRIX_TITLE_MIN: f32 = 56.;
@@ -1540,8 +1521,9 @@ const MATRIX_TITLE_MIN: f32 = 56.;
 const MATRIX_GAP: f32 = 8.;
 
 /// What the reading column keeps for the step's name, kind and detail line
-/// before the task columns take their share.
-const MATRIX_LABEL_MIN: f32 = 240.;
+/// before the task columns take their share. The detail is a gate's command or
+/// a step's skill, so a label narrower than this reads `skill c…`.
+const MATRIX_LABEL_MIN: f32 = 320.;
 
 /// The card row's own horizontal padding, shared by the header and every row.
 const MATRIX_SIDE: f32 = 16.;
@@ -1570,22 +1552,35 @@ fn matrix_columns(run: &Run) -> Vec<MatrixColumn> {
     columns
 }
 
-/// The width of one task column. The reading column is fixed, so more tasks
-/// shrink the columns instead of scrolling them: a horizontal scroll container
-/// inside the run body's own vertical scroll would take the wheel before the
-/// page did. Sixteen tasks still keep the step label 120 px, and nineteen still
-/// fit the reading column before anything is clipped.
-fn matrix_column_width(tasks: usize) -> f32 {
+/// The width of one task column: the reading column is the measure, so more
+/// tasks shrink the columns down to [`MATRIX_COLUMN_MIN`]. Below that the
+/// matrix keeps the minimum and scrolls sideways instead of clipping the last
+/// columns — a run with twenty-four tasks used to lose eleven of them.
+fn matrix_column_width(tasks: usize, available: f32) -> f32 {
     let min = theme::scaled(MATRIX_COLUMN_MIN);
     let max = theme::scaled(MATRIX_COLUMN_MAX);
     if tasks == 0 {
         return max;
     }
-    let room = theme::scaled(shell::READING_WIDTH)
-        - theme::scaled(2. * MATRIX_SIDE)
-        - theme::scaled(MATRIX_LABEL_MIN);
     let gap = theme::scaled(MATRIX_GAP);
-    ((room + gap) / tasks as f32 - gap).clamp(min, max)
+    // The label and the side insets come out of the measure; each column then
+    // carries one gap of its own, which is why it is subtracted after the
+    // division. Leaving it out made every full row overhang.
+    let room =
+        available.max(0.) - theme::scaled(2. * MATRIX_SIDE) - theme::scaled(MATRIX_LABEL_MIN);
+    (room / tasks as f32 - gap).clamp(min, max)
+}
+
+/// The width the matrix needs for `tasks` columns: its side padding, the step
+/// label's readable minimum and one column plus gap per task. When this is
+/// wider than the card, that is the horizontal scroller's content width, not a
+/// clipping edge.
+fn matrix_width(tasks: usize, column_width: f32) -> f32 {
+    if tasks == 0 {
+        return 0.;
+    }
+    theme::scaled(2. * MATRIX_SIDE + MATRIX_LABEL_MIN)
+        + tasks as f32 * (column_width + theme::scaled(MATRIX_GAP))
 }
 
 /// The lane a step holds for one task, when the task files gave the step one.
@@ -1607,9 +1602,10 @@ fn matrix_head(columns: &[MatrixColumn], column_width: f32) -> AnyElement {
         .border_color(theme::border_light())
         .child(
             div()
-                .flex_1()
+                .flex_shrink_0()
+                .w(px(theme::scaled(MATRIX_LABEL_MIN)))
                 .min_w_0()
-                .text_size(px(theme::font_micro()))
+                .text_size(px(theme::font_label()))
                 .text_color(theme::text_muted())
                 .child("Step"),
         );
@@ -1630,7 +1626,7 @@ fn matrix_head(columns: &[MatrixColumn], column_width: f32) -> AnyElement {
                 div()
                     .flex_shrink_0()
                     .font_family(theme::code_font())
-                    .text_size(px(theme::font_micro()))
+                    .text_size(px(theme::font_mono_meta()))
                     .text_color(theme::text_muted())
                     .child(format!("{:02}", column.number)),
             );
@@ -1639,7 +1635,7 @@ fn matrix_head(columns: &[MatrixColumn], column_width: f32) -> AnyElement {
                 div()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_row_meta()))
                     .text_color(theme::text_dim())
                     .child(column.title.clone()),
             );
@@ -1665,8 +1661,24 @@ fn matrix_step_label(step: &StepView, detail: &str, tasks: usize) -> AnyElement 
         (true, tasks) => format!("×{tasks}"),
         (false, _) => "once".to_owned(),
     };
+    // The detail truncates at a narrow measure; the hover text keeps the whole
+    // sentence reachable, the way the editor's path line does.
+    let full = if detail.is_empty() {
+        format!("{} {} · {}", step.id, phrase, marker)
+    } else {
+        format!("{} {} · {} · {}", step.id, phrase, marker, detail)
+    };
     let mut label = div()
-        .flex_1()
+        .id(SharedString::from(format!(
+            "flow-run-step-label-{}",
+            step.id
+        )))
+        .tooltip(tooltip_text(full))
+        // A fixed label column keeps a one-task matrix beside the steps it
+        // names instead of parking that task at the card's right edge; when
+        // there are more tasks than fit, the label is what the row keeps.
+        .flex_shrink_0()
+        .w(px(theme::scaled(MATRIX_LABEL_MIN)))
         .min_w_0()
         .overflow_hidden()
         .flex()
@@ -1698,7 +1710,7 @@ fn matrix_step_label(step: &StepView, detail: &str, tasks: usize) -> AnyElement 
                 // tight the detail below is what gives way, so a row never
                 // reads `review har…` or `fmt … ×5`.
                 .flex_shrink_0()
-                .text_size(px(theme::font_meta()))
+                .text_size(px(theme::font_label()))
                 .text_color(theme::text_muted())
                 .child(phrase),
         )
@@ -1706,7 +1718,7 @@ fn matrix_step_label(step: &StepView, detail: &str, tasks: usize) -> AnyElement 
             div()
                 .flex_shrink_0()
                 .font_family(theme::code_font())
-                .text_size(px(theme::font_micro()))
+                .text_size(px(theme::font_mono_meta()))
                 .text_color(theme::text_muted())
                 .child(marker),
         );
@@ -1760,15 +1772,31 @@ fn matrix_cell(step: &StepView, column: &MatrixColumn, column_width: f32) -> Any
         .justify_center()
         .size(px(theme::scaled(MATRIX_CELL)))
         .rounded(px(6.));
+    // Every square carries its outline, so a tinted cell and a quiet one read
+    // as the same grid; the hue and the glyph are what say which state it is.
+    square = square.border_1().border_color(theme::hairline());
     if quiet {
-        square = square
-            .bg(theme::well())
-            .border_1()
-            .border_color(theme::hairline());
+        square = square.bg(theme::well());
     } else {
         square = square.bg(theme::tint(color));
     }
     let inner = match state {
+        Some(StepState::Running) => div()
+            .id(SharedString::from(format!("{state_selector}-icon")))
+            .debug_selector({
+                let selector = state_selector.clone();
+                move || selector.clone()
+            })
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(motion::spinner(
+                format!("{state_selector}-spinner"),
+                state_icon(StepState::Running),
+                px(theme::icon_tiny()),
+                color,
+            ))
+            .into_any_element(),
         Some(state) => div()
             .id(SharedString::from(format!("{state_selector}-icon")))
             .debug_selector({
@@ -1783,7 +1811,7 @@ fn matrix_cell(step: &StepView, column: &MatrixColumn, column_width: f32) -> Any
         None => div()
             .id(SharedString::from(format!("{state_selector}-none")))
             .debug_selector(move || state_selector.clone())
-            .text_size(px(theme::font_micro()))
+            .text_size(px(theme::font_mono_meta()))
             .text_color(theme::text_muted())
             .child("–")
             .into_any_element(),
@@ -1836,7 +1864,9 @@ fn matrix_step_row(
             row = row.child(matrix_cell(step, column, column_width));
         }
     } else if step.state == StepState::Idle {
-        row = row.child(
+        // A step that runs once has no cells: its word sits at the row's end,
+        // over the task columns the per-task rows carry.
+        row = row.child(div().flex_1()).child(
             div()
                 .id(SharedString::from(format!("{state_selector}-idle")))
                 .debug_selector({
@@ -1844,12 +1874,14 @@ fn matrix_step_row(
                     move || selector.clone()
                 })
                 .flex_shrink_0()
-                .text_size(px(theme::font_meta()))
+                .text_size(px(theme::font_label()))
                 .text_color(theme::text_muted())
                 .child("not run yet"),
         );
     } else {
-        row = row.child(state_pill(state_selector, step.state));
+        row = row
+            .child(div().flex_1())
+            .child(state_pill(state_selector, step.state));
     }
     row.into_any_element()
 }
@@ -1875,7 +1907,7 @@ fn step_matrix(run: &Run, columns: &[MatrixColumn], column_width: f32) -> AnyEle
                 .debug_selector(|| "flow-run-matrix-note".into())
                 .px(px(theme::scaled(MATRIX_SIDE)))
                 .py(px(8.))
-                .text_size(px(theme::font_meta()))
+                .text_size(px(theme::font_sub()))
                 .text_color(theme::text_muted())
                 .child("No task files yet."),
         );
@@ -1953,11 +1985,11 @@ fn card_head_path(title: &str, path: AnyElement, trailing: Vec<AnyElement>) -> A
     row.into_any_element()
 }
 
-/// A trailing count or word at 13, `text_dim`.
+/// A trailing count or word at the label step, `text_dim`.
 fn head_word(text: impl Into<String>) -> AnyElement {
     div()
         .flex_shrink_0()
-        .text_size(px(theme::font_meta()))
+        .text_size(px(theme::font_label()))
         .text_color(theme::text_dim())
         .child(text.into())
         .into_any_element()
@@ -2147,6 +2179,9 @@ fn option_row(
             }
         })
         .on_click(on_click)
+        // The empty state is an outline — a circle for one answer, a square for
+        // several — so an option reads as a choice and not as a text field. A
+        // picked one takes the check in the accent.
         .child(if picked {
             icon(
                 "icons/icon-check.svg",
@@ -2155,7 +2190,21 @@ fn option_row(
             )
             .into_any_element()
         } else {
-            div().size(px(theme::icon_small())).into_any_element()
+            div()
+                .flex_shrink_0()
+                .size(px(theme::icon_small()))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .size(px(theme::icon_small() - 4.))
+                        .border_1()
+                        .border_color(theme::line_strong())
+                        .when(multi, |square| square.rounded(px(3.)))
+                        .when(!multi, |ring| ring.rounded_full()),
+                )
+                .into_any_element()
         })
         .child(div().flex_1().min_w_0().child(label.to_owned()));
     let row = if multi {
@@ -2276,10 +2325,6 @@ fn action_button(
     };
     wrapper.child(button).into_any_element()
 }
-
-/// The action a disabled button never runs: the kit keeps the handler wired,
-/// so the caller's guard is this no-op.
-fn nothing(_: &gpui::ClickEvent, _: &mut Window, _: &mut gpui::App) {}
 
 /// A shared button under its own debug selector: the kit button does not take
 /// one, and the probes click the wrapper's centre.
@@ -2452,19 +2497,6 @@ fn kind_word(kind: Option<StepKind>) -> &'static str {
     }
 }
 
-/// The failing step a blocked run stopped on: a failed gate first, then any
-/// failed step.
-fn failed_step(run: &Run) -> Option<&StepView> {
-    run.steps
-        .iter()
-        .find(|step| step.state == StepState::Failed && step.kind == Some(StepKind::Gate))
-        .or_else(|| {
-            run.steps
-                .iter()
-                .find(|step| step.state == StepState::Failed)
-        })
-}
-
 /// `test gate`, `code harness`, `merge step`: the step's word in a phrase.
 fn step_label(step: &StepView) -> String {
     format!("{} {}", step.id, kind_word(step.kind))
@@ -2474,22 +2506,18 @@ fn is_blocked(run: &Run, phase: Option<Phase>) -> bool {
     if phase.is_some_and(Phase::is_driving) {
         return false;
     }
-    let terminal = matches!(
-        run.status.as_str(),
-        "done" | "merged" | "abandoned" | "wontfix"
-    ) || matches!(phase, Some(Phase::Done) | Some(Phase::Abandoned));
-    !terminal && (phase == Some(Phase::Blocked) || run.status == "blocked")
+    let terminal =
+        run.status.is_terminal() || matches!(phase, Some(Phase::Done) | Some(Phase::Abandoned));
+    !terminal && (phase == Some(Phase::Blocked) || run.status.is_blocked())
 }
 
 fn is_paused(run: &Run, phase: Option<Phase>) -> bool {
     if phase.is_some_and(Phase::is_driving) {
         return false;
     }
-    let terminal = matches!(
-        run.status.as_str(),
-        "done" | "merged" | "abandoned" | "wontfix"
-    ) || matches!(phase, Some(Phase::Done) | Some(Phase::Abandoned));
-    !terminal && (phase == Some(Phase::Paused) || (phase.is_none() && run.status == "paused"))
+    let terminal =
+        run.status.is_terminal() || matches!(phase, Some(Phase::Done) | Some(Phase::Abandoned));
+    !terminal && (phase == Some(Phase::Paused) || (phase.is_none() && run.status.is_paused()))
 }
 
 /// The paused note: the well strip, not a card, because the run has nothing to
@@ -2853,7 +2881,7 @@ mod tests {
             has_run: true,
             title: "Demo".to_owned(),
             column: Column::Blocked,
-            status: "blocked".to_owned(),
+            status: crate::store::RunState::Blocked,
             step: "analyze".to_owned(),
             workflow: "implement@1".to_owned(),
             attempts: 3,
@@ -3056,35 +3084,73 @@ mod tests {
     fn more_tasks_shrink_the_columns_to_fit_the_reading_column() {
         let max = theme::scaled(MATRIX_COLUMN_MAX);
         let min = theme::scaled(MATRIX_COLUMN_MIN);
-        let single = matrix_column_width(1);
-        let five = matrix_column_width(5);
-        let twelve = matrix_column_width(12);
-        let many = matrix_column_width(40);
+        let reading = theme::scaled(shell::READING_WIDTH);
+        let single = matrix_column_width(1, reading);
+        let five = matrix_column_width(5, reading);
+        let twelve = matrix_column_width(12, reading);
+        let many = matrix_column_width(40, reading);
         assert_eq!(single, max, "one task takes the widest column");
-        assert_eq!(five, max, "five tasks keep a readable header");
         assert!(
-            five > twelve && twelve > many,
-            "columns shrink as tasks are added"
+            five < max && five > min,
+            "five tasks share the measure instead of sitting at one width"
         );
+        assert!(five > twelve, "columns shrink as tasks are added");
+        assert_eq!(twelve, min, "twelve tasks sit at the floor");
+        assert_eq!(many, min, "a column never narrows past one cell");
         assert_eq!(many, min, "a column never narrows below one cell");
         let gap = theme::scaled(MATRIX_GAP);
-        let columns = |tasks: usize| tasks as f32 * (matrix_column_width(tasks) + gap) - gap;
-        for tasks in 1..=19 {
-            let used = theme::scaled(2. * MATRIX_SIDE) + gap + columns(tasks);
+        let total = |tasks: usize| {
+            theme::scaled(2. * MATRIX_SIDE)
+                + theme::scaled(MATRIX_LABEL_MIN)
+                + tasks as f32 * (matrix_column_width(tasks, reading) + gap)
+        };
+        for tasks in 1..=10 {
             assert!(
-                used <= theme::scaled(shell::READING_WIDTH),
-                "{tasks} tasks overflow the reading column: {used}"
+                total(tasks) <= reading + 0.01,
+                "{tasks} tasks overflow the reading column: {}",
+                total(tasks)
             );
         }
-        for tasks in 1..=16 {
-            let label = theme::scaled(shell::READING_WIDTH)
-                - theme::scaled(2. * MATRIX_SIDE)
-                - gap
-                - columns(tasks);
-            assert!(
-                label >= theme::scaled(120.),
-                "{tasks} tasks leave the step label only {label}"
-            );
-        }
+        assert!(
+            total(11) > reading,
+            "past ten tasks the matrix keeps its label minimum and scrolls"
+        );
+    }
+
+    #[test]
+    fn a_matrix_too_wide_for_the_reading_column_asks_for_a_scroller() {
+        let reading = theme::scaled(shell::READING_WIDTH);
+        let tasks = 24;
+        let width = matrix_column_width(tasks, reading);
+        assert_eq!(
+            width,
+            theme::scaled(MATRIX_COLUMN_MIN),
+            "twenty-four tasks sit at the floor"
+        );
+        assert!(
+            matrix_width(tasks, width) > reading,
+            "the card must scroll, not clip, once the columns pass the measure"
+        );
+        assert!(
+            matrix_width(3, matrix_column_width(3, reading)) <= reading,
+            "three tasks still fit the reading column without a scroll"
+        );
+    }
+
+    /// The matrix sizes its columns from the live body, not the constant 760:
+    /// in a 1100 px window the body is 544, and five tasks must still fit.
+    #[test]
+    fn a_narrow_body_fits_its_task_columns() {
+        let narrow = 544.;
+        let tasks = 5;
+        let width = matrix_column_width(tasks, narrow);
+        let gap = theme::scaled(MATRIX_GAP);
+        let total = theme::scaled(2. * MATRIX_SIDE)
+            + theme::scaled(MATRIX_LABEL_MIN)
+            + tasks as f32 * (width + gap);
+        assert!(
+            total <= narrow + 0.01,
+            "five tasks in a 544 px body need {total}"
+        );
     }
 }

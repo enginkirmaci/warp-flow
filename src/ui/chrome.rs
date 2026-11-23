@@ -15,7 +15,7 @@ use gpui_kit::TestSupportExt as _;
 use warpui_kit_core::A11y as _;
 use warpui_kit_core::about::AppId;
 use warpui_kit_core::tooltip::tooltip_text;
-use warpui_kit_core::{icon, motion, shell};
+use warpui_kit_core::{controls, icon, motion, shell};
 
 use crate::theme;
 use crate::ui::window::{FlowApp, Section};
@@ -112,7 +112,26 @@ impl FlowApp {
         }
         // The text size and the palette live in Settings: the title bar carries
         // only what the window does, not how big or which colour the app draws.
-        bar = bar.child(self.list_toggle(cx));
+        bar = bar
+            .child(
+                controls::icon_button("flow-shortcuts-button", "Keyboard shortcuts")
+                    .debug_selector(|| "flow-shortcuts-button".into())
+                    // the title bar is the window's drag hitbox: a control on
+                    // it occludes the drag and stops the press, or the
+                    // compositor turns the click into a window move
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .tooltip(tooltip_text("Keyboard shortcuts"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_shortcuts(window, cx);
+                    }))
+                    .child(icon(
+                        "icons/icon-help.svg",
+                        px(theme::icon_small()),
+                        theme::text_muted(),
+                    )),
+            )
+            .child(self.list_toggle(cx));
         bar = bar
             .child(div().mx_1().h(px(20.)).w(px(1.)).bg(theme::hairline()))
             .child(
@@ -161,7 +180,7 @@ impl FlowApp {
         };
         title_icon("flow-list-toggle", label, icon_path)
             .debug_selector(|| "flow-list-toggle".into())
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_list(cx)))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_list(window, cx)))
             .into_any_element()
     }
 

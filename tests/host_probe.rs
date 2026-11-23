@@ -337,7 +337,7 @@ fn start_pause_resume_finishes_and_records_each_boundary() {
     assert!(
         host.snapshot()
             .run(&fixture.issue)
-            .is_some_and(|run| run.status.as_deref() == Some("done")),
+            .is_some_and(|run| run.status == Some(warp_flow::store::RunState::Done)),
         "the snapshot carries the engine's last status"
     );
 
@@ -572,7 +572,7 @@ fn the_snapshot_serializes_for_the_door() {
         .run(&fixture.issue)
         .expect("the run is in the snapshot");
     assert_eq!(run.phase, Phase::Done);
-    assert_eq!(run.status.as_deref(), Some("done"));
+    assert_eq!(run.status, Some(warp_flow::store::RunState::Done));
     assert_eq!(run.title, "Probe run");
     assert_eq!(run.log.len(), host::LOG_TAIL);
     assert_eq!(run.log.first().map(String::as_str), Some("line 480"));

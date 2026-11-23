@@ -357,10 +357,9 @@ impl ArtifactsScreen {
                         div()
                             .debug_selector(|| "flow-artifacts-count".into())
                             .flex_shrink_0()
-                            .font_family(theme::code_font())
-                            .text_size(px(theme::font_mono_meta()))
+                            .text_size(px(theme::font_row_meta()))
                             .text_color(theme::text_muted())
-                            .child(self.tabs.len().to_string()),
+                            .child(crate::ui::plural(self.tabs.len(), "file")),
                     ),
             )
             .child(
@@ -456,7 +455,7 @@ impl ArtifactsScreen {
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(theme::font_meta()))
+                            .text_size(px(theme::font_row_meta()))
                             .text_color(theme::text_dim())
                             .child(description),
                     ),
@@ -509,7 +508,7 @@ impl ArtifactsScreen {
                     .flex_wrap()
                     .items_center()
                     .gap(px(6.))
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_sub()))
                     .text_color(theme::text_muted())
                     .child(
                         div()
@@ -579,7 +578,7 @@ impl ArtifactsScreen {
             row = row.child(
                 div()
                     .debug_selector(|| "flow-artifacts-dirty".into())
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_sub()))
                     .text_color(theme::text_muted())
                     .child(format!("unsaved · {}", file_name(&path))),
             );
@@ -604,7 +603,7 @@ impl ArtifactsScreen {
             row = row.child(
                 div()
                     .debug_selector(|| "flow-artifacts-status".into())
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_sub()))
                     .text_color(theme::ADD)
                     .child(status.clone()),
             );
@@ -615,7 +614,7 @@ impl ArtifactsScreen {
                 div()
                     .debug_selector(|| "flow-artifacts-error".into())
                     .font_family(theme::code_font())
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_mono_meta()))
                     .text_color(theme::DANGER)
                     .child(error.clone()),
             );
@@ -625,7 +624,7 @@ impl ArtifactsScreen {
             row = row.child(
                 div()
                     .debug_selector(|| "flow-artifacts-lock".into())
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_sub()))
                     .text_color(theme::text_dim())
                     .child(note),
             );
@@ -646,7 +645,7 @@ impl ArtifactsScreen {
                     ))
                     .child(
                         div()
-                            .text_size(px(theme::font_meta()))
+                            .text_size(px(theme::font_sub()))
                             .text_color(theme::text_muted())
                             .child("Reading the issue folder…"),
                     ),
@@ -716,6 +715,19 @@ impl ArtifactsScreen {
                 )
                 .into_any_element()
         };
+        // A read-only document is selectable prose: the family's right-click
+        // Copy menu is what a selected paragraph expects, and the kit's text
+        // menu is the one implementation of it.
+        let content = if editable {
+            content
+        } else {
+            warpui_kit_core::text_menu::attach(
+                "flow-artifacts-menu",
+                content,
+                warpui_kit_core::text_menu::focus(cx),
+                Some("Ctrl C".into()),
+            )
+        };
         // The editable editor fills a sized parent and scrolls its own text
         // (the kit's editor is a `size_full` surface); a read-only document is
         // content-sized and the body's scroller moves it. So the 760 measure
@@ -767,7 +779,7 @@ impl ArtifactsScreen {
             .child(
                 div()
                     .text_center()
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_sub()))
                     .text_color(theme::text_dim())
                     .child(
                         "The engine writes the issue's documents when the run is triaged, then spec.md, \
@@ -789,7 +801,7 @@ impl ArtifactsScreen {
                     ))
                     .child(
                         div()
-                            .text_size(px(theme::font_meta()))
+                            .text_size(px(theme::font_sub()))
                             .text_color(theme::text_muted())
                             .child("Reading the issue folder…"),
                     ),

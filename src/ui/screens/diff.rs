@@ -35,6 +35,7 @@ use warp_flow_core::diff::{BASE_BRANCH, FileChange, FileStatus, TaskDiff, task_d
 use warp_flow_core::graph::StepKind;
 use warp_flow_core::worktree::Repo;
 use warpui_kit_core::list_nav::{self, ListKey};
+use warpui_kit_core::tooltip::tooltip_text;
 use warpui_kit_core::{A11y as _, icon, motion, palette, shell};
 use warpui_kit_diff::{DiffMode, DiffOptions, DiffScrollHandles, render_diff_with_scroll};
 use warpui_kit_markdown::LiveEditorState;
@@ -62,7 +63,7 @@ const TASK_FILE_MAX_HEIGHT: f32 = 200.;
 
 /// The top stack (`Task` + `Gates`) takes at most this much of the column, as
 /// §6 caps it.
-const TOP_STACK_FRACTION: f32 = 0.46;
+const TOP_STACK_FRACTION: f32 = 0.62;
 
 /// The conflict block's own cap: a long file still scrolls inside its frame.
 const CONFLICT_BLOCK_MAX_HEIGHT: f32 = 420.;
@@ -167,8 +168,6 @@ pub struct DiffScreen {
     top_scroll: ScrollHandle,
     /// The changes rail's own scroll position.
     files_scroll: ScrollHandle,
-    /// The picker's horizontal scroll position.
-    picker_scroll: ScrollHandle,
     /// The file the diff shows, by branch path. `None` means the whole patch.
     selected_file: Option<String>,
     /// The layout the path bar's Unified|Split chooses.
@@ -209,7 +208,6 @@ impl DiffScreen {
             issue_scroll: ScrollHandle::new(),
             top_scroll: ScrollHandle::new(),
             files_scroll: ScrollHandle::new(),
-            picker_scroll: ScrollHandle::new(),
             selected_file: None,
             mode: DiffMode::Unified,
             wrap: true,
@@ -231,7 +229,6 @@ impl DiffScreen {
         self.run = Some(run.clone());
         if switched {
             self.cursor = None;
-            self.picker_scroll = ScrollHandle::new();
             // §6: the gates card is open by default when the run is blocked.
             self.gates_open = run.run.column == Column::Blocked;
             self.clear_panel();
@@ -489,18 +486,24 @@ impl DiffScreen {
             );
         }
         let narrow = f32::from(window.bounds().size.width) < theme::NARROW_WINDOW_WIDTH;
-        let rail = self.render_rail(narrow, cx);
+        let (conflicts, changed) = self.rail_rows();
+        // A rail with nothing in it is a 320-px column saying what the path bar
+        // already says; the diff takes the whole width until a file arrives.
+        let rail_empty = conflicts.is_empty() && changed.is_empty() && !self.loading;
+        let rail = (!rail_empty).then(|| self.render_rail(narrow, cx));
         let column = self.render_task_column(&run, window, cx);
-        div()
+        let mut row = div()
             .flex()
             .flex_row()
             .flex_1()
+            .w_full()
             .min_w_0()
             .min_h_0()
-            .h_full()
-            .child(rail)
-            .child(column)
-            .into_any_element()
+            .h_full();
+        if let Some(rail) = rail {
+            row = row.child(rail);
+        }
+        row.child(column).into_any_element()
     }
 
     /// The 320 changes rail: Conflicts first, then Changed, each a group head
@@ -535,9 +538,9 @@ impl DiffScreen {
         if conflicts.is_empty() && changed.is_empty() {
             list = list.child(
                 div()
-                    .px(px(16.))
+                    .px(px(theme::scaled(shell::DETAIL_PADDING)))
                     .py(px(10.))
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_sub()))
                     .text_color(theme::text_muted())
                     .child(if self.loading {
                         "Reading the branch…"
@@ -609,7 +612,9 @@ impl DiffScreen {
             .cursor_pointer()
             .w_full()
             .h(px(theme::scaled(RAIL_ROW_HEIGHT)))
-            .pl(px(13.))
+            // the head's text sits at DETAIL_PADDING; the row's 3 px mark is
+            // inside that edge, so the padding is three less
+            .pl(px(theme::scaled(shell::DETAIL_PADDING - 3.)))
             .pr(px(8.))
             .flex()
             .flex_row()
@@ -645,7 +650,7 @@ impl DiffScreen {
                 div()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_control()))
                     .text_color(ink)
                     .child(name),
             );
@@ -654,7 +659,7 @@ impl DiffScreen {
                 div()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_row_meta()))
                     .text_color(theme::text_muted())
                     .child(folder),
             );
@@ -665,7 +670,7 @@ impl DiffScreen {
             .items_center()
             .gap(px(4.))
             .font_family(theme::code_font())
-            .text_size(px(theme::font_micro()))
+            .text_size(px(theme::font_mono_meta()))
             .font_weight(FontWeight::MEDIUM);
         if row.binary {
             counts = counts.child(div().text_color(theme::text_muted()).child("binary"));
@@ -739,6 +744,7 @@ impl DiffScreen {
         let mut title_row = div()
             .flex()
             .items_center()
+            .min_w_0()
             .gap(px(10.))
             .child(task_chip(number, status))
             .child(
@@ -823,17 +829,22 @@ impl DiffScreen {
         let commits = self.diff.as_ref().map(|diff| diff.commits).unwrap_or(0);
         div()
             .flex()
-            .flex_wrap()
+            .min_w_0()
             .items_center()
             .gap(px(6.))
-            .text_size(px(theme::font_meta()))
+            .text_size(px(theme::font_sub()))
             .text_color(theme::text_muted())
             .child(
                 div()
+                    .id("flow-diff-branch-label")
                     .debug_selector(|| "flow-diff-branch".into())
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
                     .font_family(theme::code_font())
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme::text_dim())
+                    .tooltip(tooltip_text(branch.clone()))
                     .child(branch),
             )
             .child(div().text_color(theme::line_strong()).child("→"))
@@ -861,13 +872,13 @@ impl DiffScreen {
             .child(
                 div()
                     .debug_selector(|| "flow-diff-task-file-count".into())
-                    .child(plural(files, "file")),
+                    .child(crate::ui::plural(files, "file")),
             )
             .child(
                 div()
                     .debug_selector(|| "flow-diff-commits".into())
                     .font_family(theme::code_font())
-                    .child(plural(commits, "commit")),
+                    .child(crate::ui::plural(commits, "commit")),
             )
             .into_any_element()
     }
@@ -921,10 +932,12 @@ impl DiffScreen {
             .debug_selector(|| "flow-diff-picker".into())
             .flex_shrink_0()
             .w_full()
-            .overflow_x_scroll()
-            .track_scroll(&self.picker_scroll)
+            .min_w_0()
             .flex()
             .flex_row()
+            // The task titles are the only long rows here: wrap them under the
+            // head rather than clipping the last tasks off the pane's edge.
+            .flex_wrap()
             .items_center()
             .gap(px(6.))
             .px(px(theme::scaled(shell::DETAIL_PADDING)))
@@ -985,7 +998,7 @@ impl DiffScreen {
                     .items_center()
                     .justify_center()
                     .font_family(theme::code_font())
-                    .text_size(px(theme::font_micro()))
+                    .text_size(px(theme::font_mono_meta()))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(task_status_color(task.status))
                     .child(format!("{number:02}")),
@@ -994,7 +1007,7 @@ impl DiffScreen {
                 div()
                     .max_w(px(180.))
                     .truncate()
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_control()))
                     .text_color(theme::text())
                     .child(task.title.clone()),
             );
@@ -1002,7 +1015,7 @@ impl DiffScreen {
             chip = chip.child(
                 div()
                     .flex_shrink_0()
-                    .text_size(px(theme::font_micro()))
+                    .text_size(px(theme::font_label()))
                     .text_color(theme::text_muted())
                     .child(format!("blocked by {blocked_text}")),
             );
@@ -1051,7 +1064,7 @@ impl DiffScreen {
             .flex_wrap()
             .items_center()
             .gap(px(10.))
-            .text_size(px(theme::font_meta()))
+            .text_size(px(theme::font_sub()))
             .text_color(theme::text_muted());
         if let Some(task) = task {
             facts = facts.child(
@@ -1140,7 +1153,7 @@ impl DiffScreen {
                         .min_w_0()
                         .truncate()
                         .font_family(theme::code_font())
-                        .text_size(px(theme::font_meta()))
+                        .text_size(px(theme::font_mono_meta()))
                         .text_color(theme::text_muted())
                         .child(file_meta),
                 )
@@ -1165,7 +1178,7 @@ impl DiffScreen {
         let summary = if self.gates.is_empty() {
             "no gates".to_owned()
         } else {
-            let mut parts = vec![plural(self.gates.len(), "gate")];
+            let mut parts = vec![crate::ui::plural(self.gates.len(), "gate")];
             if passed > 0 {
                 parts.push(format!("{passed} passed"));
             }
@@ -1188,7 +1201,7 @@ impl DiffScreen {
             .child(
                 div()
                     .debug_selector(|| "flow-diff-gates-summary".into())
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_sub()))
                     .text_color(theme::text_dim())
                     .child(summary),
             )
@@ -1213,7 +1226,7 @@ impl DiffScreen {
                 div()
                     .debug_selector(|| "flow-diff-gates-note".into())
                     .pt(px(8.))
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_sub()))
                     .text_color(theme::text_muted())
                     .child(
                         "Read-only here. The commands live on the gate steps in Repos › Workflow.",
@@ -1237,7 +1250,7 @@ impl DiffScreen {
             .h(px(TOGGLE_HEIGHT))
             .px(px(8.))
             .rounded(px(6.))
-            .text_size(px(theme::font_meta()))
+            .text_size(px(theme::font_control()))
             .text_color(theme::accent_ink())
             .hover(|style| style.bg(theme::raised()))
             .on_click(cx.listener(|this, _, _, cx| {
@@ -1287,7 +1300,7 @@ impl DiffScreen {
                 .child(
                     div()
                         .debug_selector(|| "flow-diff-conflict-count".into())
-                        .text_size(px(theme::font_meta()))
+                        .text_size(px(theme::font_control()))
                         .text_color(theme::DANGER)
                         .child(line),
                 )
@@ -1300,7 +1313,7 @@ impl DiffScreen {
                 .child(
                     div()
                         .debug_selector(|| "flow-diff-conflict-answer".into())
-                        .text_size(px(theme::font_meta()))
+                        .text_size(px(theme::font_sub()))
                         .text_color(theme::text_dim())
                         .child("Answer the run on the Run tab"),
                 )
@@ -1355,7 +1368,7 @@ impl DiffScreen {
                             div()
                                 .debug_selector(|| "flow-diff-adds".into())
                                 .font_family(theme::code_font())
-                                .text_size(px(theme::font_micro()))
+                                .text_size(px(theme::font_mono_meta()))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme::ADD)
                                 .child(format!("+{}", row.added)),
@@ -1364,7 +1377,7 @@ impl DiffScreen {
                             div()
                                 .debug_selector(|| "flow-diff-dels".into())
                                 .font_family(theme::code_font())
-                                .text_size(px(theme::font_micro()))
+                                .text_size(px(theme::font_mono_meta()))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme::DANGER)
                                 .child(format!("−{}", row.removed)),
@@ -1440,7 +1453,7 @@ impl DiffScreen {
             .h(px(TOGGLE_HEIGHT - 4.))
             .px(px(8.))
             .rounded(px(4.))
-            .text_size(px(theme::font_meta()))
+            .text_size(px(theme::font_control()))
             .when(selected, |segment| {
                 segment
                     .bg(theme::raised())
@@ -1477,7 +1490,7 @@ impl DiffScreen {
             .h(px(TOGGLE_HEIGHT))
             .px(px(8.))
             .rounded(px(6.))
-            .text_size(px(theme::font_meta()))
+            .text_size(px(theme::font_control()))
             .when(wrap, |button| {
                 button.bg(theme::raised()).text_color(theme::text())
             })
@@ -1622,7 +1635,7 @@ impl DiffScreen {
                 div()
                     .px(px(12.))
                     .py(px(10.))
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_sub()))
                     .text_color(theme::text_muted())
                     .child("The conflicting hunk is not in the branch's patch."),
             );
@@ -1658,7 +1671,7 @@ impl DiffScreen {
                     ))
                     .child(
                         div()
-                            .text_size(px(theme::font_meta()))
+                            .text_size(px(theme::font_label()))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::DANGER)
                             .child("Merge conflict"),
@@ -1669,7 +1682,7 @@ impl DiffScreen {
                             .min_w_0()
                             .truncate()
                             .font_family(theme::code_font())
-                            .text_size(px(theme::font_meta()))
+                            .text_size(px(theme::font_mono_meta()))
                             .text_color(theme::text_muted())
                             .child(path.to_owned()),
                     ),
@@ -1699,7 +1712,7 @@ impl DiffScreen {
                     .flex_shrink_0()
                     .px(px(12.))
                     .py(px(8.))
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_sub()))
                     .text_color(theme::text_muted())
                     .child(
                         "The engine aborted the merge at the conflict, so no marker text is kept: \
@@ -2100,7 +2113,7 @@ fn group_head(
         .gap(px(8.))
         .child(
             div()
-                .text_size(px(theme::font_meta()))
+                .text_size(px(theme::font_label()))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(label_color)
                 .child(label.to_owned()),
@@ -2108,7 +2121,7 @@ fn group_head(
         .child(div().flex_1())
         .child(
             div()
-                .text_size(px(theme::font_meta()))
+                .text_size(px(theme::font_row_meta()))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(count_color)
                 .child(count.to_string()),
@@ -2241,7 +2254,7 @@ fn gate_row(index: usize, gate: &GateView) -> AnyElement {
         div()
             .min_w(px(64.))
             .flex_shrink_0()
-            .text_size(px(theme::font_meta()))
+            .text_size(px(theme::font_control()))
             .font_weight(FontWeight::MEDIUM)
             .text_color(theme::text())
             .child(gate.name.clone()),
@@ -2252,7 +2265,7 @@ fn gate_row(index: usize, gate: &GateView) -> AnyElement {
             .min_w_0()
             .truncate()
             .font_family(theme::code_font())
-            .text_size(px(theme::font_meta()))
+            .text_size(px(theme::font_mono_meta()))
             .text_color(theme::text_muted())
             .child(gate.command.clone()),
     )
@@ -2429,15 +2442,6 @@ fn sanitize(path: &str) -> String {
     path.chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
         .collect()
-}
-
-/// `1 file` / `2 files`.
-fn plural(count: usize, word: &str) -> String {
-    if count == 1 {
-        format!("1 {word}")
-    } else {
-        format!("{count} {word}s")
-    }
 }
 
 /// The one quiet line a state shows, with its own debug selector.

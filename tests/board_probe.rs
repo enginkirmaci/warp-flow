@@ -1,5 +1,5 @@
-//! Headless probes for the shell: the six columns, the open-question override,
-//! the repository filter, the detail pane and the board's own keyboard cursor.
+//! Headless probes for the shell: the runs list and its lanes, the open-question
+//! override, the scope menu, the detail pane and the list's own keyboard cursor.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -359,7 +359,11 @@ fn an_open_question_is_waiting_on_you(cx: &mut TestAppContext) {
             .runs()
             .find(|run| run.key.id == "asking")
             .expect("the asking run is scanned");
-        assert_eq!(asking.status, "waiting", "the raw status is kept");
+        assert_eq!(
+            asking.status,
+            warp_flow::store::RunState::Waiting,
+            "the raw status is kept"
+        );
         assert_eq!(asking.column, Column::Waiting);
         assert!(asking.question.is_some(), "the open question is read");
         let override_run = page
@@ -367,7 +371,7 @@ fn an_open_question_is_waiting_on_you(cx: &mut TestAppContext) {
             .runs()
             .find(|run| run.key.id == "override")
             .expect("the overridden run is scanned");
-        assert_eq!(override_run.status, "running");
+        assert_eq!(override_run.status, warp_flow::store::RunState::Running);
         assert_eq!(override_run.column, Column::Waiting);
         let waiting = page
             .snapshot_for_probe()
@@ -410,25 +414,33 @@ fn selecting_a_repository_filters_the_board(cx: &mut TestAppContext) {
     settle(cx);
     assert!(cx.debug_bounds("flow-card-repo-a-run-a").is_some());
     assert!(cx.debug_bounds("flow-card-repo-b-run-b").is_some());
+    // Runs has one list: no repository row stands beside the runs
+    assert!(
+        cx.debug_bounds("flow-repo-repo-a").is_none(),
+        "the repositories are the Repos section's list"
+    );
 
-    click(cx, "flow-repo-repo-a");
+    // the scope menu is where Runs picks a repository
+    click(cx, "flow-runs-scope");
+    click(cx, "flow-scope-repo-repo-a");
     page.read_with(cx, |page, _| {
         assert_eq!(
             page.selected_repo_for_probe(),
             Some(repo_a.as_path()),
-            "the rail selection is the filter"
+            "the scope is the filter"
         );
     });
     assert!(
         cx.debug_bounds("flow-card-repo-a-run-a").is_some(),
-        "the selected repository keeps its runs"
+        "the scoped repository keeps its runs"
     );
     assert!(
         cx.debug_bounds("flow-card-repo-b-run-b").is_none(),
-        "the other repository's runs leave the board"
+        "the other repository's runs leave the list"
     );
 
-    click(cx, "flow-repo-all");
+    click(cx, "flow-runs-scope");
+    click(cx, "flow-scope-all");
     page.read_with(cx, |page, _| {
         assert_eq!(page.selected_repo_for_probe(), None);
     });
@@ -437,6 +449,82 @@ fn selecting_a_repository_filters_the_board(cx: &mut TestAppContext) {
         cx.debug_bounds("flow-card-repo-b-run-b").is_some(),
         "All repos shows every repository again"
     );
+
+    cleanup(home);
+}
+
+/// The list is one list: Down walks from a band into the next one, and the
+/// cursor never stands on a row the filter hides.
+#[gpui_kit::gpui::test]
+fn the_cursor_walks_the_bands_and_stays_on_the_filtered_rows(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("filter-cursor");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+
+    let repo = seed_repo(&home, "repo-a");
+    seed_spec(&repo, "moving", "ready-for-agent", "A running run", "Body.");
+    seed_run(&repo, "moving", "running", &[("code", "-", 1, "running")]);
+    seed_spec(&repo, "asking", "ready-for-agent", "An asking run", "Body.");
+    seed_run(&repo, "asking", "waiting", &[("code", "-", 1, "waiting")]);
+    seed_question(
+        &repo,
+        "asking",
+        1,
+        "open",
+        "Which cases must the probe cover?",
+    );
+
+    let (handle, page) = open_app(cx, vec![repo]);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    cx.update(|window, _| window.activate_window());
+    settle(cx);
+
+    let focus = page.read_with(cx, |page, _| page.board_focus_handle());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    settle(cx);
+
+    let cursor = |cx: &mut VisualTestContext| {
+        page.read_with(cx, |page, _| {
+            page.cursor_for_probe()
+                .map(|key| key.id.clone())
+                .expect("the cursor is on a run")
+        })
+    };
+    // Waiting on you is the first band, Running the next: Down crosses it
+    assert_eq!(cursor(cx), "asking");
+    cx.simulate_keystrokes("down");
+    settle(cx);
+    assert_eq!(
+        cursor(cx),
+        "moving",
+        "Down walks from the band into the next"
+    );
+    cx.simulate_keystrokes("home");
+    settle(cx);
+    assert_eq!(cursor(cx), "asking");
+
+    // Needs you leaves the asking run alone on the list
+    click(cx, "flow-runs-filter");
+    click(cx, "flow-filter-need");
+    assert!(
+        cx.debug_bounds("flow-card-repo-a-moving").is_none(),
+        "the running run is filtered out"
+    );
+    assert!(cx.debug_bounds("flow-card-repo-a-asking").is_some());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    settle(cx);
+
+    // Down and Up have nowhere to go: the hidden row is not a stop
+    for key in ["down", "down", "up"] {
+        cx.simulate_keystrokes(key);
+        settle(cx);
+        assert_eq!(
+            cursor(cx),
+            "asking",
+            "{key} keeps the cursor on the row the filter shows"
+        );
+    }
 
     cleanup(home);
 }

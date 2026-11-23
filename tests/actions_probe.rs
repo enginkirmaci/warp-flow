@@ -321,8 +321,12 @@ fn start_pause_resume_done_follows_the_host_and_shows_the_live_log(cx: &mut Test
         phase == Phase::Done
     });
     assert!(
-        cx.debug_bounds("flow-run-start").is_some(),
-        "a done run still shows Start, disabled, rather than no action"
+        cx.debug_bounds("flow-run-start").is_none(),
+        "a done run offers no Start at all, not a disabled one"
+    );
+    assert!(
+        cx.debug_bounds("flow-run-abandon").is_none(),
+        "a finished run has nothing to abandon"
     );
     assert!(
         cx.debug_bounds("flow-run-resume").is_none(),

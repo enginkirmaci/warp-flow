@@ -1,11 +1,13 @@
 //! The window: the family's one shell for this app — a 76 rail of sections, the
-//! repository list, and the detail, which holds the 320 run column beside the
-//! open run. The run column owns its keyboard cursor; there is no window-level
-//! arrow handler.
+//! list pane, and the detail. Which list the pane holds is the section's: Runs
+//! shows the runs and picks whose they are from a scope menu, Repos shows the
+//! repositories, Settings its groups. The list owns its keyboard cursor; there
+//! is no window-level arrow handler.
 //!
 //! Each surface lives in its own module and renders through `impl FlowApp`:
-//! [`crate::ui::chrome`] (title bar and rail), [`crate::ui::repos`] (the list),
-//! [`crate::ui::runs`] (the run column) and [`crate::ui::detail`] (the run's head,
+//! [`crate::ui::chrome`] (title bar and rail), [`crate::ui::repos`] (the
+//! repositories list), [`crate::ui::runs`] (the runs list) and
+//! [`crate::ui::detail`] (the run's head,
 //! tabs and tab bodies). The run tab's own content is [`crate::ui::run`],
 //! [`crate::ui::about`] is the About page the Settings section carries, and
 //! [`crate::ui::new_run`] is the form that writes a new issue folder.
@@ -23,10 +25,12 @@ use gpui::{
 };
 use gpui_kit::component::input::InputState;
 use warpui_kit_core::list_nav::ListKey;
+use warpui_kit_core::pane_nav::PaneNav;
 use warpui_kit_core::shell;
+use warpui_kit_core::text_menu::{self, TextMenuAnchor};
 use warpui_kit_markdown::LiveEditorState;
 
-use crate::app::Launch;
+use crate::app::{Launch, Quit, QuitOnDrop};
 use crate::door::SharedBoard;
 use crate::host::{self, Host, HostSnapshot};
 use crate::store::{self, Column, RunFilter, RunKey, Snapshot};
@@ -40,6 +44,8 @@ gpui::actions!(
         /// Folds the list pane away, or brings it back: the act the title bar's
         /// toggle performs, and the one `Ctrl+\` promises.
         ToggleList,
+        /// Shows the keyboard-reference sheet; `?` and `Ctrl+/` answer to it.
+        ShowShortcuts,
     ]
 );
 
@@ -50,11 +56,11 @@ pub(crate) const PAGE: usize = 5;
 /// at its top.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
-    /// The repositories on the left, the 320 run column and the open run on the
-    /// right: the window a person watches.
+    /// The runs list and the open run: the window a person watches. The list's
+    /// scope menu picks whose runs it shows.
     Runs,
-    /// The repositories on the left, the selected repository's gates and
-    /// workflow on the right: the window a person edits.
+    /// The repositories and the selected one's workflow template: the window a
+    /// person edits.
     Repos,
     /// This app's own settings, and the About page at the end of its group
     /// list: the installed family, this build and the license.
@@ -165,9 +171,46 @@ pub(crate) struct DocSlot {
     editor: Entity<LiveEditorState>,
 }
 
+/// The open run's screen state. It is what the Run tab is showing rather than
+/// what the scan knows, so it belongs to the open pane and is reset as one
+/// value whenever the pane moves to another run or closes. Keeping it in one
+/// struct is what replaced the five copies of a six-line reset block that had
+/// already drifted.
+#[derive(Default)]
+pub(crate) struct RunScreenState {
+    /// The open question's rendered markdown.
+    pub question: Option<DocSlot>,
+    /// Ticked labels of an open `multi` question.
+    pub multi: Vec<String>,
+    /// Why the last answer could not be written.
+    pub answer_error: Option<String>,
+    /// Why the last start, resume, pause or abandon could not run, in the
+    /// engine's own words.
+    pub action_error: Option<String>,
+    /// The run whose Abandon is waiting for its one-step confirmation.
+    pub abandon_confirm: Option<RunKey>,
+    /// The issue folder the run screen is showing, for the host's calls.
+    pub issue: Option<PathBuf>,
+}
+
+impl RunScreenState {
+    /// Forget everything the previous run left on screen.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+impl DocSlot {
+    /// The read-only editor this slot holds, for a render path that only needs
+    /// to draw it.
+    pub(crate) fn editor(&self) -> &Entity<LiveEditorState> {
+        &self.editor
+    }
+}
+
 /// The app window's state.
 /// Where each card was painted, in window coordinates: `(run, bounds)` pairs the
-/// board's columns fill during prepaint.
+/// board's lanes fill during prepaint.
 type CardBounds = Rc<RefCell<Vec<(RunKey, Bounds<gpui::Pixels>)>>>;
 
 pub struct FlowApp {
@@ -189,6 +232,23 @@ pub struct FlowApp {
     pub(crate) filter: RunFilter,
     /// Whether the run column's filter menu is open.
     pub(crate) filter_open: bool,
+    /// Whether the run list's scope menu is open.
+    pub(crate) scope_open: bool,
+    /// The run list's ⋯ menu: one open, and one armed destructive row. The
+    /// window owns it, so a frame can clear it and no thread-local outlives a
+    /// window.
+    pub(crate) run_menu: crate::ui::runs::RunMenuState,
+    /// The key map that moves the keyboard between the list and the detail:
+    /// left/right and Tab/Shift+Tab belong to the window's two panes, while
+    /// up/down stay with the focused list.
+    pub(crate) pane_nav: Rc<PaneNav>,
+    /// The window's one read-only text menu anchor: selectable markdown gets
+    /// Cut/Copy's missing half from the kit.
+    pub(crate) text_menu: Entity<TextMenuAnchor>,
+    /// Whether the keyboard-shortcut sheet is up, and where its card holds the
+    /// keyboard while it is.
+    pub(crate) shortcuts_open: bool,
+    pub(crate) shortcuts_focus: FocusHandle,
     /// Whether the list pane is folded away (`Ctrl+\`, or the title bar's
     /// toggle). The detail takes the width it leaves.
     pub(crate) list_hidden: bool,
@@ -220,11 +280,8 @@ pub struct FlowApp {
     pub(crate) cursor: Option<RunKey>,
     pub(crate) board_focus: FocusHandle,
     pub(crate) board_scroll: ScrollHandle,
-    /// How many more frames must pass before the board reveals the cursor's
-    /// card: a frame is needed for the layout a change caused to be measured.
-    pub(crate) reveal_frames: u8,
     /// Where the last frame painted each card, in window coordinates. The cards
-    /// are nested inside their columns, so the scroll handle cannot reach them
+    /// are nested inside their lanes, so the scroll handle cannot reach them
     /// by index; this is what [`FlowApp::reveal_cursor`] measures against.
     pub(crate) card_bounds: CardBounds,
     pub(crate) rail_scroll: ScrollHandle,
@@ -242,24 +299,21 @@ pub struct FlowApp {
     pub(crate) screens: Screens,
     /// The run screen's scrolling content.
     pub(crate) run_focus: FocusHandle,
+    /// The Runs detail itself: where the focus waits while the list is folded,
+    /// so a key pressed from the list still reaches the window.
+    pub(crate) detail_focus: FocusHandle,
     pub(crate) run_scroll: ScrollHandle,
-    /// The open question's rendered markdown.
-    pub(crate) run_question: Option<DocSlot>,
-    /// Ticked labels of an open `multi` question.
-    pub(crate) run_multi: Vec<String>,
-    /// Why the last answer could not be written.
-    pub(crate) run_answer_error: Option<String>,
+    /// The open run's screen state: the question it is showing, the picks and
+    /// the last error. One value, reset once, so opening a second run cannot
+    /// inherit the first one's card.
+    pub(crate) run_ui: RunScreenState,
     /// The single-line answer field a `text` (or unknown-kind) question uses.
     pub(crate) answer_field: Entity<InputState>,
-    /// Why the last start, resume, pause or abandon could not run, in the
-    /// engine's own words.
-    pub(crate) run_action_error: Option<String>,
-    /// The run whose Abandon is waiting for its one-step confirmation.
-    pub(crate) run_abandon_confirm: Option<RunKey>,
-    /// The issue folder the run screen is showing, for the host's calls.
-    pub(crate) run_issue: Option<PathBuf>,
     /// The engine log panel's scrolling content.
     pub(crate) run_log_scroll: ScrollHandle,
+    /// The workflow matrix's sideways position when a run has more task
+    /// columns than the reading column can hold.
+    pub(crate) matrix_scroll: ScrollHandle,
     /// Whether the list pane's Add-repository popover is open, and the path
     /// field it holds. The list pane is the one place a repository is added or
     /// forgotten now that the Gates tab is gone (ADR-0015).
@@ -274,6 +328,11 @@ pub struct FlowApp {
     /// never touched.
     pub(crate) forget_armed: Option<PathBuf>,
     window_title: String,
+    /// The quit path, run when this view is released with the last window.
+    /// [`crate::app::Quit`] says why it is a `Drop` and not an observer. It is
+    /// never read: being held is its whole job.
+    #[expect(dead_code, reason = "held for its Drop, which is the quit path")]
+    pub(crate) quit: QuitOnDrop,
 }
 
 impl FlowApp {
@@ -304,11 +363,27 @@ impl FlowApp {
 
     /// Build the window over the host and board handle the app's bootstrap
     /// created: the window shows the board the door answers with, and the door
-    /// publishes the host snapshot the window renders.
+    /// publishes the host snapshot the window renders. With no door to
+    /// withdraw, a probe's window still asks its host to stop on the way out.
     pub fn with_board(
         launch: Launch,
         host: Arc<Host>,
         board: SharedBoard,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let quit = QuitOnDrop::new(Quit::new(None, Arc::clone(&host)));
+        Self::with_quit(launch, host, board, quit, window, cx)
+    }
+
+    /// [`FlowApp::with_board`] carrying the app's quit path: the door goes down
+    /// and the host stops when this view is released, which the last window's
+    /// close does before gpui asks anyone to quit.
+    pub fn with_quit(
+        launch: Launch,
+        host: Arc<Host>,
+        board: SharedBoard,
+        quit: QuitOnDrop,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -318,8 +393,12 @@ impl FlowApp {
         }
         let board_focus = cx.focus_handle();
         let run_focus = cx.focus_handle();
+        let detail_focus = cx.focus_handle();
         let answer_field =
             cx.new(|cx| InputState::new(window, cx).placeholder("Or write the answer yourself"));
+        let pane_nav = Rc::new(PaneNav::new());
+        let text_menu = text_menu::install(cx);
+        let shortcuts_focus = cx.focus_handle();
         // The answer field is FlowApp state: a keystroke must repaint the
         // Submit button that reads whether the field is empty.
         cx.observe(&answer_field, |_, _, cx| cx.notify()).detach();
@@ -340,6 +419,12 @@ impl FlowApp {
             section: Section::Runs,
             filter: RunFilter::default(),
             filter_open: false,
+            scope_open: false,
+            run_menu: crate::ui::runs::RunMenuState::default(),
+            pane_nav,
+            text_menu,
+            shortcuts_open: false,
+            shortcuts_focus,
             list_hidden: false,
             list_width,
             settings_group: SettingsGroup::default(),
@@ -353,7 +438,6 @@ impl FlowApp {
             cursor: None,
             board_focus,
             board_scroll: ScrollHandle::new(),
-            reveal_frames: 0,
             card_bounds: Rc::new(RefCell::new(Vec::new())),
             rail_scroll: ScrollHandle::new(),
             screen: None,
@@ -361,27 +445,21 @@ impl FlowApp {
             titlebar_should_move: false,
             screens,
             run_focus,
+            detail_focus,
             run_scroll: ScrollHandle::new(),
-            run_question: None,
-            run_multi: Vec::new(),
-            run_answer_error: None,
+            run_ui: RunScreenState::default(),
             answer_field,
-            run_action_error: None,
-            run_abandon_confirm: None,
-            run_issue: None,
             run_log_scroll: ScrollHandle::new(),
+            matrix_scroll: ScrollHandle::new(),
             add_repo_open: false,
             add_repo_field: None,
             add_repo_note: None,
             forget_armed: None,
             window_title: String::new(),
+            quit,
         };
         app.start_scan(cx);
         app.start_host_poll(cx);
-        // The quit path is the app's, in [`crate::app::run`]: gpui drops this
-        // window's view entity when the last window closes, before app
-        // shutdown, so an entity-level `on_app_quit` never runs. It is what
-        // withdraws the door and asks the blocking engine to stop.
         app
     }
 
@@ -468,12 +546,7 @@ impl FlowApp {
         self.selected_run = Some(key);
         self.section = Section::Runs;
         self.screen = Some(Screen::Run);
-        self.run_question = None;
-        self.run_multi.clear();
-        self.run_answer_error = None;
-        self.run_action_error = None;
-        self.run_abandon_confirm = None;
-        self.run_issue = None;
+        self.run_ui.reset();
         cx.notify();
     }
 
@@ -586,15 +659,27 @@ impl FlowApp {
 
     /// Fold the list pane away, or bring it back: the title bar's toggle and
     /// `Ctrl+\`.
-    pub(crate) fn toggle_list(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// The list's own focus leaves the tree with the list, so hiding it while
+    /// the list is focused parks the focus on the detail — which is always
+    /// there — and the same key brings the list back. Showing the list hands
+    /// the focus straight back.
+    pub(crate) fn toggle_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.list_hidden = !self.list_hidden;
+        if self.list_hidden {
+            if self.board_focus.is_focused(window) {
+                window.focus(&self.detail_focus, cx);
+            }
+        } else if self.detail_focus.is_focused(window) {
+            window.focus(&self.board_focus, cx);
+        }
         cx.notify();
     }
 
     /// The `Ctrl+\` binding's handler: the same act the title bar's toggle
     /// takes, so the tooltip, the title bar and the key cannot disagree.
-    fn toggle_list_action(&mut self, _: &ToggleList, _: &mut Window, cx: &mut Context<Self>) {
-        self.toggle_list(cx);
+    fn toggle_list_action(&mut self, _: &ToggleList, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_list(window, cx);
     }
 
     /// Star or unstar a repository. The Favorites band follows on the next
@@ -720,19 +805,17 @@ impl FlowApp {
         {
             // The open run left the snapshot: fall back to the board.
             self.screen = None;
-            self.run_question = None;
-            self.run_multi.clear();
-            self.run_answer_error = None;
-            self.run_action_error = None;
-            self.run_abandon_confirm = None;
-            self.run_issue = None;
+            self.run_ui.reset();
         }
     }
 
-    /// The keys of every run in board order: column by column, then card.
+    /// The keys of every run the list shows, in its order: lane by lane, then
+    /// row, and only the lanes the filter lets through — the cursor never
+    /// stands on a row the filter hides.
     pub(crate) fn visible_keys(&self) -> Vec<RunKey> {
-        Column::ALL
+        Column::BOARD
             .iter()
+            .filter(|column| self.filter.passes(**column))
             .flat_map(|column| self.column_keys(*column))
             .collect()
     }
@@ -759,28 +842,27 @@ impl FlowApp {
         window.focus(&self.board_focus, cx);
     }
 
-    /// Take `repo` as the window's selected repository without a frame of its
-    /// own, keeping the cursor and the open run attached to what the filter
-    /// still holds.
+    /// The repository the window has selected, without a frame of its own,
+    /// keeping the cursor and the open run attached to what the scope still
+    /// holds.
     ///
-    /// The repository list, the detail's head and the board's filter all read
-    /// this one value. The gates screen adds a folder to the settings without
-    /// a click on a row, so it calls this: a screen-level selection alone would
-    /// leave the head describing the folder before it.
+    /// The repository list, the detail's head and the runs list's scope all
+    /// read this one value. A repository added from the list's `+` is selected
+    /// through this too, so the editor moves with the head it sits under.
     pub(crate) fn adopt_repo(&mut self, repo: Option<PathBuf>, cx: &mut Context<Self>) {
         self.selected_repo = repo;
         let visible = self.visible_keys();
         self.cursor = visible.first().cloned();
-        // In the Repos section the head and the tab under it read two values:
+        // In the Repos section the head and the screen under it read two values:
         // the window's selection and the screen's own. Point the screen now,
-        // while `screen` still names the open tab, so a row clicked here moves
-        // the gate editor with the head it sits under.
+        // while `screen` still names the open one, so a row clicked here moves
+        // the editor with the head it sits under.
         if self.section == Section::Repos {
             self.refresh_screens(cx);
         }
-        // A filter that no longer holds the open run closes it — but that is
-        // the Runs section's detail; the Repos section's tab is not a run, and
-        // closing it here would leave the section with no screen to point.
+        // A scope that no longer holds the open run closes it — but that is
+        // the Runs section's detail; the Repos section's screen is not a run,
+        // and closing it here would leave the section with no screen to point.
         if self.section == Section::Runs
             && let Some(selected) = &self.selected_run
             && !self
@@ -935,30 +1017,15 @@ impl FlowApp {
         // the run's own tab: opening a run shows what it is doing
         self.screen = Some(Screen::Run);
         self.section = Section::Runs;
-        self.run_question = None;
-        self.run_multi.clear();
-        self.run_answer_error = None;
-        self.run_action_error = None;
-        self.run_abandon_confirm = None;
-        self.run_issue = None;
+        self.run_ui.reset();
         window.focus(&self.board_focus, cx);
-        // The run pane takes the width the column gives up, so the row that is
-        // open can slide under it. The bounds a frame renders from are the
-        // previous frame's, and the narrowing itself is only measured at the end
-        // of this one, so the reveal runs in the render two frames from now.
-        self.reveal_frames = 2;
         cx.notify();
     }
 
     pub(crate) fn close_detail(&mut self, cx: &mut Context<Self>) {
         self.selected_run = None;
         self.screen = None;
-        self.run_question = None;
-        self.run_multi.clear();
-        self.run_answer_error = None;
-        self.run_action_error = None;
-        self.run_abandon_confirm = None;
-        self.run_issue = None;
+        self.run_ui.reset();
         cx.notify();
     }
 
@@ -1016,7 +1083,7 @@ impl FlowApp {
                             .flex()
                             .items_center()
                             .gap(px(6.))
-                            .text_size(px(theme::font_meta()))
+                            .text_size(px(theme::font_sub()))
                             .text_color(theme::text_muted())
                             .child(
                                 div()
@@ -1154,7 +1221,7 @@ impl FlowApp {
     /// Why the last run action could not run, as the run screen shows it.
     #[doc(hidden)]
     pub fn run_action_error_for_probe(&self) -> Option<&str> {
-        self.run_action_error.as_deref()
+        self.run_ui.action_error.as_deref()
     }
 
     /// The screens the rail opens, for a probe that drives one directly.
@@ -1230,6 +1297,8 @@ impl FlowApp {
 impl Render for FlowApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_window_title(window);
+        // Pane moves are rebuilt every frame from the panes actually drawn.
+        self.pane_nav.begin_frame();
         // read in the frame, so the title bar's zoom glyph follows the
         // compositor without a control having to tell it
         self.maximized = window.is_maximized();
@@ -1242,13 +1311,21 @@ impl Render for FlowApp {
             None
         } else {
             match self.section {
-                Section::Runs | Section::Repos => Some(self.render_list_pane(cx)),
+                // Runs has one list, the runs; with nothing configured the
+                // repositories list stands in, because its `+` is the way to
+                // add the first one.
+                Section::Runs if self.settings.repos.is_empty() => Some(self.render_list_pane(cx)),
+                Section::Runs => Some(self.render_runs_pane(window, cx)),
+                Section::Repos => Some(self.render_list_pane(cx)),
                 // Settings' About page takes the section's whole width: its
                 // own installed-family list is the pane beside its detail.
                 Section::Settings if self.settings_group == SettingsGroup::About => None,
                 Section::Settings => Some(self.render_settings_list(cx)),
             }
         };
+        // `shell::panes()` carries `min_w_0`/`min_h_0`: a paragraph's unwrapped
+        // width counts as its minimum otherwise, and a long one pushed the
+        // detail's right edge off screen.
         let mut stage = shell::panes().debug_selector(|| "flow-panes".into());
         if let Some(list) = list {
             stage = stage.child(list);
@@ -1268,6 +1345,7 @@ impl Render for FlowApp {
             // The window's own key: `Ctrl+\` folds the list pane away and back,
             // wherever the focus sits in the window.
             .on_action(cx.listener(Self::toggle_list_action))
+            .on_action(cx.listener(Self::show_shortcuts_action))
             // A press anywhere but the armed row's Forget affordance leaves
             // that row alone; the affordance stops its own press, so it is the
             // one exception (ADR-0015: the list pane owns the lifecycle).
@@ -1325,19 +1403,31 @@ impl Render for FlowApp {
                     .child(stage.child(detail)),
             )
             .children(new_run)
+            .when(self.shortcuts_open, |root| {
+                root.child(self.render_shortcuts(cx))
+            })
+            .child(self.text_menu.clone())
     }
 }
 
 impl FlowApp {
-    /// The Runs section's detail: the 320 run column, then the open run or the
-    /// line that says no run is open.
+    /// The `?`/`Ctrl+/` action: the sheet's one entry from the keyboard.
+    fn show_shortcuts_action(
+        &mut self,
+        _: &ShowShortcuts,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_shortcuts(window, cx);
+    }
+
+    /// The Runs section's detail: the open run, or the line that says no run is
+    /// open. The runs list is the pane beside it, so the detail takes every
+    /// pixel the list leaves.
     fn render_runs_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.settings.repos.is_empty() {
             return self.render_empty();
         }
-        // The detail holds the run column and the open run side by side: the
-        // column is the work list, the run is what the list opened. It is a row,
-        // not the shell's page column, because neither is under the other.
         let open = self.run_tab().is_some()
             && self
                 .selected_run
@@ -1349,28 +1439,31 @@ impl FlowApp {
         } else {
             self.render_no_run()
         };
-        div()
-            .flex()
-            .flex_row()
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
-            .h_full()
-            .child(self.render_run_column(window, cx))
-            .child(
-                shell::detail_pane()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .child(pane),
-            )
+        // The detail is the right-hand pane: its stop is the focused run body
+        // while one is open, else the pane itself. The board registers first,
+        // in its own render, so the order is left to right.
+        if open {
+            self.pane_nav.register(&self.run_focus);
+        } else {
+            self.pane_nav.register(&self.detail_focus);
+        }
+        shell::detail_pane()
+            .track_focus(&self.detail_focus)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if let Some(direction) = warpui_kit_core::pane_nav::direction(event)
+                    && this
+                        .pane_nav
+                        .move_from(&this.detail_focus, direction, window, cx)
+                {
+                    cx.stop_propagation();
+                }
+            }))
+            .child(pane)
             .into_any_element()
     }
 
-    /// The Repos section's detail: the selected repository's head and its Gates
-    /// and Workflow tabs.
+    /// The Repos section's detail: the selected repository's head and its
+    /// workflow editor.
     fn render_repos_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.settings.repos.is_empty() {
             return self.render_empty();
@@ -1411,19 +1504,15 @@ impl FlowApp {
         for group in SettingsGroup::ALL {
             let selected = self.settings_group == group;
             let selector = format!("flow-settings-{}", group.key());
-            let mut row = div()
-                .id(SharedString::from(selector.clone()))
+            let row = shell::list_row(SharedString::from(selector.clone()), selected)
                 .debug_selector(move || selector.clone())
                 .role(gpui::Role::Button)
                 .aria_label(group.label())
-                .relative()
-                .cursor_pointer()
                 .flex()
                 .flex_col()
                 .justify_center()
                 .gap(px(2.))
                 .h(px(theme::scaled(theme::ROW_HEIGHT)))
-                .pl(px(13.))
                 .pr(px(16.))
                 .py(px(10.))
                 .border_b_1()
@@ -1441,23 +1530,10 @@ impl FlowApp {
                 )
                 .child(
                     div()
-                        .text_size(px(theme::font_meta()))
+                        .text_size(px(theme::font_sub()))
                         .text_color(theme::text_muted())
                         .child(group.blurb()),
                 );
-            if selected {
-                row = row.bg(theme::raised()).child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .bottom_0()
-                        .left_0()
-                        .w(px(theme::ROW_MARK))
-                        .bg(theme::accent()),
-                );
-            } else {
-                row = row.hover(|style| style.bg(theme::panel()));
-            }
             rows = rows.child(row);
         }
         shell::list_pane(width)
@@ -1513,7 +1589,7 @@ impl FlowApp {
                             .text_size(px(theme::font_body()))
                             .text_color(theme::text_dim())
                             .child(
-                                "Pick a run in the column beside this pane. The engine owns its \
+                                "Pick a run in the list beside this pane. The engine owns its \
                                  folder while it drives; everything it wrote is on the run's tabs.",
                             ),
                     ),
@@ -1524,8 +1600,8 @@ impl FlowApp {
 
 // ---- small rendering helpers ----------------------------------------------
 
-/// One row of the rail's screen list: the board's shape at a smaller size, so
-/// the screen list reads as a second list in the same rail.
+/// A repository's name: the last segment of its path, which is what the runs
+/// list, the detail's head and a debug selector call it.
 pub(crate) fn repo_label(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())

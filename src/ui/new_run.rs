@@ -15,16 +15,16 @@ use std::path::{Path, PathBuf};
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Context, Entity, Focusable, FontWeight, KeyDownEvent, MouseButton, Window, div, px,
-    relative,
+    AnyElement, Context, Entity, Focusable, FontWeight, KeyDownEvent, MouseButton, SharedString,
+    Window, div, px, relative,
 };
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use warpui_kit_core::tooltip::tooltip_text;
-use warpui_kit_core::{controls, field, icon};
+use warpui_kit_core::{controls, field};
 
 use crate::store::{self, RunKey};
 use crate::theme;
-use crate::ui::window::FlowApp;
+use crate::ui::window::{FlowApp, repo_label};
 
 /// The form a New run is filled in: the repository it lands in, the two fields
 /// and what the title currently resolves to.
@@ -169,19 +169,72 @@ fn heading(title: &str) -> String {
 }
 
 impl FlowApp {
-    /// The repository a New run would land in: the one the list has selected,
-    /// or the only configured repository when the list is on All Repos.
-    ///
-    /// `None` is the multi-repository case with no selection: the run column's
-    /// New run button parks itself and says to pick a repository, rather than
-    /// guessing which checkout the person meant.
+    /// The repository a New run opens on: the one the runs list is scoped to,
+    /// else the first configured one. Over every repository the form itself
+    /// offers the pick, so the list's one primary is never parked.
     pub(crate) fn new_run_target(&self) -> Option<PathBuf> {
-        if let Some(repo) = &self.selected_repo {
-            return Some(repo.clone());
+        self.selected_repo
+            .clone()
+            .or_else(|| self.settings.repos.first().cloned())
+    }
+
+    /// Move the open form to `repo`: the folder it will write, and the slug it
+    /// shows, follow.
+    fn pick_new_run_repository(&mut self, repo: PathBuf, cx: &mut Context<Self>) {
+        if let Some(form) = self.new_run.as_mut() {
+            form.repo = repo;
         }
-        let mut repos = self.settings.repos.iter();
-        let first = repos.next()?;
-        repos.next().is_none().then(|| first.clone())
+        self.refresh_new_run_slug(cx);
+        cx.notify();
+    }
+
+    /// The repository line of the form: one chip per configured repository with
+    /// the picked one filled, or the one repository's path when there is only
+    /// it to name.
+    fn new_run_repositories(&self, picked: &Path, cx: &mut Context<Self>) -> AnyElement {
+        if self.settings.repos.len() < 2 {
+            return div()
+                .debug_selector(|| "flow-new-run-repo".into())
+                .min_w_0()
+                .truncate()
+                .text_size(px(theme::font_sub()))
+                .text_color(theme::text_dim())
+                .child(store::display_path(picked))
+                .into_any_element();
+        }
+        let mut row = div()
+            .debug_selector(|| "flow-new-run-repos".into())
+            .flex()
+            .flex_wrap()
+            .gap(px(6.));
+        for repo in &self.settings.repos {
+            let is_picked = repo.as_path() == picked;
+            let path = repo.clone();
+            let name = repo_label(repo);
+            row = row.child(
+                div()
+                    .debug_selector({
+                        let selector = format!("flow-new-run-repo-{name}");
+                        move || selector.clone()
+                    })
+                    .child(controls::button(
+                        SharedString::from(format!("flow-new-run-repo-pick-{name}")),
+                        name,
+                        if is_picked {
+                            controls::BtnKind::Primary(theme::on_accent())
+                        } else {
+                            controls::BtnKind::Chip
+                        },
+                        theme::accent(),
+                        theme::font_control(),
+                        true,
+                        cx.listener(move |this, _, _, cx| {
+                            this.pick_new_run_repository(path.clone(), cx)
+                        }),
+                    )),
+            );
+        }
+        row.into_any_element()
     }
 
     /// Open the New run form for `repo`, on the first field.
@@ -278,7 +331,7 @@ impl FlowApp {
         let request = form.request.clone();
         let slug = form.slug.clone();
         let error = form.error.clone();
-        let repo = store::display_path(&form.repo);
+        let repo = form.repo.clone();
         let title_value = title.read(cx).value().to_string();
         let armed = !title_value.trim().is_empty() && !request.read(cx).value().trim().is_empty();
         let folder = if title_value.trim().is_empty() {
@@ -298,22 +351,14 @@ impl FlowApp {
             .px(px(16.))
             .py(px(14.))
             .child(label("Repository"))
-            .child(
-                div()
-                    .debug_selector(|| "flow-new-run-repo".into())
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(theme::font_meta()))
-                    .text_color(theme::text_dim())
-                    .child(repo),
-            )
+            .child(self.new_run_repositories(&repo, cx))
             .child(label("Title"))
             .child(field::text("flow-new-run-title", &title, window, cx))
             .child(
                 div()
                     .debug_selector(|| "flow-new-run-folder".into())
                     .font_family(theme::code_font())
-                    .text_size(px(theme::font_micro()))
+                    .text_size(px(theme::font_mono_meta()))
                     .text_color(theme::text_muted())
                     .child(folder),
             )
@@ -327,7 +372,7 @@ impl FlowApp {
             Some(error) => body.child(
                 div()
                     .debug_selector(|| "flow-new-run-error".into())
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_sub()))
                     .text_color(theme::DANGER)
                     .child(error),
             ),
@@ -425,7 +470,7 @@ impl FlowApp {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(px(theme::font_micro()))
+                                    .text_size(px(theme::font_sub()))
                                     .text_color(theme::text_muted())
                                     .child("Creates the issue folder; Start run drives it."),
                             )
@@ -452,59 +497,41 @@ impl FlowApp {
 /// A field's label: the family's plain-text label, never markdown.
 fn label(text: &'static str) -> AnyElement {
     div()
-        .text_size(px(theme::font_meta()))
+        .text_size(px(theme::font_label()))
         .font_weight(FontWeight::MEDIUM)
         .text_color(theme::text_dim())
         .child(text)
         .into_any_element()
 }
 
-/// The New run button in the run column's head: one filled primary on the
-/// board's surface, parked when no repository can take the run.
+/// The New run button in the runs list's head: the Runs section's one filled
+/// primary, the family's shared button. It is live whenever a repository is
+/// configured — over every repository the form offers the pick.
 pub(crate) fn button(app: &FlowApp, cx: &mut Context<FlowApp>) -> AnyElement {
     let target = app.new_run_target();
-    let mut wrap = div()
+    let (enabled, tip) = if target.is_some() {
+        (true, "Create a run from a request")
+    } else {
+        (false, "Add a repository first.")
+    };
+    div()
         .id("flow-runs-new")
-        .debug_selector(|| "flow-runs-new".into());
-    let mut button = div()
-        .id("flow-runs-new-button")
-        .role(gpui::Role::Button)
-        .aria_label("New run")
-        .flex()
-        .items_center()
-        .gap(px(5.))
-        .h(px(28.))
-        .px(px(8.))
-        .rounded(px(6.))
-        .text_size(px(theme::font_meta()))
-        .font_weight(FontWeight::MEDIUM);
-    match target {
-        Some(target) => {
-            wrap = wrap.tooltip(tooltip_text("Create a run from a request"));
-            button = button
-                .bg(theme::accent())
-                .text_color(theme::on_accent())
-                .cursor_pointer()
-                .hover(|style| style.opacity(0.9))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_new_run(target.clone(), window, cx);
-                }))
-                .child(icon(
-                    "icons/icon-plus.svg",
-                    px(theme::icon_small()),
-                    theme::on_accent(),
-                ));
-        }
-        None => {
-            wrap = wrap.tooltip(tooltip_text("Select a repository first."));
-            button = button.opacity(0.5).child(icon(
-                "icons/icon-plus.svg",
-                px(theme::icon_small()),
-                theme::text_muted(),
-            ));
-        }
-    }
-    wrap.child(button.child("New run")).into_any_element()
+        .debug_selector(|| "flow-runs-new".into())
+        .tooltip(tooltip_text(tip))
+        .child(controls::button(
+            "flow-runs-new-button",
+            "New run",
+            controls::BtnKind::Primary(theme::on_accent()),
+            theme::accent(),
+            theme::font_control(),
+            enabled,
+            cx.listener(move |this, _, window, cx| {
+                if let Some(target) = target.clone() {
+                    this.open_new_run(target, window, cx);
+                }
+            }),
+        ))
+        .into_any_element()
 }
 
 #[cfg(test)]

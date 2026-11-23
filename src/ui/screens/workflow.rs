@@ -120,6 +120,11 @@ const DIAGRAM_MIN_WIDTH: f32 = 360.;
 /// spare.
 const DIAGRAM_MAX_SHARE: f32 = 0.68;
 
+/// The inspector's readable minimum. The graph column takes what is left and
+/// scrolls sideways when the picture is wider: a form below this width wraps
+/// its segment and its fields into the pane's edge instead of its rows.
+const INSPECTOR_MIN_WIDTH: f32 = 356.;
+
 /// One extra dependency's quiet chip on a row: small enough for the meta line.
 /// The list's head: the step count and the revision.
 const LIST_HEAD_HEIGHT: f32 = 40.;
@@ -919,7 +924,7 @@ impl WorkflowScreen {
                 div()
                     .flex_shrink_0()
                     .font_family(theme::code_font())
-                    .text_size(px(theme::font_micro()))
+                    .text_size(px(theme::font_mono_meta()))
                     .text_color(theme::text_muted())
                     .child(version),
             );
@@ -972,7 +977,7 @@ impl WorkflowScreen {
             .debug_selector(|| "flow-workflow-column".into())
             .flex()
             .flex_col()
-            .flex_shrink_0()
+            .flex_shrink(1.)
             .w(px(diagram_width))
             .min_w(px(theme::scaled(DIAGRAM_MIN_WIDTH)))
             .max_w(relative(DIAGRAM_MAX_SHARE))
@@ -1090,7 +1095,7 @@ impl WorkflowScreen {
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(theme::font_meta()))
+                            .text_size(px(theme::font_label()))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(if enabled {
                                 theme::text()
@@ -1162,7 +1167,7 @@ impl WorkflowScreen {
                         .flex()
                         .flex_col()
                         .flex_1()
-                        .min_w_0()
+                        .min_w(px(theme::scaled(INSPECTOR_MIN_WIDTH)))
                         .bg(theme::panel())
                         .child(match &self.error {
                             // A file that would not parse: say so, and never
@@ -1275,24 +1280,38 @@ impl WorkflowScreen {
                     .child(actions),
             )
             .child(
+                // The path is its own line, truncated: a deep checkout made
+                // the one flex row wider than the inspector and pushed the
+                // sentence off the right edge. The sentence follows under it,
+                // so neither has to shrink to an unreadable measure.
                 div()
                     .debug_selector(|| "flow-workflow-path".into())
                     .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(6.))
-                    .text_size(px(theme::font_meta()))
+                    .flex_col()
+                    .gap(px(2.))
+                    .min_w_0()
+                    .text_size(px(theme::font_sub()))
                     .text_color(theme::text_muted())
-                    .child(div().font_family(theme::code_font()).child(path))
-                    .child(div().text_color(theme::line_strong()).child("·"))
-                    .child("a save appends a revision; a run keeps the revision it started on"),
+                    .child(
+                        div()
+                            .id("flow-workflow-path-line")
+                            .w_full()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(theme::code_font())
+                            .tooltip(tooltip_text(path.clone()))
+                            .child(path),
+                    )
+                    .child(div().min_w_0().whitespace_normal().child(
+                        "a save appends a revision; a run keeps the revision it started on",
+                    )),
             );
         if self.dirty {
             head = head.child(
                 div()
                     .debug_selector(|| "flow-workflow-dirty".into())
                     .font_family(theme::code_font())
-                    .text_size(px(theme::font_micro()))
+                    .text_size(px(theme::font_mono_meta()))
                     .text_color(theme::text_muted())
                     .child(format!(
                         "unsaved · revision {} in the file",
@@ -1306,7 +1325,7 @@ impl WorkflowScreen {
             body = body.child(
                 div()
                     .debug_selector(|| "flow-workflow-missing".into())
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_sub()))
                     .text_color(theme::text_muted())
                     .child(
                         "This run has no workflow.toml yet: Save writes the shape below as the \
@@ -1451,7 +1470,7 @@ impl WorkflowScreen {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_w_0()
+                    .min_w(px(theme::scaled(INSPECTOR_MIN_WIDTH)))
                     .h_full()
                     .min_h_0()
                     .relative()
@@ -1564,7 +1583,7 @@ impl WorkflowScreen {
         }
         head = head.child(
             div()
-                .text_size(px(theme::font_meta()))
+                .text_size(px(theme::font_sub()))
                 .text_color(theme::text_muted())
                 .child(
                     "The revision this run uses. A save in the repository appends a new one; \
@@ -1580,7 +1599,7 @@ impl WorkflowScreen {
                     body = body.child(
                         div()
                             .debug_selector(|| "flow-run-workflow-older".into())
-                            .text_size(px(theme::font_meta()))
+                            .text_size(px(theme::font_sub()))
                             .text_color(theme::text_dim())
                             .child(format!(
                                 "Revision {recorded} is older than the file's revision {}. A run \
@@ -1593,7 +1612,7 @@ impl WorkflowScreen {
             (None, _) if missing.is_some() => {
                 body = body.child(
                     div()
-                        .text_size(px(theme::font_meta()))
+                        .text_size(px(theme::font_sub()))
                         .text_color(theme::text_dim())
                         .child(
                             "The steps below are the ones this run recorded; the file that named \
@@ -1630,7 +1649,7 @@ impl WorkflowScreen {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_w_0()
+                    .min_w(px(theme::scaled(INSPECTOR_MIN_WIDTH)))
                     .h_full()
                     .min_h_0()
                     .bg(theme::panel())
@@ -1704,7 +1723,7 @@ impl WorkflowScreen {
                     .child(
                         div()
                             .font_family(theme::code_font())
-                            .text_size(px(theme::font_micro()))
+                            .text_size(px(theme::font_mono_meta()))
                             .text_color(theme::text_muted())
                             .child(name),
                     ),
@@ -1765,7 +1784,7 @@ impl WorkflowScreen {
                         div()
                             .flex_shrink_0()
                             .w(px(theme::scaled(LABEL_WIDTH)))
-                            .text_size(px(theme::font_meta()))
+                            .text_size(px(theme::font_label()))
                             .text_color(theme::text_dim())
                             .child(label.to_owned()),
                     )
@@ -1798,7 +1817,7 @@ impl WorkflowScreen {
             .bg(theme::well())
             .px(px(12.))
             .py(px(8.))
-            .text_size(px(theme::font_meta()))
+            .text_size(px(theme::font_sub()))
             .text_color(theme::text_dim())
             .child(icon(
                 "icons/icon-lock.svg",
@@ -1810,6 +1829,11 @@ impl WorkflowScreen {
     }
 
     /// The Kind row: the family's segmented control.
+    ///
+    /// A stacked row, not a label-left one: five kinds need more width than the
+    /// label column leaves a 1500 px window's inspector, and a clipped last
+    /// option is a choice a person cannot make. `settings::stack_row` is the
+    /// family's shape for exactly this.
     fn kind_row(&self, step: &Step, cx: &mut Context<Self>) -> AnyElement {
         let kinds = vec![
             kit::Choice::new("harness", "harness", step.kind == StepKind::Harness),
@@ -1818,36 +1842,34 @@ impl WorkflowScreen {
             kit::Choice::new("merge", "merge", step.kind == StepKind::Merge),
             kit::Choice::new("cleanup", "cleanup", step.kind == StepKind::Cleanup),
         ];
-        div()
+        let segmented = div()
             .flex()
+            .flex_wrap()
             .items_center()
-            .gap(px(12.))
-            .min_h(px(theme::scaled(FIELD_ROW_HEIGHT)))
-            .py(px(6.))
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .w(px(theme::scaled(LABEL_WIDTH)))
-                    .text_size(px(theme::font_meta()))
-                    .text_color(theme::text_dim())
-                    .child("Kind"),
-            )
-            .child(kit::segmented("flow-step-kind", kinds, {
-                // `segmented` hands the key back to a plain app closure, so the
-                // screen is reached through its entity
-                let sheet = cx.entity();
-                move |key: SharedString, window, cx| {
-                    let key = key.to_string();
-                    sheet.update(cx, |this, cx| {
-                        this.set_kind(&key, cx);
-                        // a merge step's fixed shape drops the rework edge, so
-                        // the budget field has to forget the value it held
-                        this.refill_fields(window, cx);
-                        cx.notify();
-                    });
-                }
-            }))
-            .into_any_element()
+            // The five kinds are the widest set in the family: at the meta
+            // step the trough is wider than the form and clips its last
+            // segment, so this one control reads at the micro step.
+            .child(kit::segmented_sized(
+                "flow-step-kind",
+                kinds,
+                theme::font_micro(),
+                {
+                    // `segmented` hands the key back to a plain app closure, so the
+                    // screen is reached through its entity
+                    let sheet = cx.entity();
+                    move |key: SharedString, window, cx| {
+                        let key = key.to_string();
+                        sheet.update(cx, |this, cx| {
+                            this.set_kind(&key, cx);
+                            // a merge step's fixed shape drops the rework edge, so
+                            // the budget field has to forget the value it held
+                            this.refill_fields(window, cx);
+                            cx.notify();
+                        });
+                    }
+                },
+            ));
+        kit::stack_row("flow-step-kind-row", "Kind", segmented, true)
     }
 
     /// One editable row: the label at 112, the 36-high mono field beside it.
@@ -1869,7 +1891,7 @@ impl WorkflowScreen {
                 div()
                     .flex_shrink_0()
                     .w(px(theme::scaled(LABEL_WIDTH)))
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_label()))
                     .text_color(theme::text_dim())
                     .child(label.to_owned()),
             );
@@ -1900,55 +1922,21 @@ impl WorkflowScreen {
             .as_ref()
             .map(|graph| graph.max_parallel)
             .unwrap_or(1);
-        let row = div()
-            .debug_selector(|| "flow-workflow-parallel".into())
-            .flex()
-            .items_center()
-            .gap(px(12.))
-            .min_h(px(theme::scaled(FIELD_ROW_HEIGHT)))
-            .py(px(6.))
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .w(px(theme::scaled(LABEL_WIDTH)))
-                    .text_size(px(theme::font_meta()))
-                    .text_color(theme::text_dim())
-                    .child("Steps at once"),
-            );
+        let row = label_row("flow-workflow-parallel", "Steps at once", false)
+            .debug_selector(|| "flow-workflow-parallel".into());
         let mut chips = div().flex().items_center().gap(px(6.));
         for count in [1u32, 2, 3, 4, 6, 8] {
             let selected = current == count;
-            let selector = format!("flow-workflow-parallel-{count}");
-            chips = chips.child(
-                div()
-                    .id(SharedString::from(selector.clone()))
-                    .debug_selector(move || selector.clone())
-                    .role(gpui::Role::Button)
-                    .aria_label(format!("Run {count} steps at once"))
-                    .cursor_pointer()
-                    .px(px(9.))
-                    .py(px(3.))
-                    .rounded(px(5.))
-                    .border_1()
-                    .border_color(if selected {
-                        theme::accent()
-                    } else {
-                        theme::hairline()
-                    })
-                    .text_size(px(theme::font_micro()))
-                    .font_family(theme::code_font())
-                    .text_color(if selected {
-                        theme::text()
-                    } else {
-                        theme::text_muted()
-                    })
-                    .hover(|style| style.bg(theme::raised()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_parallel(count, cx);
-                        cx.notify();
-                    }))
-                    .child(count.to_string()),
-            );
+            chips = chips.child(mode_chip(
+                format!("flow-workflow-parallel-{count}"),
+                count.to_string(),
+                format!("Run {count} steps at once"),
+                selected,
+                cx.listener(move |this, _, _, cx| {
+                    this.set_parallel(count, cx);
+                    cx.notify();
+                }),
+            ));
         }
         row.child(chips).into_any_element()
     }
@@ -2186,22 +2174,8 @@ impl WorkflowScreen {
     /// The selected step's dependencies as chips: one per other step in the
     /// graph, pressed to make the step wait for it.
     fn dependency_row(&self, step: &Step, cx: &mut Context<Self>) -> AnyElement {
-        let row = div()
-            .debug_selector(|| "flow-step-depends".into())
-            .flex()
-            .items_start()
-            .gap(px(12.))
-            .min_h(px(theme::scaled(FIELD_ROW_HEIGHT)))
-            .py(px(6.))
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .w(px(theme::scaled(LABEL_WIDTH)))
-                    .pt(px(3.))
-                    .text_size(px(theme::font_meta()))
-                    .text_color(theme::text_dim())
-                    .child("Depends on"),
-            );
+        let row = label_row("flow-step-depends", "Depends on", true)
+            .debug_selector(|| "flow-step-depends".into());
         // Every step the selected one may wait for: the rest of the graph, in
         // the file's order. A step cannot wait for itself, and a cycle is what
         // `validate` refuses at save.
@@ -2230,9 +2204,9 @@ impl WorkflowScreen {
         // Showing all three as chips is what makes a change of meaning visible
         // — a person can see which of the three the step is on (ADR-0018).
         chips = chips.child(mode_chip(
-            "flow-step-depends-all",
-            "All above",
-            "Waits for every step declared before it",
+            "flow-step-depends-all".to_owned(),
+            "All above".to_owned(),
+            "Waits for every step declared before it".to_owned(),
             step.depends_on.is_none(),
             cx.listener(|this, _, window, cx| {
                 this.edit_step(cx, |step| step.depends_on = None);
@@ -2241,9 +2215,9 @@ impl WorkflowScreen {
             }),
         ));
         chips = chips.child(mode_chip(
-            "flow-step-depends-none",
-            "Nothing",
-            "Waits for nothing: it can start with the run",
+            "flow-step-depends-none".to_owned(),
+            "Nothing".to_owned(),
+            "Waits for nothing: it can start with the run".to_owned(),
             step.depends_on.as_deref().is_some_and(<[String]>::is_empty),
             cx.listener(|this, _, window, cx| {
                 this.edit_step(cx, |step| step.depends_on = Some(Vec::new()));
@@ -2261,52 +2235,32 @@ impl WorkflowScreen {
                 .any(|dependency| dependency == &id);
             let selector = format!("flow-step-depends-{id}");
             let value = id.clone();
-            chips = chips.child(
-                div()
-                    .id(SharedString::from(selector.clone()))
-                    .debug_selector(move || selector.clone())
-                    .role(gpui::Role::Button)
-                    .aria_label(if selected {
-                        format!("Waits for {id}; press to stop waiting for it")
-                    } else {
-                        format!("Does not wait for {id}; press to wait for it")
-                    })
-                    .cursor_pointer()
-                    .px(px(8.))
-                    .py(px(3.))
-                    .rounded(px(5.))
-                    .border_1()
-                    .border_color(if selected {
-                        theme::accent()
-                    } else {
-                        theme::hairline()
-                    })
-                    .text_size(px(theme::font_micro()))
-                    .font_family(theme::code_font())
-                    .text_color(if selected {
-                        theme::text()
-                    } else {
-                        theme::text_muted()
-                    })
-                    .hover(|style| style.bg(theme::raised()))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let value = value.clone();
-                        this.edit_step(cx, |step| {
-                            // naming a step leaves the default: the set becomes
-                            // exactly what is pressed
-                            let named = step.depends_on.get_or_insert_with(Vec::new);
-                            match named.iter().position(|id| id == &value) {
-                                Some(at) => {
-                                    named.remove(at);
-                                }
-                                None => named.push(value),
+            chips = chips.child(step_chip(
+                selector,
+                id.clone(),
+                if selected {
+                    format!("Waits for {id}; press to stop waiting for it")
+                } else {
+                    format!("Does not wait for {id}; press to wait for it")
+                },
+                selected,
+                cx.listener(move |this, _, window, cx| {
+                    let value = value.clone();
+                    this.edit_step(cx, |step| {
+                        // naming a step leaves the default: the set becomes
+                        // exactly what is pressed
+                        let named = step.depends_on.get_or_insert_with(Vec::new);
+                        match named.iter().position(|id| id == &value) {
+                            Some(at) => {
+                                named.remove(at);
                             }
-                        });
-                        this.refill_fields(window, cx);
-                        cx.notify();
-                    }))
-                    .child(id),
-            );
+                            None => named.push(value),
+                        }
+                    });
+                    this.refill_fields(window, cx);
+                    cx.notify();
+                }),
+            ));
         }
         row.child(chips).into_any_element()
     }
@@ -2319,13 +2273,13 @@ impl WorkflowScreen {
     /// sends it, and how many rounds it may take.
     fn edges_row(&self, step: &Step, cx: &mut Context<Self>) -> AnyElement {
         if step.kind == StepKind::Merge {
-            return rework_row("flow-step-edges", "Loops back", true)
+            return label_row("flow-step-edges", "Loops back", true)
                 .debug_selector(|| "flow-step-edges".into())
                 .child(quiet_word("A merge either lands or fails."))
                 .into_any_element();
         }
         if step.kind == StepKind::Cleanup {
-            return rework_row("flow-step-edges", "Loops back", true)
+            return label_row("flow-step-edges", "Loops back", true)
                 .debug_selector(|| "flow-step-edges".into())
                 .child(quiet_word(
                     "The run's housekeeping runs once, at the close.",
@@ -2343,7 +2297,7 @@ impl WorkflowScreen {
             body = body.child(self.one_edge_row(step, index, edge, cx));
         }
         body = body.child(self.add_edge_row(step, cx));
-        rework_row("flow-step-edges-label", "Loops back", true)
+        label_row("flow-step-edges-label", "Loops back", true)
             .child(body)
             .into_any_element()
     }
@@ -2356,20 +2310,35 @@ impl WorkflowScreen {
         edge: &Edge,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let mut row = div()
+        // Two lines: where the work returns and the cross that drops the loop,
+        // then what sends it and how many rounds. The cross shares the target's
+        // line because the chips wrap at a narrow inspector, and a cross left
+        // at the end of a wrapped row is the first thing a short form clips.
+        let head = div()
             .flex()
-            .flex_wrap()
             .items_center()
             .gap(px(6.))
             .w_full()
             .child(
                 div()
-                    .flex_shrink_0()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
                     .font_family(theme::code_font())
-                    .text_size(px(theme::font_micro()))
+                    .text_size(px(theme::font_mono_meta()))
                     .text_color(theme::text_dim())
                     .child(format!("\u{2192} {}", edge.to)),
-            );
+            )
+            .child(step_chip(
+                format!("flow-step-edge-{index}-remove"),
+                "\u{00d7}".to_owned(),
+                format!("Remove the loop back to {}", edge.to),
+                false,
+                cx.listener(move |this, _, window, cx| {
+                    this.remove_edge(index, window, cx);
+                }),
+            ));
+        let mut chips = div().flex().flex_wrap().items_center().gap(px(6.)).w_full();
         for trigger in Trigger::ALL
             .into_iter()
             .filter(|trigger| trigger.fits(step.kind))
@@ -2385,7 +2354,7 @@ impl WorkflowScreen {
                     "press to use it"
                 }
             );
-            row = row.child(rework_chip(
+            chips = chips.child(step_chip(
                 selector,
                 trigger.as_str().to_owned(),
                 accessible,
@@ -2395,17 +2364,17 @@ impl WorkflowScreen {
                 }),
             ));
         }
-        row = row.child(
+        chips = chips.child(
             div()
                 .flex_shrink_0()
-                .text_size(px(theme::font_micro()))
+                .text_size(px(theme::font_label()))
                 .text_color(theme::text_muted())
                 .child("max"),
         );
         for budget in [1u32, 2, 3, 5] {
             let selected = edge.budget() == budget;
             let selector = format!("flow-step-edge-{index}-max-{budget}");
-            row = row.child(rework_chip(
+            chips = chips.child(step_chip(
                 selector,
                 budget.to_string(),
                 format!("{budget} rounds"),
@@ -2415,16 +2384,14 @@ impl WorkflowScreen {
                 }),
             ));
         }
-        row = row.child(rework_chip(
-            format!("flow-step-edge-{index}-remove"),
-            "\u{00d7}".to_owned(),
-            format!("Remove the loop back to {}", edge.to),
-            false,
-            cx.listener(move |this, _, window, cx| {
-                this.remove_edge(index, window, cx);
-            }),
-        ));
-        row.into_any_element()
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .w_full()
+            .child(head)
+            .child(chips)
+            .into_any_element()
     }
 
     /// The row that adds an edge: every step that is not already a target.
@@ -2448,7 +2415,7 @@ impl WorkflowScreen {
             let selector = format!("flow-step-edge-add-{id}");
             let value = id.clone();
             let label = id.clone();
-            chips = chips.child(rework_chip(
+            chips = chips.child(step_chip(
                 selector,
                 label,
                 format!("Add a loop back to {id}"),
@@ -2561,7 +2528,7 @@ impl WorkflowScreen {
                     )
                     .child(
                         div()
-                            .text_size(px(theme::font_meta()))
+                            .text_size(px(theme::font_sub()))
                             .text_color(theme::text_dim())
                             .child("appended, never rewritten"),
                     ),
@@ -2593,7 +2560,7 @@ impl WorkflowScreen {
                     .child(
                         div()
                             .flex_shrink_0()
-                            .text_size(px(theme::font_meta()))
+                            .text_size(px(theme::font_row_meta()))
                             .text_color(theme::text_dim())
                             .child(format!(
                                 "{} {} · {}",
@@ -2857,16 +2824,16 @@ fn sibling_index(graph: &Workflow, index: usize, delta: isize) -> Option<usize> 
 /// One of them is always lit, so the state is never implied by the absence of a
 /// chip.
 fn mode_chip(
-    id: &'static str,
-    label: &'static str,
-    aria: &'static str,
+    selector: String,
+    label: String,
+    accessible: String,
     selected: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     div()
-        .id(SharedString::from(id))
-        .debug_selector(move || id.to_owned())
-        .a11y_option(aria, selected)
+        .id(SharedString::from(selector.clone()))
+        .debug_selector(move || selector.clone())
+        .a11y_option(accessible, selected)
         .cursor_pointer()
         .px(px(8.))
         .py(px(3.))
@@ -2877,7 +2844,7 @@ fn mode_chip(
         } else {
             theme::hairline()
         })
-        .text_size(px(theme::font_micro()))
+        .text_size(px(theme::font_control()))
         .font_family(theme::code_font())
         .text_color(if selected {
             theme::text()
@@ -2890,13 +2857,14 @@ fn mode_chip(
         .into_any_element()
 }
 
-/// One rework row's label column: the field's 112-wide label, so the picker
-/// lines up with every other field.
-fn rework_row(id: &'static str, label: &'static str, chips: bool) -> gpui::Stateful<gpui::Div> {
+/// A field row: the form's 112-wide label column and whatever the field
+/// draws. `chips` starts the label at the row's top, because a chip row grows
+/// to a second line and a centred label would drift to its middle.
+fn label_row(id: &'static str, label: &'static str, chips: bool) -> gpui::Stateful<gpui::Div> {
     let mut label_column = div()
         .flex_shrink_0()
         .w(px(theme::scaled(LABEL_WIDTH)))
-        .text_size(px(theme::font_meta()))
+        .text_size(px(theme::font_label()))
         .text_color(theme::text_dim())
         .child(label);
     let mut row = div()
@@ -2918,11 +2886,10 @@ fn rework_row(id: &'static str, label: &'static str, chips: bool) -> gpui::State
     row.child(label_column)
 }
 
-/// One rework chip: a target a step may return the work to, or the clear.
-///
-/// It is the dependency row's chip in the same size and face, and its
-/// accessible name says what a press would do rather than which step it is.
-fn rework_chip(
+/// One chip: a step the selected step may wait for or loop back to, an edge
+/// trigger, a budget. Its accessible name says what a press would do rather
+/// than which step it is.
+fn step_chip(
     selector: String,
     label: String,
     accessible: String,
@@ -2943,7 +2910,7 @@ fn rework_chip(
         } else {
             theme::hairline()
         })
-        .text_size(px(theme::font_micro()))
+        .text_size(px(theme::font_control()))
         .font_family(theme::code_font())
         .text_color(if selected {
             theme::text()
@@ -3213,17 +3180,18 @@ fn empty_state(glyph: &str, title: &str, line: &str) -> AnyElement {
         .child(
             div()
                 .text_align(gpui::TextAlign::Center)
-                .text_size(px(theme::font_meta()))
+                .text_size(px(theme::font_sub()))
                 .text_color(theme::text_muted())
                 .child(line.to_owned()),
         )
         .into_any_element()
 }
 
-/// A value at the meta step in the UI face.
+/// A value at the control step in the UI face, so it reads heavier than the
+/// label beside it.
 fn value_word(text: &str) -> AnyElement {
     div()
-        .text_size(px(theme::font_meta()))
+        .text_size(px(theme::font_control()))
         .text_color(theme::text())
         .child(text.to_owned())
         .into_any_element()
@@ -3246,7 +3214,7 @@ fn mono_or_dash(value: Option<&str>) -> AnyElement {
     }
 }
 
-/// A quiet text action: a link-shaped control at the meta step.
+/// A quiet text action: a link-shaped control at the control step.
 fn action_link(
     id: &'static str,
     label: &'static str,
@@ -3263,7 +3231,7 @@ fn action_link(
         .h(px(theme::scaled(shell::CONTROL_HEIGHT)))
         .px(px(6.))
         .rounded(px(6.))
-        .text_size(px(theme::font_meta()))
+        .text_size(px(theme::font_control()))
         .text_color(theme::accent_ink())
         .hover(|style| style.text_color(theme::text()))
         .on_click(on_click);

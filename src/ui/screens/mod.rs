@@ -190,7 +190,7 @@ pub(crate) fn placeholder(key: &'static str) -> AnyElement {
         .items_center()
         .justify_center()
         .p(px(24.))
-        .text_size(px(theme::font_meta()))
+        .text_size(px(theme::font_sub()))
         .text_color(theme::text_muted())
         .child("Nothing here yet.")
         .into_any_element()

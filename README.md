@@ -34,6 +34,7 @@ and installer are on
 
 ```sh
 cargo run -- --repo <path>     # the desktop app (repeat --repo per repository)
+cargo run -- --version         # the family's support line, no window
 cargo test -p warp-flow-core   # the engine
 cargo test -p warp-flow        # the desktop app's headless probes
 cargo run --bin warp-flow-cli -- run <issue-dir>   # drive a run from a terminal
@@ -44,17 +45,27 @@ needs the usual Wayland/Vulkan development packages.
 
 ## What it does
 
-The app is the process that drives a run, and it wears the suite's one shell: a
-76 rail of sections, the 432 repository list — folded away and back by the title
-bar's toggle or `Ctrl+\` — then the detail. The `Runs` section's detail holds
-the 320 run column — the board read downwards, one lane band per state the issue
-folders fall into — beside the open run. The `Repos` section holds the selected
-repository's workflow graph.
+The app is the process that drives a run, and it wears the suite's one shell:
+a 76 rail of sections, one list — folded away and back by the title bar's
+toggle or `Ctrl+\` — then the detail. Which list it is depends on the section.
+`Runs` lists the runs, the board read downwards: one lane band per state the
+issue folders fall into, the lanes that need a person first, and a scope menu
+that picks whose runs it shows — every repository, or one. `Repos` lists the
+repositories and opens the selected one's workflow graph; it is also where a
+repository is added, starred and forgotten.
 
-The run column's **New run** is the one screen action that creates an issue
+The runs list's **New run** is the one screen action that creates an issue
 folder: a title and the request become `.scratch/<slug>/spec.md` (a title
 already in use gets `-2`, `-3`, …), the next scan lands the run in Triage, and
 the window opens it with **Start run** in reach.
+
+The run's head offers one verb at a time, decided from the record's own state:
+**Start run** for a run with no record, **Resume** for a paused, failed or
+answered one, **Retry gate** or **Retry step** for a blocked one — the word
+follows what the blocked step is — and nothing at all for a finished one. A run
+this window is not driving shows **Resume**, not a spinner. `Ctrl+/` — or the
+title bar's `?` button — opens the keyboard reference, which lists every key
+the window answers to.
 
 The rail is `Runs`, `Repos`, then `Settings` at its foot. Opening a run puts its
 four tabs in the run's head:

@@ -257,8 +257,9 @@ pub struct RunSnapshot {
     pub title: String,
     /// The app's phase for this run.
     pub phase: Phase,
-    /// The engine's last status, when it has reported one.
-    pub status: Option<String>,
+    /// The engine's last status, when it has reported one: the same vocabulary
+    /// the scan reads from `run.md`, so the window compares one enum.
+    pub status: Option<crate::store::RunState>,
     /// When the host started driving, RFC 3339 UTC.
     pub started: String,
     /// When the worker finished, RFC 3339 UTC.
@@ -418,11 +419,11 @@ impl Host {
         };
         match shared {
             Some(shared) if shared.phase().is_driving() => shared.request_abandon(),
-            Some(_) => self.begin(&issue, DriveMode::Resume, Some(Signal::Abandon)),
-            None => Err(format!(
-                "No run here is being driven (`{}`).",
-                issue.display()
-            )),
+            // A worker that is gone is resumed only to record the abandon. A
+            // run this window never drove — a paused record opened after a
+            // restart — takes the same path: the engine writes the status and
+            // runs no step before it reads the signal.
+            _ => self.begin(&issue, DriveMode::Resume, Some(Signal::Abandon)),
         }
     }
 
@@ -775,7 +776,7 @@ impl RunState {
             repo: self.repo.clone(),
             title: self.title.clone(),
             phase: self.phase(),
-            status: lock(&self.status).map(RunStatus::as_str).map(str::to_owned),
+            status: lock(&self.status).map(crate::store::RunState::from),
             started: timestamp(self.started),
             finished: lock(&self.finished).map(timestamp),
             error: lock(&self.error).clone(),

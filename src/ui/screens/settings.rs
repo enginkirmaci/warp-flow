@@ -302,7 +302,7 @@ impl Render for SettingsScreen {
                     )
                     .child(
                         div()
-                            .text_size(px(theme::font_meta()))
+                            .text_size(px(theme::font_sub()))
                             .text_color(theme::text_dim())
                             .child(match self.group {
                                 Some(group) => group.blurb(),

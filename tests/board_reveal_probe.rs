@@ -110,8 +110,8 @@ fn the_board_reveals_the_card_under_the_cursor(cx: &mut TestAppContext) {
     let home = scratch_home("reveal");
     cx.update(gpui_kit::init);
     cx.update(theme::apply_kit_theme);
-    // the run column is a fixed 320 wide, so only its height scrolls; many runs
-    // in two repositories make it taller than the window
+    // the runs list is the list pane, a fixed width, so only its height
+    // scrolls; many runs in two repositories make it taller than the window
     let first = seed_repo(&home, "repo-a", 12);
     let second = seed_repo(&home, "repo-b", 2);
 
@@ -199,14 +199,14 @@ fn the_board_reveals_the_card_under_the_cursor(cx: &mut TestAppContext) {
         .expect("the window is open");
     assert!(inside(card.expect("the first card is painted"), viewport));
 
-    for _ in 0..5 {
-        handle
-            .update(cx, |app, window, cx| {
-                app.press_for_probe("right", window, cx);
-            })
-            .expect("the window is open");
-        settle(cx);
-    }
+    // End walks to the list's last card — across every band — and the list
+    // scrolls it into view
+    handle
+        .update(cx, |app, window, cx| {
+            app.press_for_probe("end", window, cx);
+        })
+        .expect("the window is open");
+    settle(cx);
     let (card, viewport) = handle
         .read_with(cx, |app, _| {
             let card = app
@@ -215,13 +215,13 @@ fn the_board_reveals_the_card_under_the_cursor(cx: &mut TestAppContext) {
             (card, app.board_scroll_for_probe().1)
         })
         .expect("the window is open");
-    let card = card.expect("the far lane's card is painted");
+    let card = card.expect("the last card is painted");
     assert!(
         inside(card, viewport),
-        "the far lane's card {card:?} left the viewport {viewport:?}"
+        "the last card {card:?} left the viewport {viewport:?}"
     );
 
-    // opening the detail pane narrows the board; the open card stays visible
+    // opening a run leaves the list its width; the open card stays visible
     handle
         .update(cx, |app, window, cx| {
             let key = app.cursor_for_probe().cloned().expect("a cursor");

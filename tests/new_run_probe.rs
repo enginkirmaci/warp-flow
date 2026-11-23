@@ -25,8 +25,11 @@ fn hold_home() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn scratch_home() -> PathBuf {
-    let home = std::env::temp_dir().join(format!("warpflow-new-run-probe-{}", std::process::id()));
+fn scratch_home(name: &str) -> PathBuf {
+    let home = std::env::temp_dir().join(format!(
+        "warpflow-new-run-probe-{name}-{}",
+        std::process::id()
+    ));
     let _ = fs::remove_dir_all(&home);
     fs::create_dir_all(&home).expect("scratch home");
     // SAFETY: the probe holds HOME_LOCK for its whole scenario.
@@ -36,8 +39,8 @@ fn scratch_home() -> PathBuf {
 
 /// A throwaway git repository with the workflow file a run needs, and no issue
 /// folder: the form is the only way a run appears.
-fn seed_repo(home: &Path) -> PathBuf {
-    let repo = home.join("repo");
+fn seed_repo(home: &Path, name: &str) -> PathBuf {
+    let repo = home.join(name);
     fs::create_dir_all(&repo).expect("repository folder");
     git(&repo, &["init", "--initial-branch=main", "--quiet"]);
     git(&repo, &["config", "user.email", "probe@example.com"]);
@@ -95,11 +98,11 @@ fn click(cx: &mut VisualTestContext, name: &str) {
 #[gpui_kit::gpui::test]
 fn new_run_writes_the_issue_folder_and_opens_the_run(cx: &mut TestAppContext) {
     let _guard = hold_home();
-    let home = scratch_home();
+    let home = scratch_home("one");
     cx.update(gpui_kit::init);
     cx.update(theme::apply_kit_theme);
 
-    let repo = seed_repo(&home);
+    let repo = seed_repo(&home, "repo");
     let mut page = None;
     let handle = cx.open_window(size(px(1500.), px(960.)), |window, cx| {
         let app = FlowApp::new(
@@ -116,7 +119,7 @@ fn new_run_writes_the_issue_folder_and_opens_the_run(cx: &mut TestAppContext) {
     let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
     settle(cx);
 
-    // the empty board still offers the run column's primary
+    // the empty board still offers the runs list's primary
     assert!(
         cx.debug_bounds("flow-runs-new").is_some(),
         "the board offers New run"
@@ -165,6 +168,65 @@ fn new_run_writes_the_issue_folder_and_opens_the_run(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("flow-run-start").is_some(),
         "a new run offers Start run"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// Over every repository New run is still live: the form offers one chip per
+/// repository, and the picked one decides whose `.scratch/` is written.
+#[gpui_kit::gpui::test]
+fn new_run_picks_its_repository_when_several_are_configured(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("many");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+
+    let first = seed_repo(&home, "repo-a");
+    let second = seed_repo(&home, "repo-b");
+    let handle = cx.open_window(size(px(1500.), px(960.)), |window, cx| {
+        FlowApp::new(
+            Launch {
+                repos: vec![first.clone(), second.clone()],
+            },
+            window,
+            cx,
+        )
+    });
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    click(cx, "flow-runs-new");
+    assert!(
+        cx.debug_bounds("flow-new-run").is_some(),
+        "the form is up over every repository"
+    );
+    assert!(
+        cx.debug_bounds("flow-new-run-repos").is_some(),
+        "the form offers the pick"
+    );
+    assert!(cx.debug_bounds("flow-new-run-repo-repo-a").is_some());
+    assert!(cx.debug_bounds("flow-new-run-repo-repo-b").is_some());
+
+    click(cx, "flow-new-run-repo-repo-b");
+    click(cx, "flow-new-run-title");
+    cx.simulate_input("A run for the second repository");
+    settle(cx);
+    click(cx, "flow-new-run-request");
+    cx.simulate_input("Create it in repo-b.");
+    settle(cx);
+    click(cx, "flow-new-run-create");
+    settle(cx);
+
+    assert!(
+        second
+            .join(".scratch/a-run-for-the-second-repository/spec.md")
+            .is_file(),
+        "the picked repository receives the issue folder"
+    );
+    assert!(
+        !first.join(".scratch").exists(),
+        "the other repository is untouched"
     );
 
     let _ = fs::remove_dir_all(&home);

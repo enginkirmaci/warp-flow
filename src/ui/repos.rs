@@ -1,14 +1,18 @@
-//! The list pane: the repositories, All Repos first, then the Favorites band and
-//! the rest.
+//! The Repos section's list pane: the repositories, All Repos first, then the
+//! Favorites band and the rest.
 //!
-//! A repository row is the design's 64: the star, the name at 15/600 and the age
-//! of its newest run; the second line summarizes its runs as stats in the entity
-//! hues, the two that need a person first, or says there are no runs yet. Hover
-//! gives Open in Station and Forget — the list pane is the one place a
-//! repository's lifecycle lives, so forgetting one starts here. Forget takes two
-//! presses (the first arms the row) and never touches the folder on disk. The
-//! row selects the repository, which is what the run column and the repository
-//! detail read.
+//! A repository row is the design's 64: the star, the name at 15/600, and the
+//! age of its newest run; the second line names the repository's path and how
+//! many gate steps its workflow defines, which is what the section's detail
+//! opens. Hover gives Open in Station and Forget — this list is the one place
+//! a repository is added or forgotten, so forgetting one starts here. Forget
+//! takes two presses (the first arms the row) and never touches the folder on
+//! disk. The row selects the repository, which is what the workflow editor
+//! reads. The Runs section picks a repository from its own scope menu; it has
+//! one list, the runs.
+//!
+//! The pane's frame, its resize bar and its `+` popover are the family's list
+//! pane, shared with the runs list ([`crate::ui::runs`]).
 
 use gpui::prelude::*;
 use gpui::{AnyElement, Context, FontWeight, MouseButton, SharedString, div, px};
@@ -17,14 +21,15 @@ use warpui_kit_core::{A11y as _, controls, icon, shell};
 
 use crate::store::{self, Column};
 use crate::theme;
-use crate::ui::runs::{plural, state_hue, state_icon};
-use crate::ui::window::{FlowApp, Section};
+use crate::ui::plural;
+use crate::ui::runs::{state_hue, state_icon};
+use crate::ui::window::FlowApp;
 
 /// The name a row's group gets, so its children can react to the row's hover.
 const ROW_GROUP: &str = "flow-repo-row";
 
 impl FlowApp {
-    /// The 432 list pane: the head, the summary and the rows.
+    /// The Repos section's list pane: the head, the summary and the rows.
     pub(crate) fn render_list_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let width = shell::clamp_list_width(self.list_width);
         let favorite_paths: Vec<std::path::PathBuf> = self
@@ -34,9 +39,7 @@ impl FlowApp {
             .filter(|repo| self.settings.is_favorite(&repo.path))
             .map(|repo| repo.path.clone())
             .collect();
-        let need = self.snapshot.need_you_count(None);
-        let running = self.snapshot.running_count(None);
-        let runs = self.snapshot.run_count(None);
+        let gates: usize = self.snapshot.repos.iter().map(|repo| repo.gates).sum();
         let repositories = self.snapshot.repos.len();
 
         let mut rows = div()
@@ -97,11 +100,7 @@ impl FlowApp {
                             .text_size(px(theme::font_list_title()))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::text())
-                            .child(if self.section == Section::Repos {
-                                "Repositories"
-                            } else {
-                                "Runs"
-                            }),
+                            .child("Repositories"),
                     )
                     .child(
                         div()
@@ -126,34 +125,13 @@ impl FlowApp {
             .child(
                 div()
                     .debug_selector(|| "flow-list-summary".into())
-                    .flex()
-                    .items_center()
-                    .gap(px(4.))
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_sub()))
                     .text_color(theme::text_muted())
-                    .when(need > 0, |line| {
-                        line.child(
-                            div()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme::CHANGES)
-                                .child(format!("{need} need you")),
-                        )
-                        .child(div().child("·"))
-                    })
-                    .when(running > 0, |line| {
-                        line.child(div().child(format!("{running} running")))
-                            .child(div().child("·"))
-                    })
-                    .child(if self.section == Section::Repos {
-                        let gates: usize = self.snapshot.repos.iter().map(|repo| repo.gates).sum();
-                        format!(
-                            "{repositories} {} · {gates} {}",
-                            plural(repositories, "repository"),
-                            plural(gates, "gate")
-                        )
-                    } else {
-                        format!("{runs} {}", plural(runs, "run"))
-                    }),
+                    .child(format!(
+                        "{} · {}",
+                        plural(repositories, "repository"),
+                        plural(gates, "gate")
+                    )),
             );
 
         shell::list_pane(width)
@@ -161,30 +139,7 @@ impl FlowApp {
             .relative()
             .child(head)
             .child(rows)
-            // the pane's edge: drag it between 320 and 560, and the width is
-            // remembered on release
-            .child(
-                div()
-                    .id("flow-list-resize")
-                    .debug_selector(|| "flow-list-resize".into())
-                    .role(gpui::Role::Splitter)
-                    .aria_label("Resize the list")
-                    .cursor_col_resize()
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .right(px(-3.))
-                    .w(px(6.))
-                    .occlude()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.list_resizing = true;
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    ),
-            )
+            .child(resize_bar(cx))
             .into_any_element()
     }
 
@@ -211,7 +166,7 @@ impl FlowApp {
                 div()
                     .px(px(8.))
                     .py(px(6.))
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_label()))
                     .text_color(theme::text_muted())
                     .child("Add a repository"),
             );
@@ -242,7 +197,7 @@ impl FlowApp {
                     .debug_selector(|| "flow-add-repo-note".into())
                     .px(px(8.))
                     .pb(px(6.))
-                    .text_size(px(theme::font_meta()))
+                    .text_size(px(theme::font_sub()))
                     .text_color(theme::text_muted())
                     .child(note.clone()),
             );
@@ -269,7 +224,7 @@ impl FlowApp {
 
         let mut row = repo_row_frame("flow-repo-all", selected)
             .debug_selector(|| "flow-repo-all".into())
-            .a11y_button(format!("All Repos, {total} {}", plural(total, "run")))
+            .a11y_button(format!("All Repos, {}", plural(total, "run")))
             .group(ROW_GROUP)
             .on_click(cx.listener(|this, _, window, cx| {
                 this.select_repo(None, window, cx);
@@ -305,9 +260,9 @@ impl FlowApp {
                     .child(
                         div()
                             .flex_shrink_0()
-                            .text_size(px(theme::font_meta()))
+                            .text_size(px(theme::font_row_meta()))
                             .text_color(theme::text_muted())
-                            .child(format!("{total} {}", plural(total, "run"))),
+                            .child(plural(total, "run")),
                     ),
             )
             .child(stats_line(summary));
@@ -437,17 +392,13 @@ impl FlowApp {
                         line.child(
                             div()
                                 .flex_shrink_0()
-                                .text_size(px(theme::font_meta()))
+                                .text_size(px(theme::font_row_meta()))
                                 .text_color(theme::text_muted())
                                 .child(age),
                         )
                     }),
             )
-            .child(if self.section == Section::Repos {
-                repo_facts_line(repo)
-            } else {
-                stats_line(repo.summary())
-            });
+            .child(repo_facts_line(repo));
         row = row.child(hover_station(
             &format!("flow-repo-station-{}", repo.name),
             Some(path),
@@ -470,38 +421,49 @@ impl FlowApp {
     }
 }
 
+/// The list pane's edge: drag it between the shell's bounds, and the width is
+/// remembered on release. Both lists carry it — the repositories and the runs
+/// share one remembered width.
+pub(crate) fn resize_bar(cx: &mut Context<FlowApp>) -> AnyElement {
+    div()
+        .id("flow-list-resize")
+        .debug_selector(|| "flow-list-resize".into())
+        .role(gpui::Role::Splitter)
+        .aria_label("Resize the list")
+        .cursor_col_resize()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .right(px(-3.))
+        .w(px(6.))
+        .occlude()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                this.list_resizing = true;
+                cx.stop_propagation();
+                cx.notify();
+            }),
+        )
+        .into_any_element()
+}
+
 /// A repository row's frame: the design's 64, the selection wash and the accent
 /// edge down its left side.
 fn repo_row_frame(id: impl Into<gpui::ElementId>, selected: bool) -> gpui::Stateful<gpui::Div> {
-    let mut row = div()
-        .id(id)
-        .relative()
-        .cursor_pointer()
+    // The family's list row owns the pointer, the hover wash and the selected
+    // mark; this adds the repository row's height and its second line.
+    shell::list_row(id, selected)
         .w_full()
         .h(px(theme::scaled(theme::ROW_HEIGHT)))
         .flex()
         .flex_col()
         .justify_center()
         .gap(px(3.))
-        .pl(px(13.))
         .pr(px(16.))
         .py(px(10.))
         .border_b_1()
-        .border_color(theme::hairline());
-    if selected {
-        row = row.bg(theme::raised()).child(
-            div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left_0()
-                .w(px(theme::ROW_MARK))
-                .bg(theme::accent()),
-        );
-    } else {
-        row = row.hover(|style| style.bg(theme::panel()));
-    }
-    row
+        .border_color(theme::hairline())
 }
 
 /// The Repos section's second line: the repository's own path and how many gate
@@ -519,7 +481,7 @@ fn repo_facts_line(repo: &store::RepoView) -> AnyElement {
         .gap(px(8.))
         .pl(px(28.))
         .min_w_0()
-        .text_size(px(theme::font_meta()))
+        .text_size(px(theme::font_row_meta()))
         .text_color(theme::text_muted())
         .child(
             div()
@@ -550,7 +512,7 @@ fn stats_line(counts: Vec<(Column, usize)>) -> AnyElement {
         .items_center()
         .gap(px(10.))
         .pl(px(28.))
-        .text_size(px(theme::font_meta()))
+        .text_size(px(theme::font_row_meta()))
         .text_color(theme::text_muted());
     if counts.is_empty() {
         return line.child("No runs yet").into_any_element();
@@ -593,7 +555,7 @@ fn band(label: &str, count: usize) -> AnyElement {
         .h(px(34.))
         .px(px(16.))
         .bg(theme::surface())
-        .text_size(px(theme::font_meta()))
+        .text_size(px(theme::font_label()))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(theme::text_dim())
         .child(icon(
@@ -706,7 +668,7 @@ fn forget_affordance(
         .gap(px(4.))
         .rounded(px(6.))
         .cursor_pointer()
-        .text_size(px(theme::font_meta()))
+        .text_size(px(theme::font_control()))
         .font_weight(FontWeight::MEDIUM)
         .text_color(hue)
         .opacity(if selected || armed { 1. } else { 0. })

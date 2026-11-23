@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use gpui::prelude::*;
 use gpui::{
-    Entity, IntoElement, Modifiers, Point, Render, TestAppContext, VisualTestContext, Window, div,
-    px, size,
+    Entity, IntoElement, Modifiers, Point, Render, ScrollDelta, ScrollEvent, ScrollSource,
+    TestAppContext, TouchPhase, VisualTestContext, Window, div, point, px, size,
 };
 use warp_flow::host::Host;
 use warp_flow::store;
@@ -183,6 +183,7 @@ fn selector(name: &str) -> &'static str {
 }
 
 fn click(cx: &mut VisualTestContext, name: &str) {
+    reveal(cx, name);
     let bounds = cx
         .debug_bounds(selector(name))
         .unwrap_or_else(|| panic!("{name} is missing from the frame"));
@@ -192,6 +193,40 @@ fn click(cx: &mut VisualTestContext, name: &str) {
     };
     cx.simulate_click(center, Modifiers::default());
     settle(cx);
+}
+
+/// Wheel the inspector's form until `name` is wholly inside the window.
+///
+/// The form is taller than a 860-px window at the default text size, and the
+/// edge rows sit near its bottom, so a press on them scrolls the way a
+/// person's would — the probe follows the row instead of pretending the whole
+/// form fits.
+fn reveal(cx: &mut VisualTestContext, name: &str) {
+    let inspector = cx
+        .debug_bounds("flow-workflow-inspector")
+        .expect("the inspector is drawn");
+    for _ in 0..10 {
+        let bounds = cx
+            .debug_bounds(selector(name))
+            .unwrap_or_else(|| panic!("{name} is missing from the frame"));
+        let window = cx.update(|window, _| window.bounds());
+        if bounds.origin.y + bounds.size.height <= window.origin.y + window.size.height {
+            return;
+        }
+        let at = Point {
+            x: inspector.origin.x + inspector.size.width / 2.,
+            y: inspector.origin.y + inspector.size.height / 2.,
+        };
+        cx.simulate_event(ScrollEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(point(px(0.), px(-160.))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+            source: ScrollSource::Pointer,
+        });
+        settle(cx);
+    }
+    panic!("{name} never scrolled into view");
 }
 
 /// Click into a field and type `value` into it.

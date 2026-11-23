@@ -239,6 +239,8 @@ fn forgetting_a_repository_takes_a_second_click(cx: &mut TestAppContext) {
     let handle = open_app(cx, vec![first, second]);
     let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
     settle(cx);
+    // the repositories are the Repos section's list: Runs has the runs
+    click(cx, "flow-rail-repos");
 
     // both rows sit in the configured order, and neither is armed
     assert!(cx.debug_bounds("flow-repo-repo-a").is_some());
@@ -319,6 +321,7 @@ fn a_press_anywhere_else_disarms_a_forget(cx: &mut TestAppContext) {
     let handle = open_app(cx, vec![first, second]);
     let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
     settle(cx);
+    click(cx, "flow-rail-repos");
 
     click(cx, "flow-list-forget-0");
     assert!(

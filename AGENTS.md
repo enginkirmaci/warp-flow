@@ -1,9 +1,9 @@
 # warp-flow — agent instructions
 
 The suite's conventions apply: read
-[`../../AGENTS.md`](../../AGENTS.md) first — the checkout is a sibling of
-`warp-suite` and `apps/warp-flow` is the link to it, so the same path works
-either way. This file adds only the app-specific facts.
+[`../warp-suite/AGENTS.md`](../warp-suite/AGENTS.md) first — the checkout is a
+sibling of `warp-suite` and `apps/warp-flow` is the link to it, so the same path
+works either way. This file adds only the app-specific facts.
 
 Design plans live in `docs/plans/`: a plan is deleted when its work lands, and the
 rules that still matter move into `README.md` or this file.
@@ -29,8 +29,15 @@ rules that still matter move into `README.md` or this file.
   document that quotes an artifact's shape is part of that shape's contract:
   `analyze`'s task example is parsed by `artifact`'s tests, so a template that
   teaches a word the parser refuses fails the suite instead of a run.
-- `src/main.rs` — the thin launcher for the desktop app; `src/lib.rs` is the
-  probe boundary, and `src/store.rs` is the filesystem scan behind the board.
+- `src/main.rs` — the thin launcher for the desktop app, and the place
+  `--version`/`-V` is answered before logging or a window: the family's About
+  list fills itself by spawning every installed member with `--version` and
+  killing it at a two-second deadline, so a launcher that boots the window
+  instead flashes it in a sibling. `src/lib.rs` is the probe boundary, and
+  `src/store.rs` is the filesystem scan behind the board, plus `RunState`: the
+  one typed vocabulary for a run's state. It reads `run.md`, then `spec.md`,
+  then Triage — never a third copy of the strings — and a `RunState` is what
+  the lanes, the pills and the action plan speak.
 - `src/host.rs` — the engine host: one blocking `Runner` per issue folder on a
   worker thread, one run per repository, the control value the engine reads at
   a step boundary, the log ring, and the snapshot the window and the door read.
@@ -42,22 +49,47 @@ rules that still matter move into `README.md` or this file.
   keep its argument tests.
 - `src/ui/` — the family's one shell: `chrome.rs` (the 46 title bar — whose
   list toggle is also `Ctrl+\` — and the 76 rail), `repos.rs` (the 432
-  repository list: the board's filter on Runs, the repository picker on Repos),
-  `runs.rs` (the 320 run column, the board read downwards: lane bands, run
-  rows, the keyboard cursor and its reveal) and `detail.rs` (the run's head and
+  repository list, which is the Repos section's own: the picker the workflow
+  editor reads and the one place a repository is added or forgotten, plus the
+  resize bar both lists share), `runs.rs` (the runs list, the Runs section's
+  one list: the board read downwards — a scope menu picks whose runs, lane
+  bands in `Column::BOARD` order, run rows, the keyboard cursor and its
+  reveal) and `detail.rs` (the run's head and
   its four tabs — Run, Task & diff, Artifacts, Workflow — and the repository
   detail's head over its one screen). `window.rs` holds the state, the scan and
   host adoption, selection and the render composition; `run.rs` is the Run
   tab's body (the workflow matrix — steps down, tasks across, one cell per
   crossing — the task chips, the question card, attempt history, sessions and
-  the engine log); `about.rs` is the family's About page
+  the engine log). The matrix takes the live body width: its step label keeps a
+  320-px column, the task columns share the rest down to one cell, and past
+  that the card scrolls sideways rather than clipping the last task; a label
+  that truncates carries its full sentence as a tooltip. `about.rs` is the
+  family's About page
   (the installed family, this build and the license). The shell is
   `warpui_kit_core::shell`: rail 76, list 432 (320–560), detail padding 24,
-  reading 760, control 34, field 36, tab 42. Keep the state grouping: a lane
+  reading 760, control 34, field 36, tab 42. Each section has one list and
+  never a second column: Runs picks a repository from its scope menu, because
+  at the default 1500 px window a second list left the detail 672 px and four
+  screens overflowed. Keep the state grouping: a lane
   band per non-empty `store::Column`, Waiting on you in `CHANGES`, Blocked in
-  `DANGER`, the rest quiet. `new_run.rs` is the column's one filled primary: it
+  `DANGER`, the rest quiet. `new_run.rs` is the runs list's one filled primary: it
   asks for a title and a request, writes `.scratch/<slug>/spec.md`, and hands
   the window the run key to open once the next scan holds it.
+- `src/ui/actions.rs` — **the one answer to "what may this run be asked to do
+  now"**: `plan(run, phase)` returns the one filled verb (`Start`, `Resume`,
+  `Retry`), its reason when it has none, and whether Pause or Abandon apply.
+  The head row, the ⋯ menu and the blocked card all draw that plan and never
+  test a state themselves — the three used to disagree, so a finished run
+  parked a disabled **Start** and a blocked harness step offered **Retry
+  gate**. No gpui imports: its tests are plain unit tests.
+- `src/ui/shortcuts.rs` — the keyboard-reference sheet (`Ctrl+/` or the title
+  bar's `?` button), built from
+  `warpui_kit_core::shortcuts::dialog` over the same key map the handlers use.
+  The window owns the sheet state (`shortcuts_open`) and takes the focus while
+  it is up, the way it owns the ⋯ menu's state and the text menu's anchor;
+  neither is `thread_local!` — one process is one window's worth of state.
+  The panes move through `pane_nav`: `Left`/`Right`/`Tab` walk list ↔ detail
+  from the keyboard, and every pane that wants a stop registers itself.
 - `src/ui/screens/` — the run's four screens, one entity each: `artifacts.rs`,
   `diff.rs`, `workflow.rs`, `settings.rs`. `mod.rs` owns the `Screen`
   vocabulary, the `ScreenRun` a screen is handed, and the two rules they all
@@ -81,10 +113,18 @@ rules that still matter move into `README.md` or this file.
 - `app.toml`, `version.toml`, `rust-toolchain.toml`, `scripts/version.py` and
   `.githooks/pre-commit` follow the family's rules; do not hand-edit a version.
 
-The quit path lives on the `App` in `src/app.rs`, not on the window: gpui drops
-a window's view entity when the last window closes, before app shutdown, so an
-entity-level `on_app_quit` never runs (verified live). That hook is what
-withdraws the door and asks a blocking engine to stop.
+The quit path is `app::Quit` in `src/app.rs`: the door closes, the host stops
+and the endpoint is withdrawn, once however many times it is asked. Two things
+run it. The window's view holds it as a `QuitOnDrop` guard, because gpui
+releases the view when the last window closes, before it asks anyone to quit;
+`on_app_quit` stays as the second net. That handler alone is not enough: gpui
+runs those from `App::shutdown`, which the Linux platform calls once after the
+event loop returns and skips when the `App` is borrowed at that moment.
+`tests/quit_probe.rs` closes a window with no quit handler involved. Neither
+runs for a process killed by a signal (Ctrl-C on `cargo run`): the endpoint
+files then stay until the next launch replaces them. Nothing else outlives the
+process: the kit ties its `gsettings monitor` to the app's lifetime
+(`PR_SET_PDEATHSIG` on Linux), so a signal leaves no monitor behind.
 
 ## Invariants
 

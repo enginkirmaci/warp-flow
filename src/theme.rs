@@ -55,11 +55,8 @@ pub const TITLEBAR_H: f32 = warpui_kit_core::shell::TITLE_BAR_HEIGHT;
 /// The list pane's width when nothing has been dragged: 432, the design's.
 pub const LIST_WIDTH: f32 = warpui_kit_core::shell::LIST_WIDTH;
 
-/// A repository row in the list, and a run row in the run column.
+/// A repository row in the list, and a run row in the runs list.
 pub const ROW_HEIGHT: f32 = 64.;
-
-/// The run column's width: the detail's work list, the board read downwards.
-pub const RUN_COLUMN_WIDTH: f32 = 320.;
 
 /// One lane band over the runs that share a state.
 pub const LANE_HEIGHT: f32 = 32.;
