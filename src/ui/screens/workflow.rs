@@ -3179,7 +3179,7 @@ fn new_step(id: &str, kind: StepKind, depends_on: &[&str]) -> Step {
 /// steps their project has instead of deleting the ones it does not. The shape
 /// is this repository's own `.flow/workflow.toml` — analyze the request, split
 /// it, let a person approve the plan, then per-task code, review and the three
-/// gates, then the version bump, the merge and the closing report — with this
+/// gates, then the bump gate, the merge and the closing report — with this
 /// repository's own gate commands. A harness step whose skill this build does
 /// not ship is left out, because preparation refuses a graph naming one.
 fn new_graph() -> Workflow {
@@ -3191,12 +3191,12 @@ fn new_graph() -> Workflow {
         step.per_task = per_task;
         step
     };
-    let gate = |id: &str, command: &str, timeout_secs: u64, on: &[&str]| {
+    let gate = |id: &str, command: &str, timeout_secs: u64, per_task: bool, on: &[&str]| {
         let mut step = new_step(id, StepKind::Gate, on);
         step.command = Some(command.to_owned());
         step.cwd = Some(".".to_owned());
         step.timeout_secs = Some(timeout_secs);
-        step.per_task = true;
+        step.per_task = per_task;
         step
     };
     // The file is the pipeline (ADR-0018): a step that names nothing waits for
@@ -3211,20 +3211,22 @@ fn new_graph() -> Workflow {
         // The three checks are this repository's own CI, cheapest first, so a
         // task fails on fmt before it spends half an hour in the test suite.
         // `fmt` and `clippy` leave `review` together; `test` follows `clippy`.
-        gate("fmt", "cargo fmt --all --check", 300, &["review"]),
+        gate("fmt", "cargo fmt --all --check", 300, true, &["review"]),
         gate(
             "clippy",
             "cargo clippy --locked --all-targets -- -D warnings",
             1800,
+            true,
             &["review"],
         ),
-        gate("test", "cargo test --locked", 1800, &["clippy"]),
+        gate("test", "cargo test --locked", 1800, true, &["clippy"]),
     ];
-    // The version moves once, before the queue lands anything; merge is the
-    // barrier after it and summary is the run's closing report.
-    if ships("bump") {
-        steps.push(harness("bump", "bump", None, false, &[]));
-    }
+    // The version moves once, before the queue lands anything, and a script
+    // does the mechanical work: the bump is a gate, not a session. It is not
+    // per task, because two task branches that each bumped the same file would
+    // conflict on the second merge. Merge is the barrier after it and summary
+    // is the run's closing report.
+    steps.push(gate("bump", "python3 scripts/bump.py", 300, false, &[]));
     let mut merge = new_step("merge", StepKind::Merge, &[]);
     merge.per_task = true;
     merge.mode = Some("local".to_owned());
