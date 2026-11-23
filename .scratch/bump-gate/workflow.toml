@@ -1,0 +1,123 @@
+schema = 2
+name = "implement"
+revision = 1
+max_parallel = 2
+
+[[step]]
+id = "analyze"
+kind = "harness"
+enabled = true
+skill = "analyze"
+harness = "dsh"
+model = "opencode-go/deepseek-v4.1-flash"
+effort = "max"
+produces = "spec.md"
+per_task = false
+push = false
+
+[[step]]
+id = "split"
+kind = "harness"
+enabled = true
+skill = "split"
+harness = "dsh"
+model = "opencode-go/deepseek-v4.1-flash"
+effort = "high"
+per_task = false
+push = false
+
+[[step]]
+id = "approve-plan"
+kind = "question"
+enabled = true
+per_task = false
+push = false
+
+[[step]]
+id = "code"
+kind = "harness"
+enabled = true
+skill = "code"
+harness = "dsh"
+model = "opencode-go/deepseek-v4.1-flash"
+effort = "max"
+per_task = true
+push = false
+
+[[step]]
+id = "review"
+kind = "harness"
+enabled = true
+skill = "review"
+harness = "dsh"
+model = "opencode-go/deepseek-v4.1-flash"
+effort = "high"
+produces = "review.md"
+rework_to = "code"
+rework_max = 3
+per_task = true
+push = false
+
+[[step]]
+id = "fmt"
+kind = "gate"
+enabled = true
+command = "cargo fmt --all --check && cargo fmt --all --manifest-path crates/warp-flow-core/Cargo.toml --check"
+cwd = "."
+timeout_secs = 300
+depends_on = ["review"]
+per_task = true
+push = false
+
+[[step]]
+id = "clippy"
+kind = "gate"
+enabled = true
+command = "cargo clippy --locked --all-targets -- -D warnings && cargo clippy --locked --all-targets -p warp-flow-core -- -D warnings"
+cwd = "."
+timeout_secs = 1800
+depends_on = ["review"]
+per_task = true
+push = false
+
+[[step]]
+id = "test"
+kind = "gate"
+enabled = true
+command = "cargo test --locked && cargo test --locked -p warp-flow-core"
+cwd = "."
+timeout_secs = 1800
+depends_on = ["clippy"]
+per_task = true
+push = false
+
+[[step]]
+id = "bump"
+kind = "harness"
+enabled = true
+skill = "bump"
+harness = "dsh"
+model = "opencode-go/deepseek-v4.1-flash"
+effort = "low"
+per_task = false
+push = false
+
+[[step]]
+id = "merge"
+kind = "merge"
+enabled = true
+per_task = true
+mode = "local"
+push = false
+
+[[step]]
+id = "summary"
+kind = "harness"
+enabled = true
+skill = "summary"
+harness = "dsh"
+model = "opencode-go/deepseek-v4.1-flash"
+effort = "high"
+produces = "summary.md"
+per_task = false
+push = false
