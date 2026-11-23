@@ -1,6 +1,6 @@
 # 01: Add the bump gate's script and prove it commits once
 
-**Status:** ready-for-agent
+**Status:** resolved
 **Category:** enhancement
 **Blocked by:** None
 
