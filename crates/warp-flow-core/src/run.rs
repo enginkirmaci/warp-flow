@@ -1745,24 +1745,30 @@ impl<H: Harness + Send + 'static> Runner<H> {
         }
     }
 
-    /// The gates the merge queue runs for `step`: every enabled gate step above
-    /// it, in graph order.
+    /// The gates the merge queue runs for `step`: the enabled gate steps above
+    /// it that are marked `per_task`, in graph order.
     ///
-    /// A rebase changes the branch the gates measured, so the merge re-runs
-    /// them on the rebased tree. Which gates those are is the graph's answer
-    /// (ADR-0015): a gate step the merge does not depend on does not gate the
-    /// merge. The whole chain counts, not only the direct dependencies — a
-    /// merge below `test` which sits below `lint` runs both — so this asks the
-    /// graph for its ancestors rather than for [`Workflow::resolve`], which
-    /// stops at an enabled step. Disabled gate steps are transparent, and a
-    /// gate step's own `cwd` is resolved against the worktree the merge
-    /// measures.
+    /// A rebase changes the branch a per-task gate measured, so the merge
+    /// re-runs that gate on the rebased tree. A gate declared for the whole run
+    /// must not run again: a gate may act rather than only check (ADR-0019), and
+    /// an acting gate is not idempotent — a bump that moves a version and
+    /// commits on `main` would repeat the bump inside a task worktree. A check
+    /// that must gate every merge is therefore marked `per_task`.
+    ///
+    /// Which gate steps those are is the graph's answer (ADR-0015): a gate step
+    /// the merge does not depend on does not gate the merge. The whole chain
+    /// counts, not only the direct dependencies — a merge below `test` which
+    /// sits below `lint` runs both — so this asks the graph for its ancestors
+    /// rather than for [`Workflow::resolve`], which stops at an enabled step.
+    /// Disabled gate steps are transparent, and a gate step's own `cwd` is
+    /// resolved against the worktree the merge measures.
     fn merge_gates(&self, step: &Step) -> Result<Vec<Gate>> {
-        let mut gates = Vec::new();
-        for ancestor in self.workflow.gate_ancestors(step) {
-            gates.push(ancestor.gate()?);
-        }
-        Ok(gates)
+        self.workflow
+            .gate_ancestors(step)
+            .into_iter()
+            .filter(|ancestor| ancestor.per_task)
+            .map(Step::gate)
+            .collect()
     }
 
     /// Write `resolved` on a task; the merge step is the only caller.
@@ -4023,6 +4029,7 @@ depends_on = ["ask"]
     fn a_merge_runs_every_gate_above_it() {
         // `merge` depends on `code`, which waits for `test`, which waits for
         // `lint`: the merge re-runs both gates, not only its direct dependency.
+        // Both gates measure the task branch, so both are per task.
         let dir = TempDir::new();
         let root = repository(&dir);
         let issue = issue_in(&root);
@@ -4038,6 +4045,7 @@ kind = "gate"
 command = "true"
 cwd = "."
 timeout_secs = 5
+per_task = true
 
 [[step]]
 id = "test"
@@ -4045,6 +4053,7 @@ kind = "gate"
 command = "true"
 cwd = "."
 timeout_secs = 5
+per_task = true
 depends_on = ["lint"]
 
 [[step]]
@@ -4080,6 +4089,111 @@ depends_on = ["code"]
             gates,
             vec!["lint".to_owned(), "test".to_owned()],
             "the merge runs the whole gate chain in declaration order"
+        );
+    }
+
+    #[test]
+    fn a_merge_does_not_re_run_a_gate_that_is_not_per_task() {
+        // A gate declared for the whole run acts once (ADR-0019): `bump` is not
+        // per task, so the merge must leave it out and re-run only the gates
+        // that measure the task branch, in declaration order.
+        let dir = TempDir::new();
+        let root = repository(&dir);
+        let issue = issue_in(&root);
+        let graph = workflow(
+            r#"
+schema = 2
+name = "implement"
+revision = 1
+
+[[step]]
+id = "bump"
+kind = "gate"
+command = "true"
+cwd = "."
+timeout_secs = 5
+
+[[step]]
+id = "lint"
+kind = "gate"
+command = "true"
+cwd = "."
+timeout_secs = 5
+per_task = true
+
+[[step]]
+id = "test"
+kind = "gate"
+command = "true"
+cwd = "."
+timeout_secs = 5
+per_task = true
+
+[[step]]
+id = "merge"
+kind = "merge"
+per_task = true
+mode = "local"
+"#,
+        );
+        let mut config = RunnerConfig::new(&issue, graph, FakeHarness::new());
+        config.workdir = root.clone();
+        config.repo = Some(Repo::open(&root).expect("repo opens"));
+        let runner = Runner::new(config).expect("runner");
+        let merge = runner
+            .workflow
+            .step("merge")
+            .expect("the graph names a merge step");
+        let gates: Vec<String> = runner
+            .merge_gates(merge)
+            .expect("the gates resolve")
+            .into_iter()
+            .map(|gate| gate.name)
+            .collect();
+        assert_eq!(
+            gates,
+            vec!["lint".to_owned(), "test".to_owned()],
+            "the merge re-runs only the per-task gates, in declaration order"
+        );
+        assert!(
+            !gates.iter().any(|gate| gate == "bump"),
+            "a gate declared for the whole run does not run again per task: {gates:?}"
+        );
+    }
+
+    #[test]
+    fn the_shipped_template_runs_only_its_per_task_gates_at_merge() {
+        // The merge queue measures the repository's own template, where the
+        // checks are per task but the run-wide `bump` is not (ADR-0019). The
+        // assertion holds whether `bump` is a harness step or the non-per-task
+        // gate the template ships it as next.
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.flow/workflow.toml");
+        let graph = Workflow::read(&path).expect("the repository's own template parses");
+        let dir = TempDir::new();
+        let root = repository(&dir);
+        let issue = issue_in(&root);
+        let mut config = RunnerConfig::new(&issue, graph, FakeHarness::new());
+        config.workdir = root.clone();
+        config.repo = Some(Repo::open(&root).expect("repo opens"));
+        let runner = Runner::new(config).expect("runner");
+        let merge = runner
+            .workflow
+            .step("merge")
+            .expect("the shipped template names a merge step");
+        let gates: Vec<String> = runner
+            .merge_gates(merge)
+            .expect("the gates resolve")
+            .into_iter()
+            .map(|gate| gate.name)
+            .collect();
+        assert_eq!(
+            gates,
+            vec!["fmt".to_owned(), "clippy".to_owned(), "test".to_owned()],
+            "the merge re-runs the repository's own checks, in declaration order"
+        );
+        assert!(
+            !gates.iter().any(|gate| gate == "bump"),
+            "the run-wide bump is not re-run per task: {gates:?}"
         );
     }
 
