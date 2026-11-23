@@ -7,10 +7,11 @@
 # the plan, then drive each ready task through code, review and the gates
 # before the merge queue lands it.
 #
-# A step's place is its `depends_on` set, not its position in this file
-# (ADR-0014): a step may name several dependencies, and two steps with no
-# dependency between them may run at the same time, up to `max_parallel`.
-# Steps marked `per_task` run once for every ready task.
+# The file is read downwards (ADR-0018): a step that says nothing about its
+# dependencies waits for every step declared before it, so a pipeline needs no
+# edges at all. Naming steps is how a step breaks out of that order — a branch
+# names the step it leaves from, and `depends_on = []` is a root wherever it is
+# declared. Steps marked `per_task` run once for every ready task.
 #
 # A gate is a step (ADR-0015): it carries its own command, folder and timeout,
 # so there is no second file to keep in step with this one.
@@ -19,38 +20,62 @@
 # its artifact's front matter, and `changes` makes the run walk back up to
 # `code` with `review`'s findings, at most `rework_max` times. When the budget
 # is spent the step fails and the run stops.
+#
+# What a harness step runs on is picked per step (ADR-0017): `harness`, `model`
+# and `effort` are resolved against warp-agent's catalog when the step's turn
+# comes, and a name nothing publishes blocks the step instead of being swapped
+# for another. Every harness step here runs on dsh with
+# `opencode-go/deepseek-v4.1-flash`; the effort is the one thing that differs,
+# because it is the only knob that should: the steps that decide and write get
+# `max`, the ones that read and report get `high`, and the mechanical one gets
+# `low`.
 schema = 2
 name = "implement"
 revision = 1
 max_parallel = 2
 
+# The request is read once, at the start, and the whole plan comes out of this
+# step: the hardest thinking in the run, so the highest effort.
 [[step]]
 id = "analyze"
 kind = "harness"
 skill = "analyze"
 produces = "spec.md"
+harness = "dsh"
+model = "opencode-go/deepseek-v4.1-flash"
+effort = "max"
 
+# Splitting is bookkeeping over a spec that already exists: it reads the spec
+# and writes the task list, so `high` is enough.
 [[step]]
 id = "split"
 kind = "harness"
 skill = "split"
-depends_on = ["analyze"]
+harness = "dsh"
+model = "opencode-go/deepseek-v4.1-flash"
+effort = "high"
 
 [[step]]
 id = "approve-plan"
 kind = "question"
-depends_on = ["split"]
 
+# The code step is the run's long tail: it writes the change, so it gets the
+# highest effort. It is per task, so this is what every task's session runs.
 [[step]]
 id = "code"
 kind = "harness"
 skill = "code"
 per_task = true
-depends_on = ["approve-plan"]
+harness = "dsh"
+model = "opencode-go/deepseek-v4.1-flash"
+effort = "max"
 
 # The review either clears the code or sends it back. Its artifact is per task
 # (`review-01.md`), because every task is reviewed on its own, and its
 # `verdict` front matter is the only thing the engine reads from it.
+#
+# It reads a diff and writes findings — a reading job, not a writing one — so
+# `high` rather than `max`.
 [[step]]
 id = "review"
 kind = "harness"
@@ -59,7 +84,9 @@ per_task = true
 produces = "review.md"
 rework_to = "code"
 rework_max = 3
-depends_on = ["code"]
+harness = "dsh"
+model = "opencode-go/deepseek-v4.1-flash"
+effort = "high"
 
 # The checks fork here and join at `bump`: formatting is one branch, the two
 # build-heavy checks are the other. They measure the same worktree, so they
@@ -98,19 +125,25 @@ timeout_secs = 1800
 per_task = true
 depends_on = ["clippy"]
 
-# The join. `bump` is not per task, so waiting for one per-task step means
-# waiting for every task to have it — which is exactly what a step after the
-# task lanes should do.
+# The join. `bump` names nothing, so it waits for every step declared before it
+# — the whole task lane, every check included. It is not per task, so waiting
+# for a per-task step means waiting for every task to have it: exactly what a
+# step after the task lanes should do.
 #
 # The version moves once, before the queue lands anything: the engine's own
 # commits pass `--no-verify`, so the pre-commit hook that bumps PATCH never runs
 # on them. One bump per run, never one per task — two task branches that each
 # bumped the same file would conflict on the second merge.
+#
+# It edits two files and runs the version script, and the script decides the
+# number: `low` is the right effort for a step with nothing to think about.
 [[step]]
 id = "bump"
 kind = "harness"
 skill = "bump"
-depends_on = ["fmt", "test"]
+harness = "dsh"
+model = "opencode-go/deepseek-v4.1-flash"
+effort = "low"
 
 [[step]]
 id = "merge"
@@ -118,12 +151,14 @@ kind = "merge"
 per_task = true
 mode = "local"
 push = false
-depends_on = ["bump"]
 
 # The run's closing report: what landed, what did not, and what needs a person.
+# It reads the whole run and writes prose, so `high`.
 [[step]]
 id = "summary"
 kind = "harness"
 skill = "summary"
 produces = "summary.md"
-depends_on = ["merge"]
+harness = "dsh"
+model = "opencode-go/deepseek-v4.1-flash"
+effort = "high"

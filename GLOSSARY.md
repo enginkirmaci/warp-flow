@@ -16,7 +16,9 @@ decision it makes is written down before the next step reads it.
 | **issue** | A request distilled into a tracker record under `.scratch/<feature-slug>/` with a `Status:` line; the unit one run works on. |
 | **task** | One numbered ticket under `.scratch/<feature-slug>/issues/`; the unit that gets its own worktree and branch. |
 | **blocker** | A task that must be merged before another may start, carried as the `Blocked by:` line the tracker already writes. |
-| **step** | One node of a workflow graph: analyze, split, code, review, a gate, a question, a bump, a merge, a summary. It names the steps it waits for, so a step is defined by its dependencies and not by where it sits in the file. |
+| **step** | One node of a workflow graph: analyze, split, code, review, a gate, a question, a bump, a merge, a summary. What it waits for is its `depends_on`, and a step that says nothing waits for every step declared before it (ADR-0018). |
+| **root** | A step that waits for nothing: `depends_on = []`. It can start the moment the run does, wherever it is declared, which is how a workflow has two entry points. |
+| **join** | A step that waits for more than one thing — the whole task lane, in the shipped template — so it runs once, after every branch has finished. A step that names nothing is a join when it is declared after the branches. |
 | **gate step** | A step whose kind is `gate`: it carries its own command, folder and timeout, and a run passes it or fails it. It is a step like any other, so it has a place in the graph and can be disabled. |
 | **disabled step** | A step kept in the graph but not run. Its dependents inherit its own dependencies, so the pipeline closes over it instead of breaking. |
 | **wave** | The steps that become ready at the same time: same depth from the graph's roots, no dependency between them. A wave is what the engine may run at once. |

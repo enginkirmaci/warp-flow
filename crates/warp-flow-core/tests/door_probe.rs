@@ -573,7 +573,7 @@ fn step_request(prompt: &str) -> StepRequest {
             command: None,
             cwd: None,
             timeout_secs: None,
-            depends_on: Vec::new(),
+            depends_on: Some(Vec::new()),
             produces: None,
             rework_to: None,
             rework_max: None,

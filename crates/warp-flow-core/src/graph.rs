@@ -60,9 +60,11 @@ pub enum StepKind {
 
 /// One node of a workflow graph.
 ///
-/// A step's place is its `depends_on` set, not its position in the file
-/// (ADR-0014): several dependencies fork and join, and two steps with no
-/// dependency between them may run at the same time.
+/// A step's place is its `depends_on`, and an omitted `depends_on` means "every
+/// step declared before me" (ADR-0018): the file is read downwards the way it is
+/// written, and naming steps is how a step breaks out of that — for a fork, a
+/// branch, or a root declared after others. Several dependencies fork and join,
+/// and two steps that wait for the same thing may run at the same time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
@@ -101,17 +103,29 @@ pub struct Step {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
     /// The steps that must finish before this one starts.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub depends_on: Vec<String>,
+    ///
+    /// Three states, and the difference between the first two is the whole
+    /// point (ADR-0018):
+    ///
+    /// - **omitted** — wait for every step declared before this one. The file
+    ///   reads downwards, so a pipeline needs no edges at all.
+    /// - **`depends_on = []`** — wait for nothing: a root, wherever it is
+    ///   declared. This is how two entry points are expressed.
+    /// - **a list** — wait for exactly those, and for nothing else. A branch
+    ///   names the step it leaves from, so it runs beside its siblings instead
+    ///   of after them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<Vec<String>>,
     /// The artifact the step writes, relative to the issue folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub produces: Option<String>,
     /// The step this one sends the work back to when it asks for changes.
     ///
     /// A rework edge is not a dependency. It never moves a step in the graph
-    /// (ADR-0014) and [`Workflow::check_acyclic`] never walks it, which is what
-    /// lets a workflow describe a bounded loop and stay acyclic. What travels
-    /// back is this step's own `produces`: the target reads it as its findings.
+    /// (ADR-0014, ADR-0018) and [`Workflow::check_acyclic`] never walks it,
+    /// which is what lets a workflow describe a bounded loop and stay acyclic.
+    /// What travels back is this step's own `produces`: the target reads it as
+    /// its findings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rework_to: Option<String>,
     /// How many times `rework_to` may be taken before this step fails.
@@ -137,6 +151,14 @@ fn yes() -> bool {
 }
 
 impl Step {
+    /// The steps this one names, with an omitted set read as empty.
+    ///
+    /// This is what the *file* says. [`Workflow::dependencies`] is what the run
+    /// waits for, which for an omitted set is every step declared before it.
+    pub fn named_dependencies(&self) -> &[String] {
+        self.depends_on.as_deref().unwrap_or_default()
+    }
+
     /// This step as a runnable gate.
     ///
     /// A gate step carries its own command, folder and timeout (ADR-0015), so
@@ -393,13 +415,23 @@ impl Workflow {
                     step.id
                 )));
             }
-            for dependency in &step.depends_on {
+            for dependency in step.named_dependencies() {
                 if !by_id.contains_key(dependency.as_str()) {
                     return Err(Error::Workflow(format!(
                         "step `{}` depends on unknown step `{dependency}`",
                         step.id
                     )));
                 }
+            }
+            if step
+                .named_dependencies()
+                .iter()
+                .any(|dependency| dependency == &step.id)
+            {
+                return Err(Error::Workflow(format!(
+                    "step `{}` depends on itself",
+                    step.id
+                )));
             }
         }
 
@@ -506,6 +538,31 @@ impl Workflow {
         self.steps.iter().filter(|step| step.enabled)
     }
 
+    /// The steps `step` waits for, as the file declares them.
+    ///
+    /// An omitted `depends_on` means every step declared before this one
+    /// (ADR-0018): the default is the file's own order, and naming steps is
+    /// what narrows it. A step the graph does not carry waits for nothing,
+    /// which is what a graph being edited in memory needs.
+    pub fn dependencies(&self, step: &Step) -> Vec<String> {
+        match &step.depends_on {
+            Some(named) => named.clone(),
+            None => {
+                // a step the graph does not carry has nothing above it: the
+                // editor draws a graph mid-edit, and a step being added is not
+                // in it yet
+                if self.step(&step.id).is_none() {
+                    return Vec::new();
+                }
+                self.steps
+                    .iter()
+                    .take_while(|other| other.id != step.id)
+                    .map(|other| other.id.clone())
+                    .collect()
+            }
+        }
+    }
+
     /// The dependencies of `step` with disabled steps resolved away.
     ///
     /// A disabled step never runs, so waiting for it would wait forever. Its
@@ -520,8 +577,8 @@ impl Workflow {
 
     /// Collect `step`'s enabled dependencies into `out`, depth first.
     fn resolve_into(&self, step: &Step, out: &mut Vec<String>, seen: &mut BTreeSet<String>) {
-        for dependency in &step.depends_on {
-            let Some(dependency) = self.step(dependency) else {
+        for dependency in self.dependencies(step) {
+            let Some(dependency) = self.step(&dependency) else {
                 continue;
             };
             if dependency.enabled {
@@ -579,8 +636,8 @@ impl Workflow {
 
     /// Collect every step `step` depends on, transitively, into `reached`.
     fn ancestors_into<'a>(&'a self, step: &Step, reached: &mut BTreeSet<&'a str>) {
-        for dependency in &step.depends_on {
-            let Some(dependency) = self.step(dependency) else {
+        for dependency in self.dependencies(step) {
+            let Some(dependency) = self.step(&dependency) else {
                 continue;
             };
             // A step already reached is also the guard against a cycle.
@@ -659,8 +716,8 @@ impl Workflow {
             return 0;
         }
         let mut level = 0;
-        for dependency in &step.depends_on {
-            if let Some(dependency) = self.step(dependency) {
+        for dependency in self.dependencies(step) {
+            if let Some(dependency) = self.step(&dependency) {
                 level = level.max(self.depth_of(dependency, depth, visiting) + 1);
             }
         }
@@ -679,7 +736,7 @@ impl Workflow {
 
         fn visit(
             id: &str,
-            by_id: &BTreeMap<String, &Step>,
+            edges: &BTreeMap<String, Vec<String>>,
             marks: &mut BTreeMap<String, Mark>,
             stack: &mut Vec<String>,
         ) -> Result<()> {
@@ -690,12 +747,12 @@ impl Workflow {
             }
             marks.insert(id.to_owned(), Mark::Active);
             stack.push(id.to_owned());
-            if let Some(step) = by_id.get(id) {
-                for dependency in &step.depends_on {
+            if let Some(dependencies) = edges.get(id) {
+                for dependency in dependencies {
                     match marks.get(dependency) {
                         Some(Mark::Done) => {}
                         Some(Mark::Active) => return Err(cycle_error(stack, dependency)),
-                        None => visit(dependency, by_id, marks, stack)?,
+                        None => visit(dependency, edges, marks, stack)?,
                     }
                 }
             }
@@ -704,15 +761,25 @@ impl Workflow {
             Ok(())
         }
 
-        let by_id: BTreeMap<String, &Step> = self
+        // The edges the run actually waits on, not only the ones the file names:
+        // an omitted set is "everything declared before", so a step that names a
+        // *later* step can close a loop through that default.
+        let edges: BTreeMap<String, Vec<String>> = self
             .steps
             .iter()
-            .map(|step| (step.id.clone(), step))
+            .map(|step| {
+                let dependencies = self
+                    .dependencies(step)
+                    .iter()
+                    .map(|id| (*id).to_owned())
+                    .collect();
+                (step.id.clone(), dependencies)
+            })
             .collect();
         let mut marks: BTreeMap<String, Mark> = BTreeMap::new();
         let mut stack: Vec<String> = Vec::new();
         for step in &self.steps {
-            visit(&step.id, &by_id, &mut marks, &mut stack)?;
+            visit(&step.id, &edges, &mut marks, &mut stack)?;
         }
         Ok(())
     }
@@ -778,7 +845,7 @@ mod tests {
             command: (kind == StepKind::Gate).then(|| "cargo test".to_owned()),
             cwd: None,
             timeout_secs: None,
-            depends_on: depends_on.iter().map(|dep| (*dep).to_owned()).collect(),
+            depends_on: Some(depends_on.iter().map(|dep| (*dep).to_owned()).collect()),
             produces: None,
             rework_to: None,
             rework_max: None,
@@ -786,6 +853,14 @@ mod tests {
             mode: None,
             push: false,
         }
+    }
+
+    /// A step whose `depends_on` is omitted: it waits for every step declared
+    /// before it.
+    fn linked(id: &str, kind: StepKind) -> Step {
+        let mut step = step(id, kind, &[]);
+        step.depends_on = None;
+        step
     }
 
     fn workflow(steps: Vec<Step>) -> Workflow {
@@ -813,25 +888,29 @@ skill = "analyze"
 produces = "spec.md"
 
 [[step]]
-id = "test"
-kind = "gate"
-command = "cargo test"
-depends_on = ["code"]
-
-[[step]]
 id = "code"
 kind = "harness"
 skill = "code"
 per_task = true
+
+[[step]]
+id = "test"
+kind = "gate"
+command = "cargo test"
 "#,
         );
         workflow.validate().expect("valid");
         assert_eq!(workflow.steps.len(), 3);
-        assert!(workflow.steps[2].per_task);
+        assert!(workflow.steps[1].per_task);
         assert!(!workflow.steps[0].per_task);
         assert_eq!(workflow.steps[0].produces.as_deref(), Some("spec.md"));
-        assert_eq!(workflow.steps[1].command.as_deref(), Some("cargo test"));
+        assert_eq!(workflow.steps[2].command.as_deref(), Some("cargo test"));
         assert_eq!(workflow.max_parallel, DEFAULT_MAX_PARALLEL);
+        // a step that names nothing waits for the ones before it
+        assert_eq!(
+            workflow.dependencies(&workflow.steps[2]),
+            vec!["analyze".to_owned(), "code".to_owned()]
+        );
     }
 
     #[test]
@@ -1481,5 +1560,128 @@ depends-on = ["b"]
         graph.steps[2].rework_max = None;
         graph.validate().expect("a missing budget is allowed");
         assert_eq!(Workflow::rework_budget(&graph.steps[2]), 1);
+    }
+
+    #[test]
+    fn a_step_that_names_nothing_waits_for_the_steps_declared_before_it() {
+        let graph = workflow(vec![
+            linked("one", StepKind::Harness),
+            linked("two", StepKind::Harness),
+            linked("three", StepKind::Harness),
+        ]);
+        graph.validate().expect("a pipeline needs no edges");
+        assert!(graph.dependencies(&graph.steps[0]).is_empty());
+        assert_eq!(graph.dependencies(&graph.steps[1]), vec!["one".to_owned()]);
+        assert_eq!(
+            graph.dependencies(&graph.steps[2]),
+            vec!["one".to_owned(), "two".to_owned()]
+        );
+        // the last step waits for both, transitively as well
+        assert_eq!(graph.resolve(&graph.steps[2]), vec!["one", "two"]);
+    }
+
+    #[test]
+    fn a_late_step_that_names_nothing_is_not_in_the_first_wave() {
+        // `third` says nothing, so it waits for the two steps declared before
+        // it; `aside` says `depends_on = []`, so it starts with the run.
+        let graph = workflow(vec![
+            linked("first", StepKind::Harness),
+            step("aside", StepKind::Harness, &[]),
+            linked("third", StepKind::Harness),
+        ]);
+        graph.validate().expect("valid");
+        assert_eq!(ids(&graph.ready(&BTreeSet::new())), vec!["first", "aside"]);
+        assert_eq!(
+            ids(&graph.ready(&BTreeSet::from(["first".to_owned()]))),
+            vec!["aside"],
+            "`third` also waits for `aside`"
+        );
+        assert_eq!(
+            ids(&graph.ready(&BTreeSet::from(["first".to_owned(), "aside".to_owned()]))),
+            vec!["third"]
+        );
+        let waves: Vec<Vec<String>> = graph.waves().iter().map(|wave| ids(wave)).collect();
+        assert_eq!(
+            waves,
+            vec![
+                vec!["first".to_owned(), "aside".to_owned()],
+                vec!["third".to_owned()]
+            ]
+        );
+    }
+
+    #[test]
+    fn a_step_that_names_steps_waits_for_exactly_those() {
+        let graph = workflow(vec![
+            linked("one", StepKind::Harness),
+            linked("two", StepKind::Harness),
+            // the branch leaves `one` and does not wait for `two`, which is
+            // declared before it
+            step("branch", StepKind::Harness, &["one"]),
+        ]);
+        graph.validate().expect("a branch is not a cycle");
+        assert_eq!(
+            graph.dependencies(&graph.steps[2]),
+            vec!["one".to_owned()],
+            "naming a step narrows the default"
+        );
+    }
+
+    #[test]
+    fn an_empty_set_is_a_root_wherever_it_is_declared() {
+        let graph = workflow(vec![
+            linked("one", StepKind::Harness),
+            linked("two", StepKind::Harness),
+            step("aside", StepKind::Harness, &[]),
+        ]);
+        graph.validate().expect("two entry points are allowed");
+        assert!(
+            graph.dependencies(&graph.steps[2]).is_empty(),
+            "`depends_on = []` means nothing, not everything before"
+        );
+        assert!(graph.resolve(&graph.steps[2]).is_empty());
+    }
+
+    #[test]
+    fn a_forward_dependency_through_the_default_is_a_cycle() {
+        // `first` names a step declared after it, and that step names nothing —
+        // so it waits for `first`, which waits for it.
+        let graph = workflow(vec![
+            step("first", StepKind::Harness, &["second"]),
+            linked("second", StepKind::Harness),
+        ]);
+        let error = graph.validate().expect_err("the default closes a loop");
+        assert!(error.to_string().contains("cycle"), "{error}");
+    }
+
+    #[test]
+    fn a_disabled_step_passes_its_own_dependencies_on() {
+        let mut graph = workflow(vec![
+            linked("one", StepKind::Harness),
+            linked("off", StepKind::Harness),
+            linked("three", StepKind::Harness),
+        ]);
+        graph.steps[1].enabled = false;
+        graph.validate().expect("a disabled step is not a cycle");
+        assert_eq!(
+            graph.resolve(&graph.steps[2]),
+            vec!["one"],
+            "`three` inherits what the disabled step waited for"
+        );
+    }
+
+    #[test]
+    fn a_rework_edge_may_point_at_any_step_declared_before_it() {
+        // with an omitted set every earlier step is upstream, so a loop from the
+        // last step back to the first is legal without naming it
+        let mut graph = workflow(vec![
+            linked("analyze", StepKind::Harness),
+            linked("code", StepKind::Harness),
+            linked("review", StepKind::Harness),
+        ]);
+        graph.steps[0].produces = Some("spec.md".to_owned());
+        graph.steps[2].produces = Some("review.md".to_owned());
+        graph.steps[2].rework_to = Some("analyze".to_owned());
+        graph.validate().expect("an earlier step is upstream");
     }
 }

@@ -1,6 +1,13 @@
 # A step's place is its dependencies
 
-_Status: accepted. 2026-11-23._
+_Status: superseded by [ADR-0018](0018-the-file-is-read-downwards.md) on
+2026-11-23, in one respect: the file's order is no longer only a tie-break. A
+step that names nothing now waits for every step declared before it, so the
+order a person reads is the order a run walks. Everything else here stands —
+`depends_on` is still the only thing that says where a step sits, a step may
+still name several, and siblings still run at the same time._
+
+_Originally accepted 2026-11-23._
 
 A workflow is a directed acyclic graph, and `depends_on` is the only thing that
 says where a step sits. A step may name several dependencies, so branches fork

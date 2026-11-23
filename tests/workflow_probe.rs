@@ -106,10 +106,13 @@ id = "first"
 kind = "harness"
 skill = "analyze"
 
+# a second root: `depends_on = []` is what says "wait for nothing" when the
+# default is "wait for everything above" (ADR-0018)
 [[step]]
 id = "second"
 kind = "harness"
 skill = "analyze"
+depends_on = []
 
 [[step]]
 id = "left"
@@ -470,8 +473,8 @@ fn the_editor_loads_saves_a_new_revision_and_refuses_a_cycle(cx: &mut TestAppCon
 
     // a cycle is refused by the validator and nothing is written
     let mut cycle = on_disk.clone();
-    cycle.steps[0].depends_on = vec![cycle.steps[2].id.clone()];
-    cycle.steps[2].depends_on = vec![cycle.steps[0].id.clone()];
+    cycle.steps[0].depends_on = Some(vec![cycle.steps[2].id.clone()]);
+    cycle.steps[2].depends_on = Some(vec![cycle.steps[0].id.clone()]);
     handle
         .update(cx, |host, _window, cx| {
             host.0
@@ -647,9 +650,10 @@ fn the_editor_adds_at_both_ends_and_disables_a_step(cx: &mut TestAppContext) {
         .expect("the window is open")
         .expect("a graph");
     assert_eq!(graph.steps[0].id, "step-4", "the new step is first");
-    assert!(
-        graph.steps[0].depends_on.is_empty(),
-        "a step at the front waits for nothing"
+    assert_eq!(
+        graph.steps[0].depends_on,
+        Some(Vec::new()),
+        "a step at the front waits for nothing, and says so"
     );
 
     // a step at the end waits for the current leaves
@@ -666,9 +670,8 @@ fn the_editor_adds_at_both_ends_and_disables_a_step(cx: &mut TestAppContext) {
     let last = graph.steps.last().expect("a last step");
     assert_eq!(last.id, "step-5");
     assert_eq!(
-        last.depends_on,
-        vec!["step-4".to_owned(), "check".to_owned()],
-        "the end joins every current leaf, and the step at the front is one"
+        last.depends_on, None,
+        "a step at the end names nothing, so it waits for every step above it"
     );
 
     // disabling a step keeps it in the graph and marks it off
@@ -744,7 +747,9 @@ fn dependencies_are_chips_picked_from_the_graph(cx: &mut TestAppContext) {
         .expect("the window is open")
         .expect("a graph");
     assert!(
-        graph.steps[0].depends_on.contains(&"check".to_owned()),
+        graph.steps[0]
+            .named_dependencies()
+            .contains(&"check".to_owned()),
         "pressing a chip adds the dependency: {:?}",
         graph.steps[0].depends_on
     );
@@ -756,7 +761,9 @@ fn dependencies_are_chips_picked_from_the_graph(cx: &mut TestAppContext) {
         .expect("the window is open")
         .expect("a graph");
     assert!(
-        !graph.steps[0].depends_on.contains(&"check".to_owned()),
+        !graph.steps[0]
+            .named_dependencies()
+            .contains(&"check".to_owned()),
         "pressing it again removes it: {:?}",
         graph.steps[0].depends_on
     );
@@ -1390,15 +1397,42 @@ fn the_default_document_has_every_step_disabled(cx: &mut TestAppContext) {
         "eleven rows"
     );
     assert!(cx.debug_bounds("flow-workflow-step-11").is_none());
-    // the shipped document is one chain — every step waits for the one before
-    // it — so the whole list is drawn flat. This is the bug the level rule
-    // fixes: the old depth rule staircased it one level per step.
-    let flat = indent_of(cx, 0);
-    for index in 1..graph.steps.len() {
-        let indent = indent_of(cx, index);
+    // The shipped document is a pipeline with one fork: `fmt` and `clippy`
+    // leave `review` together, `test` follows `clippy`, and `bump` joins them.
+    // So the trunk is flat, the two branches sit one level in, and the join
+    // comes back out — the level rule, on the document a new repository gets.
+    let trunk = indent_of(cx, 0);
+    let index = |id: &str| {
+        graph
+            .steps
+            .iter()
+            .position(|step| step.id == id)
+            .expect("the step is in the document")
+    };
+    for id in ["analyze", "split", "approve-plan", "code", "review"] {
+        let indent = indent_of(cx, index(id));
         assert!(
-            (indent - flat).abs() < 0.5,
-            "step {index} is a link in the shipped chain, not a branch: {flat} vs {indent}"
+            (indent - trunk).abs() < 0.5,
+            "`{id}` is on the trunk: {trunk} vs {indent}"
+        );
+    }
+    let branch = indent_of(cx, index("fmt"));
+    assert!(
+        branch > trunk + 8. && branch < trunk + 48.,
+        "`fmt` starts a branch, so it sits one level in: {trunk} vs {branch}"
+    );
+    for id in ["fmt", "clippy", "test"] {
+        let indent = indent_of(cx, index(id));
+        assert!(
+            (indent - branch).abs() < 1.5,
+            "`{id}` is inside the branch: {branch} vs {indent}"
+        );
+    }
+    for id in ["bump", "merge", "summary"] {
+        let indent = indent_of(cx, index(id));
+        assert!(
+            (indent - trunk).abs() < 0.5,
+            "`{id}` is after the join, so it comes back out: {trunk} vs {indent}"
         );
     }
 
@@ -1772,21 +1806,46 @@ fn a_step_with_no_dependency_says_it_starts_with_the_run(cx: &mut TestAppContext
     settle(cx);
     select(&handle, cx, 0);
 
-    // `analyze` waits for nothing, so it is a root: the row says so rather than
-    // leaving an empty set to be read as "in the place it is drawn"
-    assert!(cx.debug_bounds("flow-step-depends-note").is_some());
+    // the first step names nothing, so it waits for every step above it — and
+    // there are none, which is the same as being a root. The row says which of
+    // the three states it is in, and the meta line agrees.
+    assert!(
+        meta_of(&handle, cx, 0).contains("after all above"),
+        "the row meta says what an omitted set means: {}",
+        meta_of(&handle, cx, 0)
+    );
+    assert!(cx.debug_bounds("flow-step-depends-all").is_some());
+    assert!(cx.debug_bounds("flow-step-depends-none").is_some());
+
+    // "Nothing" is the state that says it starts with the run, whatever the
+    // file's order is
+    click(cx, "flow-step-depends-none");
+    assert_eq!(
+        graph_of(&handle, cx).steps[0].depends_on,
+        Some(Vec::new()),
+        "the root state is written down, not implied"
+    );
     assert!(
         meta_of(&handle, cx, 0).contains("first"),
-        "the row meta already says it runs first"
+        "and the meta says it runs first: {}",
+        meta_of(&handle, cx, 0)
     );
 
-    // naming a step it waits for answers the question, so the note goes
+    // naming a step replaces the default with exactly that step
     click(cx, "flow-step-depends-check");
-    assert_eq!(graph_of(&handle, cx).steps[0].depends_on, vec!["check"]);
-    assert!(
-        cx.debug_bounds("flow-step-depends-note").is_none(),
-        "a step that waits for one is not a root"
+    assert_eq!(
+        graph_of(&handle, cx).steps[0].depends_on,
+        Some(vec!["check".to_owned()])
     );
+    assert!(
+        meta_of(&handle, cx, 0).contains("after check"),
+        "the meta names the step it waits for: {}",
+        meta_of(&handle, cx, 0)
+    );
+
+    // and "All above" puts the file's order back
+    click(cx, "flow-step-depends-all");
+    assert_eq!(graph_of(&handle, cx).steps[0].depends_on, None);
 
     let _ = std::fs::remove_dir_all(&home);
 }

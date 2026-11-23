@@ -265,8 +265,11 @@ fn print_plan(prepared: &Prepared, max_attempts: u32) {
         if step.per_task {
             line.push_str(" per task");
         }
-        if !step.depends_on.is_empty() {
-            line.push_str(&format!(" (after {})", step.depends_on.join(", ")));
+        // the three states, spelled out: the file's order, nothing, or names
+        match &step.depends_on {
+            None => line.push_str(" (after all above)"),
+            Some(named) if named.is_empty() => line.push_str(" (after nothing)"),
+            Some(named) => line.push_str(&format!(" (after {})", named.join(", "))),
         }
         if let Some(command) = &step.command {
             line.push_str(&format!(" `{command}`"));

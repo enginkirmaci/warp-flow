@@ -1348,7 +1348,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 continue;
             }
             if let Some(step) = self.workflow.step(&id) {
-                pending.extend(step.depends_on.iter().cloned());
+                pending.extend(self.workflow.dependencies(step));
             }
         }
         reached
@@ -3998,6 +3998,8 @@ kind = "question"
 id = "code"
 kind = "harness"
 skill = "code"
+# a root: it waits for nothing even though it is declared after `ask`
+depends_on = []
 
 [[step]]
 id = "after"

@@ -122,6 +122,13 @@ withdraws the door and asks a blocking engine to stop.
 - A step after the task lanes (`bump`, `summary`) is not per task: it waits for
   a per-task step, and a per-task dependency resolves for the graph as "every
   task has it".
+- **The file is read downwards.** `depends_on` has three states (ADR-0018):
+  omitted is every step declared before it, `[]` is a root, a list is exactly
+  those. `Workflow::dependencies` is the one resolver — the scheduler, the cycle
+  check, the rework targets, the merge's gate ancestors and the drawn tree all
+  go through it, so they cannot disagree. Never read `step.depends_on` directly
+  to answer "what does this wait for"; `named_dependencies()` is only for what
+  the file spells out.
 
 ## Tests
 

@@ -1161,10 +1161,13 @@ fn topological_steps(workflow: &Workflow) -> Vec<&Step> {
     let mut done: BTreeSet<String> = BTreeSet::new();
     let mut ordered = Vec::with_capacity(pending.len());
     while !pending.is_empty() {
+        // the run waits on the resolved set, not on what the file spells out:
+        // an omitted `depends_on` is every step declared before it (ADR-0018)
         let ready = pending.iter().position(|step| {
-            step.depends_on
+            workflow
+                .dependencies(step)
                 .iter()
-                .all(|dependency| done.contains(dependency))
+                .all(|id| done.contains(id))
         });
         let Some(index) = ready else {
             ordered.extend(pending);
@@ -1800,11 +1803,14 @@ skill = "code"
 per_task = true
 depends_on = ["analyze"]
 
+# declared last, and a root: `depends_on = []` is what says so, because an
+# omitted set would mean "everything above" and close a loop (ADR-0018)
 [[step]]
 id = "analyze"
 kind = "harness"
 skill = "analyze"
 produces = "spec.md"
+depends_on = []
 "#,
         )
         .expect("workflow.toml");
@@ -1920,7 +1926,7 @@ produces = "spec.md"
             command: None,
             cwd: None,
             timeout_secs: None,
-            depends_on: Vec::new(),
+            depends_on: Some(Vec::new()),
             produces: None,
             rework_to: None,
             rework_max: None,

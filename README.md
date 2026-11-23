@@ -68,7 +68,10 @@ run puts its four tabs in the run's head:
 `Repos` is the window a person edits: its `Workflow` tab is the repository's
 step graph with its revisions, drawn as an indented tree — each step sits under
 its first dependency, and any further dependency is a chip on its row, so a
-fork and a join are visible as such. A step is added at the front, after the
+fork and a join are visible as such. The file is read downwards: a step that
+names nothing waits for every step above it, `depends_on = []` is a root, and a
+list is exactly what the step waits for — so a pipeline needs no edges and only
+a fork names its parent (ADR-0018). A step is added at the front, after the
 selection or at the end, which is what decides what it waits for; a step can be
 disabled, and its dependents then inherit its own dependencies so the pipeline
 closes over it. A harness step picks its harness, model and effort from the

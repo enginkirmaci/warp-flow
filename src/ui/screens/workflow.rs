@@ -168,7 +168,12 @@ struct StepFacts {
     skill: Option<String>,
     command: Option<String>,
     produces: Option<String>,
-    depends_on: Vec<String>,
+    /// What the file says: the steps this one names, or `None` when it names
+    /// nothing and waits for every step declared before it (ADR-0018).
+    depends_on: Option<Vec<String>>,
+    /// What the run waits for, resolved: the named set, or every row above
+    /// this one. This is what the list's tree is drawn from.
+    waits_for: Vec<String>,
     per_task: bool,
     /// Whether the step runs. A disabled step stays in the list, dimmed.
     enabled: bool,
@@ -484,7 +489,8 @@ impl WorkflowScreen {
             return graph
                 .steps
                 .iter()
-                .map(|step| StepFacts {
+                .enumerate()
+                .map(|(index, step)| StepFacts {
                     id: step.id.clone(),
                     kind: step.kind,
                     meta: step_meta(step),
@@ -493,6 +499,14 @@ impl WorkflowScreen {
                     command: step.command.clone(),
                     produces: step.produces.clone(),
                     depends_on: step.depends_on.clone(),
+                    // an omitted set is every step declared before this one
+                    waits_for: match &step.depends_on {
+                        Some(named) => named.clone(),
+                        None => graph.steps[..index]
+                            .iter()
+                            .map(|other| other.id.clone())
+                            .collect(),
+                    },
                     per_task: step.per_task,
                     enabled: step.enabled,
                 })
@@ -514,7 +528,8 @@ impl WorkflowScreen {
                 skill: None,
                 command: None,
                 produces: None,
-                depends_on: Vec::new(),
+                depends_on: None,
+                waits_for: Vec::new(),
                 per_task: step.per_task,
                 enabled: true,
             })
@@ -707,35 +722,25 @@ impl WorkflowScreen {
     /// Add a step after the selection.
     /// Add a step at the front, after the selection, or at the end.
     ///
-    /// A step's place is its dependencies (ADR-0014), so where it goes decides
-    /// what it waits for: at the front it waits for nothing, after the
-    /// selection it waits for that step, and at the end it waits for the
-    /// current leaves — the steps nothing else depends on.
+    /// Where a step goes decides what it waits for (ADR-0018): at the front it
+    /// waits for nothing, after the selection it waits for that step alone, and
+    /// at the end it names nothing — which is "every step above it".
     fn add_step(&mut self, place: Place, cx: &mut Context<Self>) {
         let Some(graph) = self.graph.as_mut() else {
             return;
         };
         let number = graph.steps.len() + 1;
         let depends_on = match place {
-            Place::Front => Vec::new(),
+            // a root: it says so, so moving it later does not quietly turn it
+            // into a step that waits for the pipeline
+            Place::Front => Some(Vec::new()),
             Place::After => graph
                 .steps
                 .get(self.selected)
-                .map(|step| vec![step.id.clone()])
-                .unwrap_or_default(),
-            Place::End => {
-                let depended_on: std::collections::BTreeSet<&str> = graph
-                    .steps
-                    .iter()
-                    .flat_map(|step| step.depends_on.iter().map(String::as_str))
-                    .collect();
-                graph
-                    .steps
-                    .iter()
-                    .filter(|step| !depended_on.contains(step.id.as_str()))
-                    .map(|step| step.id.clone())
-                    .collect()
-            }
+                .map(|step| vec![step.id.clone()]),
+            // the file's own order is the default, so a step at the end waits
+            // for everything above it without naming one of them
+            Place::End => None,
         };
         let step = Step {
             id: format!("step-{number}"),
@@ -785,7 +790,9 @@ impl WorkflowScreen {
         }
         let removed = graph.steps.remove(self.selected);
         for step in &mut graph.steps {
-            step.depends_on.retain(|id| id != &removed.id);
+            if let Some(named) = step.depends_on.as_mut() {
+                named.retain(|id| id != &removed.id);
+            }
         }
         self.selected = self.selected.min(graph.steps.len().saturating_sub(1));
         self.fields = None;
@@ -796,12 +803,11 @@ impl WorkflowScreen {
 
     /// Move the selected step up or down among its siblings.
     ///
-    /// Siblings share a parent — the same `depends_on[0]`, or both are roots —
-    /// so the arrows reorder declaration order inside one branch and never
-    /// across branches. A step's place is its dependencies (ADR-0014), and the
-    /// list is drawn from them: trading a step with a cousin changes nothing a
-    /// person can see, which is why the buttons are off when there is no
-    /// sibling to trade places with.
+    /// Siblings share a parent — the first step either names, or neither naming
+    /// one — so the arrows reorder declaration order inside one branch and
+    /// never across branches. The list is drawn from the resolved dependencies,
+    /// and trading a step with a cousin changes nothing a person can see, which
+    /// is why the buttons are off when there is no sibling to trade places with.
     fn move_step(&mut self, delta: isize, cx: &mut Context<Self>) {
         let Some(graph) = self.graph.as_mut() else {
             return;
@@ -1002,8 +1008,11 @@ impl WorkflowScreen {
         let indent_selector = format!("flow-workflow-indent-{index}");
         // A join is named on the row itself: the step's parent is the row it is
         // drawn under, and `depends_on[1..]` are the other parents it waits for.
-        let joins = if facts.depends_on.len() > 1 {
-            format!(", also after {}", facts.depends_on[1..].join(", "))
+        // A step that names nothing waits for every row above it (ADR-0018), so
+        // there is nothing to list — its meta line says that instead.
+        let named = facts.depends_on.as_deref().unwrap_or_default();
+        let joins = if named.len() > 1 {
+            format!(", also after {}", named[1..].join(", "))
         } else {
             String::new()
         };
@@ -1071,7 +1080,7 @@ impl WorkflowScreen {
                 .text_color(theme::text_dim())
                 .child(facts.meta.clone()),
         );
-        for dependency in facts.depends_on.iter().skip(1) {
+        for dependency in named.iter().skip(1) {
             meta = meta.child(join_chip(index, dependency));
         }
         row.child(
@@ -1363,7 +1372,7 @@ impl WorkflowScreen {
         for (label, key, input) in rows {
             body = body.child(self.field_row(label, key, input, window, cx));
         }
-        // A step's place is its dependencies (ADR-0014), so they are picked
+        // A step's place is its dependencies (ADR-0018), so they are picked
         // from the graph's own steps rather than typed: a mistyped id is a
         // graph the engine refuses, and the fix is a name a person cannot see.
         body = body.child(self.dependency_row(&step, cx));
@@ -1685,10 +1694,11 @@ impl WorkflowScreen {
         } else {
             "once, at the start"
         };
-        let depends = if step.depends_on.is_empty() {
-            None
-        } else {
-            Some(step.depends_on.join(", "))
+        // Three states in the reading too: the file's order, nothing, or names.
+        let depends = match &step.depends_on {
+            None => Some("every step above it".to_owned()),
+            Some(named) if named.is_empty() => Some("nothing: it starts with the run".to_owned()),
+            Some(named) => Some(named.join(", ")),
         };
         let mut rows: Vec<(&str, AnyElement)> = vec![
             ("Kind", value_word(kind_word(step.kind))),
@@ -2194,11 +2204,40 @@ impl WorkflowScreen {
             .gap(px(6.))
             .flex_1()
             .min_w_0();
+        // The two defaults first, then the steps: an omitted set is the file's
+        // own order, an empty one is a root, and pressing a step names it.
+        // Showing all three as chips is what makes a change of meaning visible
+        // — a person can see which of the three the step is on (ADR-0018).
+        chips = chips.child(mode_chip(
+            "flow-step-depends-all",
+            "All above",
+            "Waits for every step declared before it",
+            step.depends_on.is_none(),
+            cx.listener(|this, _, window, cx| {
+                this.edit_step(cx, |step| step.depends_on = None);
+                this.refill_fields(window, cx);
+                cx.notify();
+            }),
+        ));
+        chips = chips.child(mode_chip(
+            "flow-step-depends-none",
+            "Nothing",
+            "Waits for nothing: it can start with the run",
+            step.depends_on.as_deref().is_some_and(<[String]>::is_empty),
+            cx.listener(|this, _, window, cx| {
+                this.edit_step(cx, |step| step.depends_on = Some(Vec::new()));
+                this.refill_fields(window, cx);
+                cx.notify();
+            }),
+        ));
         if !has_others {
             chips = chips.child(quiet_word("No other steps yet."));
         }
         for id in others {
-            let selected = step.depends_on.contains(&id);
+            let selected = step
+                .named_dependencies()
+                .iter()
+                .any(|dependency| dependency == &id);
             let selector = format!("flow-step-depends-{id}");
             let value = id.clone();
             chips = chips.child(
@@ -2232,10 +2271,14 @@ impl WorkflowScreen {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let value = value.clone();
                         this.edit_step(cx, |step| {
-                            if let Some(at) = step.depends_on.iter().position(|id| id == &value) {
-                                step.depends_on.remove(at);
-                            } else {
-                                step.depends_on.push(value);
+                            // naming a step leaves the default: the set becomes
+                            // exactly what is pressed
+                            let named = step.depends_on.get_or_insert_with(Vec::new);
+                            match named.iter().position(|id| id == &value) {
+                                Some(at) => {
+                                    named.remove(at);
+                                }
+                                None => named.push(value),
                             }
                         });
                         this.refill_fields(window, cx);
@@ -2244,27 +2287,7 @@ impl WorkflowScreen {
                     .child(id),
             );
         }
-        // A step's place is its dependencies, so a step that names none is a
-        // root: it is ready the moment the run starts, beside the other roots,
-        // whatever order the file declares it in. The drawn list can read as if
-        // its order were the run's — a join drawn near the end looks like it
-        // comes last even with nothing to wait for — so the row says what an
-        // empty set means instead of leaving it to unselected chips.
-        let mut column = div().flex().flex_col().gap(px(4.)).child(row.child(chips));
-        if step.depends_on.is_empty() && has_others {
-            column = column.child(
-                div()
-                    .debug_selector(|| "flow-step-depends-note".into())
-                    .pl(px(theme::scaled(LABEL_WIDTH) + 12.))
-                    .text_size(px(theme::font_meta()))
-                    .text_color(theme::text_muted())
-                    .child(
-                        "Waits for nothing, so it starts with the run — press a step to wait for \
-                         it.",
-                    ),
-            );
-        }
-        column.into_any_element()
+        row.child(chips).into_any_element()
     }
 
     /// The step's rework edge: the earlier step it sends the work back to.
@@ -2369,7 +2392,7 @@ impl WorkflowScreen {
             return Vec::new();
         };
         let mut reached = std::collections::BTreeSet::new();
-        collect_ancestors(graph, &step.depends_on, &mut reached);
+        collect_ancestors(graph, step, &mut reached);
         graph
             .steps
             .iter()
@@ -2751,15 +2774,17 @@ fn tree_order(facts: &[StepFacts]) -> Vec<(usize, usize)> {
 
 /// Each step's dependencies, as row indices the list actually draws.
 ///
-/// An id the graph does not know is one a person is still typing, and a step
-/// naming the same dependency twice waits for it once.
+/// This is [`StepFacts::waits_for`] — the same set the engine resolves, so an
+/// omitted `depends_on` draws as the join it is. An id the graph does not know
+/// is one a person is still typing, and a step naming the same dependency twice
+/// waits for it once.
 fn known_dependencies(
     facts: &[StepFacts],
     index_of: &std::collections::BTreeMap<&str, usize>,
 ) -> Vec<Vec<usize>> {
     let mut dependencies: Vec<Vec<usize>> = vec![Vec::new(); facts.len()];
     for (index, fact) in facts.iter().enumerate() {
-        for id in &fact.depends_on {
+        for id in &fact.waits_for {
             let Some(&dependency) = index_of.get(id.as_str()) else {
                 continue;
             };
@@ -2902,18 +2927,72 @@ fn collect_step_ancestors(
 
 /// The index of the step's sibling `delta` places away, if it has one.
 ///
-/// Siblings share a parent — the same `depends_on[0]`, or both are roots — and
-/// only the declaration order moves: a step's dependencies are never edited, so
-/// the arrows cannot reshape the tree. `None` is what keeps the button off.
+/// Siblings share a parent — the first step either of them names, or neither
+/// naming one — and only the declaration order moves: a step's dependencies are
+/// never edited, so the arrows cannot reshape the tree. `None` is what keeps the
+/// button off.
 fn sibling_index(graph: &Workflow, index: usize, delta: isize) -> Option<usize> {
-    let parent = graph.steps.get(index)?.depends_on.first().cloned();
-    let is_sibling = |other: &Step| other.depends_on.first().cloned() == parent;
+    let parent = graph
+        .steps
+        .get(index)?
+        .depends_on
+        .as_ref()?
+        .first()
+        .cloned();
+    let is_sibling = |other: &Step| {
+        other
+            .depends_on
+            .as_ref()
+            .and_then(|deps| deps.first())
+            .cloned()
+            == parent
+    };
     if delta < 0 {
         graph.steps.iter().take(index).rposition(is_sibling)
     } else {
         (index.saturating_add(1)..graph.steps.len())
             .find(|sibling| is_sibling(&graph.steps[*sibling]))
     }
+}
+
+/// One of the two defaults in the dependency row: "All above" or "Nothing".
+///
+/// The chips are deliberately the same size and shape as a step's chip, because
+/// they are the same kind of choice: which of the three states the step is in.
+/// One of them is always lit, so the state is never implied by the absence of a
+/// chip.
+fn mode_chip(
+    id: &'static str,
+    label: &'static str,
+    aria: &'static str,
+    selected: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(SharedString::from(id))
+        .debug_selector(move || id.to_owned())
+        .a11y_option(aria, selected)
+        .cursor_pointer()
+        .px(px(8.))
+        .py(px(3.))
+        .rounded(px(5.))
+        .border_1()
+        .border_color(if selected {
+            theme::accent()
+        } else {
+            theme::hairline()
+        })
+        .text_size(px(theme::font_micro()))
+        .font_family(theme::code_font())
+        .text_color(if selected {
+            theme::text()
+        } else {
+            theme::text_muted()
+        })
+        .hover(|style| style.bg(theme::raised()))
+        .on_click(on_click)
+        .child(label)
+        .into_any_element()
 }
 
 /// One extra dependency on a row: the other parent of a join, quiet beside the
@@ -3002,21 +3081,23 @@ fn rework_chip(
         .into_any_element()
 }
 
-/// Every step `ids` names, and everything those wait for, by id.
+/// Every step `step` waits for, and everything those wait for, by id.
 ///
-/// `reached` is also the cycle guard: `validate` refuses a cycle, but the
-/// inspector is drawn while a person is midway through an edit.
+/// The set comes from [`Workflow::dependencies`], so an omitted `depends_on` —
+/// every step declared before it — is included, which is exactly what the engine
+/// will do. `reached` is also the cycle guard: `validate` refuses a cycle, but
+/// the inspector is drawn while a person is midway through an edit.
 fn collect_ancestors<'a>(
     graph: &'a Workflow,
-    ids: &[String],
+    step: &Step,
     reached: &mut std::collections::BTreeSet<&'a str>,
 ) {
-    for id in ids {
-        let Some(dependency) = graph.step(id) else {
+    for id in graph.dependencies(step) {
+        let Some(dependency) = graph.step(&id) else {
             continue;
         };
         if reached.insert(dependency.id.as_str()) {
-            collect_ancestors(graph, &dependency.depends_on, reached);
+            collect_ancestors(graph, dependency, reached);
         }
     }
 }
@@ -3034,9 +3115,14 @@ fn step_meta(step: &Step) -> String {
     } else {
         "once"
     };
-    let after = match step.depends_on.first() {
-        Some(first) => format!("after {first}"),
-        None => "first".to_owned(),
+    // Three states, three words: an omitted set follows the file's own order, an
+    // empty one is a root, and a list names the step it leaves from.
+    let after = match &step.depends_on {
+        None => "after all above".to_owned(),
+        Some(named) => match named.first() {
+            Some(first) => format!("after {first}"),
+            None => "first".to_owned(),
+        },
     };
     let rework = match &step.rework_to {
         Some(target) => format!("returns to {target} · "),
@@ -3076,7 +3162,7 @@ fn new_step(id: &str, kind: StepKind, depends_on: &[&str]) -> Step {
         command: None,
         cwd: None,
         timeout_secs: None,
-        depends_on: depends_on.iter().map(|id| (*id).to_owned()).collect(),
+        depends_on: Some(depends_on.iter().map(|id| (*id).to_owned()).collect()),
         produces: None,
         rework_to: None,
         rework_max: None,
@@ -3113,31 +3199,33 @@ fn new_graph() -> Workflow {
         step.per_task = true;
         step
     };
+    // The file is the pipeline (ADR-0018): a step that names nothing waits for
+    // every step above it, so only the fork names a parent. `bump` and `merge`
+    // name nothing on purpose — that is what makes them the join.
     let mut steps = vec![
         harness("analyze", "analyze", Some("spec.md"), false, &[]),
-        harness("split", "split", None, false, &["analyze"]),
-        new_step("approve-plan", StepKind::Question, &["split"]),
-        harness("code", "code", None, true, &["approve-plan"]),
-        harness("review", "review", None, true, &["code"]),
+        harness("split", "split", None, false, &[]),
+        new_step("approve-plan", StepKind::Question, &[]),
+        harness("code", "code", None, true, &[]),
+        harness("review", "review", None, true, &[]),
         // The three checks are this repository's own CI, cheapest first, so a
         // task fails on fmt before it spends half an hour in the test suite.
+        // `fmt` and `clippy` leave `review` together; `test` follows `clippy`.
         gate("fmt", "cargo fmt --all --check", 300, &["review"]),
         gate(
             "clippy",
             "cargo clippy --locked --all-targets -- -D warnings",
             1800,
-            &["fmt"],
+            &["review"],
         ),
         gate("test", "cargo test --locked", 1800, &["clippy"]),
     ];
     // The version moves once, before the queue lands anything; merge is the
     // barrier after it and summary is the run's closing report.
-    let mut merge_after = vec!["test"];
     if ships("bump") {
-        steps.push(harness("bump", "bump", None, false, &["test"]));
-        merge_after = vec!["bump"];
+        steps.push(harness("bump", "bump", None, false, &[]));
     }
-    let mut merge = new_step("merge", StepKind::Merge, &merge_after);
+    let mut merge = new_step("merge", StepKind::Merge, &[]);
     merge.per_task = true;
     merge.mode = Some("local".to_owned());
     merge.push = false;
@@ -3148,7 +3236,7 @@ fn new_graph() -> Workflow {
             "summary",
             Some("summary.md"),
             false,
-            &["merge"],
+            &[],
         ));
     }
     Workflow {

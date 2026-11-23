@@ -198,10 +198,11 @@ depends_on = ["test"]
 
 Nothing in the file is language-specific: a gate is a shell command, a
 directory, a timeout and an exit code, so a repository in any language is
-covered by the same shape. A step's place is its `depends_on` set, not its
-position in the file (ADR-0014): a step may name several dependencies, and two
-steps with no dependency between them may run at the same time, up to
-`max_parallel`. A step may be `enabled = false`, in which case it never runs and
+covered by the same shape. The file is read downwards (ADR-0018): a step that
+names nothing waits for every step declared before it, `depends_on = []` is a
+root, and a list is exactly what the step waits for — so a pipeline needs no
+edges and only a fork names its parent. Two steps that wait for the same thing
+may run at the same time, up to `max_parallel`. A step may be `enabled = false`, in which case it never runs and
 its dependents inherit its own dependencies. A harness step may also name what
 it runs on — `harness`, `model`, `effort` — and an empty value is the engine's
 choice: a managed harness (dsh first), its first model, the model's own default
