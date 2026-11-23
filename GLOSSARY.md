@@ -19,7 +19,7 @@ decision it makes is written down before the next step reads it.
 | **step** | One node of a workflow graph: analyze, split, code, review, a gate, a question, a bump, a merge, a summary. It names the steps it waits for, so a step is defined by its dependencies and not by where it sits in the file. |
 | **gate step** | A step whose kind is `gate`: it carries its own command, folder and timeout, and a run passes it or fails it. It is a step like any other, so it has a place in the graph and can be disabled. |
 | **disabled step** | A step kept in the graph but not run. Its dependents inherit its own dependencies, so the pipeline closes over it instead of breaking. |
-| **wave** | The steps that become ready at the same time: same depth from the graph's roots, no dependency between them. A wave is what the editor draws as one band, and what the engine may run at once. |
+| **wave** | The steps that become ready at the same time: same depth from the graph's roots, no dependency between them. A wave is what the engine may run at once. |
 | **merge step** | The step that lands a task's branch. It waits for every step in flight to finish and starts nothing while it runs, because it refuses a checkout with uncommitted work. |
 | **bump step** | The step that moves the repository's version once, before the merge queue lands anything. The engine's own commits pass `--no-verify`, so the pre-commit hook that bumps PATCH never runs on them. |
 | **summary step** | The step that closes a run: it reads the whole issue folder and writes `summary.md`, the report a person who did not watch the run needs. |

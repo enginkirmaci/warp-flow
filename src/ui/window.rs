@@ -303,6 +303,12 @@ pub struct FlowApp {
     pub(crate) add_repo_field: Option<Entity<InputState>>,
     /// Why the last add or remove could not happen, in the list's own words.
     pub(crate) add_repo_note: Option<String>,
+    /// The repository whose row's Forget affordance is armed. The list pane is
+    /// the one place a repository is added or forgotten (ADR-0015), and the
+    /// affordance takes two presses: the first arms the row and the second
+    /// forgets it, so a slip cannot drop a repository. The checkout on disk is
+    /// never touched.
+    pub(crate) forget_armed: Option<PathBuf>,
     window_title: String,
 }
 
@@ -403,6 +409,7 @@ impl FlowApp {
             add_repo_open: false,
             add_repo_field: None,
             add_repo_note: None,
+            forget_armed: None,
             window_title: String::new(),
         };
         app.start_scan(cx);
@@ -715,6 +722,16 @@ impl FlowApp {
         {
             self.selected_repo = None;
         }
+        // An armed row whose repository left the scan has nothing left to
+        // confirm: clear it rather than arm a confirm for something the list no
+        // longer holds.
+        if self
+            .forget_armed
+            .as_deref()
+            .is_some_and(|armed| self.snapshot.repo(armed).is_none())
+        {
+            self.forget_armed = None;
+        }
         let visible = self.visible_keys();
         if self
             .cursor
@@ -882,6 +899,7 @@ impl FlowApp {
 
     /// Forget one repository from this window. The checkout is never touched.
     pub(crate) fn remove_repository(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.forget_armed = None;
         let Some(index) = self
             .settings
             .repos
@@ -906,6 +924,42 @@ impl FlowApp {
             self.adopt_repo(next, cx);
         }
         cx.notify();
+    }
+
+    /// Whether `path`'s row is armed for its second press.
+    ///
+    /// The armed path always comes from the snapshot's own row, so this is a
+    /// plain comparison: it is read in the frame, and a frame must not touch
+    /// the filesystem.
+    pub(crate) fn is_forget_armed(&self, path: &Path) -> bool {
+        self.forget_armed.as_deref() == Some(path)
+    }
+
+    /// The first press on a row's Forget affordance: arm it. Nothing is removed
+    /// until the second press, so the arming press is harmless.
+    pub(crate) fn arm_forget(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if self.is_forget_armed(path) {
+            return;
+        }
+        self.forget_armed = Some(path.to_path_buf());
+        cx.notify();
+    }
+
+    /// The second press on an armed row's Forget affordance: forget the
+    /// repository through the one remove path, so the settings are saved and
+    /// the scan restarts exactly as they do for a probe.
+    pub(crate) fn forget_repository(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.forget_armed = None;
+        self.remove_repository(path, cx);
+    }
+
+    /// A press anywhere but the armed row's Forget affordance leaves the row
+    /// alone. The window's root calls this for every press that reaches it; the
+    /// affordance stops its own press, so it is the one exception.
+    pub(crate) fn disarm_forget(&mut self, cx: &mut Context<Self>) {
+        if self.forget_armed.take().is_some() {
+            cx.notify();
+        }
     }
 
     pub(crate) fn open_run(&mut self, key: RunKey, window: &mut Window, cx: &mut Context<Self>) {
@@ -1241,6 +1295,13 @@ impl Render for FlowApp {
             .flex_col()
             .bg(theme::surface())
             .text_color(theme::text())
+            // A press anywhere but the armed row's Forget affordance leaves
+            // that row alone; the affordance stops its own press, so it is the
+            // one exception (ADR-0015: the list pane owns the lifecycle).
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.disarm_forget(cx)),
+            )
             .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
                 if !this.list_resizing {
                     return;

@@ -34,7 +34,7 @@ fn scratch_home() -> PathBuf {
     home
 }
 
-/// A throwaway git repository with the gate file a run needs, and no issue
+/// A throwaway git repository with the workflow file a run needs, and no issue
 /// folder: the form is the only way a run appears.
 fn seed_repo(home: &Path) -> PathBuf {
     let repo = home.join("repo");

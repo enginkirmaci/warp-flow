@@ -59,6 +59,15 @@ const LIST_WIDTH: f32 = 320.;
 /// One step row in the list.
 const STEP_ROW_HEIGHT: f32 = 58.;
 
+/// One level of the list's tree: what a row adds to its left padding per depth.
+const INDENT_STEP: f32 = 14.;
+
+/// A row's own left padding, before the tree's indent.
+const ROW_PADDING: f32 = 13.;
+
+/// One extra dependency's quiet chip on a row: small enough for the meta line.
+const JOIN_CHIP_HEIGHT: f32 = 16.;
+
 /// The list's head: the step count and the revision.
 const LIST_HEAD_HEIGHT: f32 = 40.;
 
@@ -321,9 +330,9 @@ impl WorkflowScreen {
         });
         let graph = read.as_ref().ok().cloned();
         // A file that exists but will not parse is not a file that is absent.
-        // Offering the shipped shape over a broken one would let Save replace
-        // a graph of nine steps with a graph of one, so the editor refuses to
-        // work until the file is fixed outside it.
+        // Offering the default document over a broken one would let Save replace
+        // the graph a person wrote with the all-off menu, so the editor refuses
+        // to work until the file is fixed outside it.
         let broken = graph.is_none() && path.is_file();
         self.selected = 0;
         self.loaded = graph.clone();
@@ -443,43 +452,6 @@ impl WorkflowScreen {
                 enabled: true,
             })
             .collect()
-    }
-
-    /// The list's rows grouped into waves: `(wave number, row indices)`.
-    ///
-    /// A wave is the set of steps that become ready together — same depth from
-    /// the graph's roots, no dependency between them. The editor draws one band
-    /// per wave, which is what makes a fork and a join visible. Disabled steps
-    /// are in the waves they would occupy, so switching one off does not move
-    /// the rows around it.
-    fn waves(&self, facts: &[StepFacts]) -> Vec<(usize, Vec<usize>)> {
-        let Some(graph) = &self.graph else {
-            // No graph: the log's steps have no dependencies to group by, so
-            // they are one wave in the order the log lists them.
-            return if facts.is_empty() {
-                Vec::new()
-            } else {
-                vec![(0, (0..facts.len()).collect())]
-            };
-        };
-        let mut depth: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-        for step in &graph.steps {
-            depth_of(
-                graph,
-                step,
-                &mut depth,
-                &mut std::collections::BTreeSet::new(),
-            );
-        }
-        let mut waves: Vec<(usize, Vec<usize>)> = Vec::new();
-        for (index, step) in graph.steps.iter().enumerate() {
-            let level = depth.get(step.id.as_str()).copied().unwrap_or(0);
-            match waves.last_mut() {
-                Some((wave, indices)) if *wave == level => indices.push(index),
-                _ => waves.push((level, vec![index])),
-            }
-        }
-        waves
     }
 
     /// Edit the selected step and mark the graph dirty.
@@ -763,22 +735,36 @@ impl WorkflowScreen {
         cx.notify();
     }
 
-    /// Move the selected step up or down in the declaration order.
+    /// Move the selected step up or down among its siblings.
+    ///
+    /// Siblings share a parent — the same `depends_on[0]`, or both are roots —
+    /// so the arrows reorder declaration order inside one branch and never
+    /// across branches. A step's place is its dependencies (ADR-0014), and the
+    /// list is drawn from them: trading a step with a cousin changes nothing a
+    /// person can see, which is why the buttons are off when there is no
+    /// sibling to trade places with.
     fn move_step(&mut self, delta: isize, cx: &mut Context<Self>) {
         let Some(graph) = self.graph.as_mut() else {
             return;
         };
         let from = self.selected;
-        let to = from as isize + delta;
-        if to < 0 || to as usize >= graph.steps.len() {
+        let Some(to) = sibling_index(graph, from, delta) else {
             return;
-        }
-        let to = to as usize;
-        graph.steps.swap(from, to);
+        };
+        let step = graph.steps.remove(from);
+        graph.steps.insert(to, step);
         self.selected = to;
         self.dirty = true;
         self.list_scroll.scroll_to_item(to);
         cx.notify();
+    }
+
+    /// Whether the selected step has a sibling `delta` places away, which is
+    /// what the arrows' disabled state reads.
+    fn can_move(&self, delta: isize) -> bool {
+        self.graph
+            .as_ref()
+            .is_some_and(|graph| sibling_index(graph, self.selected, delta).is_some())
     }
 
     /// Validate and write the graph as the next revision.
@@ -915,15 +901,12 @@ impl WorkflowScreen {
                 "A workflow needs one harness step to run anything.",
             ));
         }
-        // The list is drawn in waves: the steps that become ready together sit
-        // under one band, so a fork and a join are visible as such. A step's
-        // place is its dependencies (ADR-0014), and the band is where that
-        // shows.
-        for (wave, indices) in self.waves(facts) {
-            rows = rows.child(wave_band(wave, indices.len()));
-            for index in indices {
-                rows = rows.child(self.render_step_row(index, &facts[index], revision, cx));
-            }
+        // The list is an indented tree: each step sits one level under the step
+        // it waits for first, and its children follow it depth first, so a fork
+        // reads as the rows beneath one step and a join as a step carrying
+        // chips beside its meta.
+        for (index, depth) in tree_order(facts) {
+            rows = rows.child(self.render_step_row(index, depth, &facts[index], revision, cx));
         }
         div()
             .id("flow-workflow-column")
@@ -945,6 +928,7 @@ impl WorkflowScreen {
     fn render_step_row(
         &self,
         index: usize,
+        depth: usize,
         facts: &StepFacts,
         revision: u32,
         cx: &mut Context<Self>,
@@ -952,12 +936,20 @@ impl WorkflowScreen {
         let selected = index == self.selected;
         let selector = format!("flow-workflow-step-{index}");
         let mark_selector = format!("flow-workflow-selected-{index}");
+        let indent_selector = format!("flow-workflow-indent-{index}");
+        // A join is named on the row itself: the step's parent is the row it is
+        // drawn under, and `depends_on[1..]` are the other parents it waits for.
+        let joins = if facts.depends_on.len() > 1 {
+            format!(", also after {}", facts.depends_on[1..].join(", "))
+        } else {
+            String::new()
+        };
         let mut row = div()
             .id(SharedString::from(selector.clone()))
             .debug_selector(move || selector.clone())
             .a11y_option(
                 format!(
-                    "Step {}, {}{}",
+                    "Step {}, {}{joins}{}",
                     facts.id,
                     facts.meta,
                     if facts.enabled { "" } else { ", disabled" }
@@ -970,7 +962,9 @@ impl WorkflowScreen {
             .items_center()
             .gap(px(10.))
             .h(px(theme::scaled(STEP_ROW_HEIGHT)))
-            .pl(px(13.))
+            // The tree's depth is the row's left padding, so the height and the
+            // selection mark (pinned to the row's own edge) never move with it.
+            .pl(px(ROW_PADDING + depth as f32 * INDENT_STEP))
             .pr(px(12.))
             .cursor_pointer()
             .when(selected, |row| row.bg(theme::raised()))
@@ -993,12 +987,31 @@ impl WorkflowScreen {
                     .bg(theme::accent()),
             );
         }
-        row.child(icon(
-            kind_glyph(facts.kind),
-            px(theme::icon_small()),
-            theme::text_muted(),
-        ))
-        .child(
+        // The depth is readable as one selector per row: its x is the row's
+        // content edge, which moves exactly one `INDENT_STEP` per level.
+        row = row.child(
+            div()
+                .debug_selector(move || indent_selector.clone())
+                .flex_shrink_0()
+                .child(icon(
+                    kind_glyph(facts.kind),
+                    px(theme::icon_small()),
+                    theme::text_muted(),
+                )),
+        );
+        let mut meta = div().flex().items_center().gap(px(6.)).min_w_0().child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(theme::font_meta()))
+                .text_color(theme::text_dim())
+                .child(facts.meta.clone()),
+        );
+        for dependency in facts.depends_on.iter().skip(1) {
+            meta = meta.child(join_chip(index, dependency));
+        }
+        row.child(
             div()
                 .flex_1()
                 .min_w_0()
@@ -1017,13 +1030,7 @@ impl WorkflowScreen {
                         })
                         .child(facts.id.clone()),
                 )
-                .child(
-                    div()
-                        .truncate()
-                        .text_size(px(theme::font_meta()))
-                        .text_color(theme::text_dim())
-                        .child(facts.meta.clone()),
-                ),
+                .child(meta),
         )
         .child(if self.read_only {
             facts
@@ -1116,14 +1123,16 @@ impl WorkflowScreen {
         actions = actions
             .child(icon_action(
                 "flow-workflow-up",
-                "Move the step up",
+                "Move the step up among its siblings",
                 "icons/icon-arrow-up.svg",
+                self.can_move(-1),
                 cx.listener(|this, _, _, cx| this.move_step(-1, cx)),
             ))
             .child(icon_action(
                 "flow-workflow-down",
-                "Move the step down",
+                "Move the step down among its siblings",
                 "icons/icon-arrow-down.svg",
+                self.can_move(1),
                 cx.listener(|this, _, _, cx| this.move_step(1, cx)),
             ));
         let save_enabled = self.dirty;
@@ -1138,6 +1147,7 @@ impl WorkflowScreen {
                 "flow-workflow-remove",
                 "Remove the step",
                 "icons/icon-trash.svg",
+                true,
                 cx.listener(|this, _, _, cx| this.remove_step(cx)),
             ));
 
@@ -2253,69 +2263,123 @@ fn kind_glyph(kind: StepKind) -> &'static str {
     }
 }
 
-/// The depth of `step`: one past the deepest of its dependencies.
+/// The list's rows in the order the indented tree draws them: `(row, depth)`.
 ///
-/// This is what groups the list into waves. `validate` refuses a cycle, so the
-/// `visiting` guard only keeps a malformed graph from recursing forever while
-/// the editor is mid-edit.
-fn depth_of<'a>(
-    graph: &'a Workflow,
-    step: &'a Step,
-    depth: &mut std::collections::BTreeMap<&'a str, usize>,
-    visiting: &mut std::collections::BTreeSet<&'a str>,
-) -> usize {
-    if let Some(known) = depth.get(step.id.as_str()) {
-        return *known;
-    }
-    if !visiting.insert(step.id.as_str()) {
-        return 0;
-    }
-    let mut level = 0;
-    for dependency in &step.depends_on {
-        if let Some(dependency) = graph.step(dependency) {
-            level = level.max(depth_of(graph, dependency, depth, visiting) + 1);
+/// A step's parent is the first dependency the graph knows — `depends_on[0]`,
+/// not the deepest one — so the list is the graph's shape: roots in declaration
+/// order, each step's children directly after it, and a step reached only as a
+/// later dependency still appearing exactly once. The tree is the graph's, not
+/// today's run: a disabled step is still a node, so switching one off never
+/// moves the rows around it.
+///
+/// `seen` is the cycle guard: `validate` refuses a cycle, but the list is drawn
+/// while a person is midway through an edit. A step the walk cannot reach is
+/// drawn after the rest, at the root, rather than dropped.
+fn tree_order(facts: &[StepFacts]) -> Vec<(usize, usize)> {
+    let index_of: std::collections::BTreeMap<&str, usize> = facts
+        .iter()
+        .enumerate()
+        .map(|(index, fact)| (fact.id.as_str(), index))
+        .collect();
+    // A dependency is a parent only when the graph knows the id: one a person
+    // is still typing is not a row to hang under yet.
+    let parent: Vec<Option<usize>> = facts
+        .iter()
+        .enumerate()
+        .map(|(index, fact)| {
+            fact.depends_on
+                .first()
+                .and_then(|id| index_of.get(id.as_str()).copied())
+                .filter(|parent| *parent != index)
+        })
+        .collect();
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); facts.len()];
+    for (index, parent) in parent.iter().enumerate() {
+        if let Some(parent) = parent {
+            children[*parent].push(index);
         }
     }
-    visiting.remove(step.id.as_str());
-    depth.insert(step.id.as_str(), level);
-    level
+    let mut rows = Vec::with_capacity(facts.len());
+    let mut seen = vec![false; facts.len()];
+    for (index, parent) in parent.iter().enumerate() {
+        if parent.is_none() {
+            walk_tree(index, 0, &children, &mut seen, &mut rows);
+        }
+    }
+    // Whatever the roots did not reach is a cycle the editor is halfway through
+    // making. It has no depth to trust, so it is drawn at the end, at the root.
+    for index in 0..facts.len() {
+        walk_tree(index, 0, &children, &mut seen, &mut rows);
+    }
+    rows
 }
 
-/// One wave's band: the number and how many steps are in it.
-fn wave_band(wave: usize, count: usize) -> AnyElement {
-    let selector = format!("flow-workflow-wave-{wave}");
+/// One step and its subtree, depth first; `seen` stops a cycle from recursing.
+fn walk_tree(
+    index: usize,
+    depth: usize,
+    children: &[Vec<usize>],
+    seen: &mut [bool],
+    rows: &mut Vec<(usize, usize)>,
+) {
+    if std::mem::replace(&mut seen[index], true) {
+        return;
+    }
+    rows.push((index, depth));
+    for child in &children[index] {
+        walk_tree(*child, depth + 1, children, seen, rows);
+    }
+}
+
+/// The index of the step's sibling `delta` places away, if it has one.
+///
+/// Siblings share a parent — the same `depends_on[0]`, or both are roots — and
+/// only the declaration order moves: a step's dependencies are never edited, so
+/// the arrows cannot reshape the tree. `None` is what keeps the button off.
+fn sibling_index(graph: &Workflow, index: usize, delta: isize) -> Option<usize> {
+    let parent = graph.steps.get(index)?.depends_on.first().cloned();
+    let is_sibling = |other: &Step| other.depends_on.first().cloned() == parent;
+    if delta < 0 {
+        graph.steps.iter().take(index).rposition(is_sibling)
+    } else {
+        (index.saturating_add(1)..graph.steps.len())
+            .find(|sibling| is_sibling(&graph.steps[*sibling]))
+    }
+}
+
+/// One extra dependency on a row: the other parent of a join, quiet beside the
+/// meta and small enough to fit inside the 320 column at any depth.
+fn join_chip(index: usize, dependency: &str) -> AnyElement {
+    let selector = format!("flow-workflow-join-{index}-{dependency}");
     div()
         .debug_selector(move || selector.clone())
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .h(px(30.))
-        .px(px(14.))
-        .bg(theme::surface())
+        .flex_shrink_0()
+        .max_w(px(88.))
+        .truncate()
+        .h(px(theme::scaled(JOIN_CHIP_HEIGHT)))
+        .px(px(5.))
+        .rounded(px(999.))
+        .bg(theme::raised())
+        .font_family(theme::code_font())
         .text_size(px(theme::font_micro()))
-        .font_weight(FontWeight::SEMIBOLD)
         .text_color(theme::text_muted())
-        .child(format!("Wave {}", wave + 1))
-        .child(div().flex_1())
-        .child(div().font_weight(FontWeight::MEDIUM).child(if count == 1 {
-            "1 step".to_owned()
-        } else {
-            format!("{count} in parallel")
-        }))
+        .child(format!("+{dependency}"))
         .into_any_element()
 }
 
 /// A step's list meta: `harness · once per task · after code`.
+///
+/// The dependency it names is the step's parent in the tree; any others are
+/// chips beside the meta, because the row has no width for a list of names.
 fn step_meta(step: &Step) -> String {
     let cadence = if step.per_task {
         "once per task"
     } else {
         "once"
     };
-    let after = if step.depends_on.is_empty() {
-        "first".to_owned()
-    } else {
-        format!("after {}", step.depends_on.join(", "))
+    let after = match step.depends_on.first() {
+        Some(first) => format!("after {first}"),
+        None => "first".to_owned(),
     };
     format!("{} · {cadence} · {after}", kind_word(step.kind))
 }
@@ -2335,30 +2399,101 @@ fn log_step_meta(step: &store::StepView) -> String {
     }
 }
 
-/// The graph a run with no `workflow.toml` starts from: the shipped shape.
+/// One step of the default document: every field at its quiet default, off,
+/// waiting for `depends_on`.
+fn new_step(id: &str, kind: StepKind, depends_on: &[&str]) -> Step {
+    Step {
+        id: id.to_owned(),
+        kind,
+        // The accepted default is a menu, not a scaffold: a step arrives off,
+        // and a person turns on the pipeline their repository has.
+        enabled: false,
+        skill: None,
+        harness: None,
+        model: None,
+        effort: None,
+        command: None,
+        cwd: None,
+        timeout_secs: None,
+        depends_on: depends_on.iter().map(|id| (*id).to_owned()).collect(),
+        produces: None,
+        per_task: false,
+        mode: None,
+        push: false,
+    }
+}
+
+/// The graph a repository with no `workflow.toml` starts from: the known
+/// pipeline, every step switched off.
+///
+/// A new repository's editor is a menu, not a scaffold: a person enables the
+/// steps their project has instead of deleting the ones it does not. The shape
+/// is this repository's own `.flow/workflow.toml` — analyze the request, split
+/// it, let a person approve the plan, then per-task code, review and the three
+/// gates, then the version bump, the merge and the closing report — with this
+/// repository's own gate commands. A harness step whose skill this build does
+/// not ship is left out, because preparation refuses a graph naming one.
 fn new_graph() -> Workflow {
+    let ships = |skill: &str| warp_flow_core::skill::NAMES.contains(&skill);
+    let harness = |id: &str, skill: &str, produces: Option<&str>, per_task: bool, on: &[&str]| {
+        let mut step = new_step(id, StepKind::Harness, on);
+        step.skill = Some(skill.to_owned());
+        step.produces = produces.map(str::to_owned);
+        step.per_task = per_task;
+        step
+    };
+    let gate = |id: &str, command: &str, timeout_secs: u64, on: &[&str]| {
+        let mut step = new_step(id, StepKind::Gate, on);
+        step.command = Some(command.to_owned());
+        step.cwd = Some(".".to_owned());
+        step.timeout_secs = Some(timeout_secs);
+        step.per_task = true;
+        step
+    };
+    let mut steps = vec![
+        harness("analyze", "analyze", Some("spec.md"), false, &[]),
+        harness("split", "split", None, false, &["analyze"]),
+        new_step("approve-plan", StepKind::Question, &["split"]),
+        harness("code", "code", None, true, &["approve-plan"]),
+        harness("review", "review", None, true, &["code"]),
+        // The three checks are this repository's own CI, cheapest first, so a
+        // task fails on fmt before it spends half an hour in the test suite.
+        gate("fmt", "cargo fmt --all --check", 300, &["review"]),
+        gate(
+            "clippy",
+            "cargo clippy --locked --all-targets -- -D warnings",
+            1800,
+            &["fmt"],
+        ),
+        gate("test", "cargo test --locked", 1800, &["clippy"]),
+    ];
+    // The version moves once, before the queue lands anything; merge is the
+    // barrier after it and summary is the run's closing report.
+    let mut merge_after = vec!["test"];
+    if ships("bump") {
+        steps.push(harness("bump", "bump", None, false, &["test"]));
+        merge_after = vec!["bump"];
+    }
+    let mut merge = new_step("merge", StepKind::Merge, &merge_after);
+    merge.per_task = true;
+    merge.mode = Some("local".to_owned());
+    merge.push = false;
+    steps.push(merge);
+    if ships("summary") {
+        steps.push(harness(
+            "summary",
+            "summary",
+            Some("summary.md"),
+            false,
+            &["merge"],
+        ));
+    }
     Workflow {
         schema: SCHEMA,
         name: "implement".to_owned(),
         revision: 1,
         max_parallel: 2,
-        steps: vec![Step {
-            id: "analyze".to_owned(),
-            kind: StepKind::Harness,
-            enabled: true,
-            skill: Some("analyze".to_owned()),
-            harness: None,
-            model: None,
-            effort: None,
-            command: None,
-            cwd: None,
-            timeout_secs: None,
-            depends_on: Vec::new(),
-            produces: Some("spec.md".to_owned()),
-            per_task: false,
-            mode: None,
-            push: false,
-        }],
+        steps,
     }
 }
 
@@ -2498,16 +2633,28 @@ fn action_link(
 }
 
 /// One ghost icon control at the control height, under its own selector.
+///
+/// A disabled control wears no handler at all: the arrows are off when the
+/// selected step has no sibling, and a button that dims but still acts would be
+/// a lie about what the click did.
 fn icon_action(
     id: &'static str,
     label: &'static str,
     glyph: &'static str,
+    enabled: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
-    controls::icon_button(SharedString::from(id), label)
+    let button = controls::icon_button(SharedString::from(id), label)
         .debug_selector(move || id.to_owned())
-        .tooltip(tooltip_text(label))
-        .on_click(on_click)
+        .tooltip(tooltip_text(label));
+    // A disabled arrow wears no handler: a step with no sibling to trade places
+    // with has nowhere to go, and a control that dims but still acts is a lie.
+    let button = if enabled {
+        button.on_click(on_click)
+    } else {
+        button.opacity(0.5).cursor_default()
+    };
+    button
         .child(icon(glyph, px(theme::icon_medium()), theme::text_muted()))
         .into_any_element()
 }

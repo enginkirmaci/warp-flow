@@ -4,8 +4,11 @@
 //! A repository row is the design's 64: the star, the name at 15/600 and the age
 //! of its newest run; the second line summarizes its runs as stats in the entity
 //! hues, the two that need a person first, or says there are no runs yet. Hover
-//! gives Open in Station. The row selects the repository, which is what the run
-//! column and the repository detail read.
+//! gives Open in Station and Forget — the list pane is the one place a
+//! repository's lifecycle lives, so forgetting one starts here. Forget takes two
+//! presses (the first arms the row) and never touches the folder on disk. The
+//! row selects the repository, which is what the run column and the repository
+//! detail read.
 
 use gpui::prelude::*;
 use gpui::{AnyElement, Context, FontWeight, MouseButton, SharedString, div, px};
@@ -321,6 +324,17 @@ impl FlowApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let selected = self.selected_repo.as_deref() == Some(repo.path.as_path());
+        let armed = self.is_forget_armed(&repo.path);
+        // The row's place in the configured list: the settings keep the order
+        // the scan reads, and the affordance's selector is that index. A plain
+        // comparison, not `same_path`: this runs in the frame, which must never
+        // touch the filesystem.
+        let index = self
+            .settings
+            .repos
+            .iter()
+            .position(|known| *known == repo.path)
+            .unwrap_or_default();
         let path = repo.path.clone();
         let selector = format!("flow-repo-{}", repo.name);
         let star_selector = format!("flow-repo-star-{}", repo.name);
@@ -341,6 +355,15 @@ impl FlowApp {
         if let Some(note) = &repo.note {
             label.push_str(", ");
             label.push_str(note);
+        }
+        // The row's own a11y text names the affordance, and an armed row says
+        // so in words: the colour change is never the only signal.
+        label.push_str(", can be forgotten from this list");
+        if armed {
+            label.push_str(
+                ", Forget armed: click it again to remove the repository from this list, \
+                 or click anywhere else to cancel",
+            );
         }
 
         let age = repo.newest_age();
@@ -428,6 +451,14 @@ impl FlowApp {
         row = row.child(hover_station(
             &format!("flow-repo-station-{}", repo.name),
             Some(path),
+            cx,
+        ));
+        row = row.child(forget_affordance(
+            index,
+            &repo.name,
+            repo.path.clone(),
+            selected,
+            armed,
             cx,
         ));
         if let Some(note) = &repo.note {
@@ -620,6 +651,93 @@ fn hover_station(
             px(theme::icon_small()),
             theme::text_muted(),
         ))
+        .into_any_element()
+}
+
+/// The row's quiet Forget affordance, beside Open in Station.
+///
+/// The list pane is the one place a repository is added or forgotten
+/// (ADR-0015), so forgetting one starts here. Like Open in Station, it is
+/// drawn only while the row is hovered or selected — never a bare destructive
+/// button — and it takes two presses: the first arms the row and says so in
+/// its label and its a11y text, the second forgets the repository through the
+/// window's one remove path. The folder on disk is never touched, which the
+/// tooltip says outright.
+fn forget_affordance(
+    index: usize,
+    name: &str,
+    path: std::path::PathBuf,
+    selected: bool,
+    armed: bool,
+    cx: &mut Context<FlowApp>,
+) -> AnyElement {
+    // One affordance, two states: the armed frame carries the second-selector
+    // name, so a probe can see that the first press only armed the row.
+    let selector = if armed {
+        format!("flow-list-forget-armed-{index}")
+    } else {
+        format!("flow-list-forget-{index}")
+    };
+    let id = format!("flow-list-forget-{index}");
+    let label = if armed {
+        format!("Click again to forget {name}; the folder on disk is untouched")
+    } else {
+        format!("Forget {name} from this list; the folder on disk is untouched")
+    };
+    let hue = if armed {
+        theme::DANGER
+    } else {
+        theme::text_muted()
+    };
+    let mut chip = div()
+        .id(SharedString::from(id))
+        .debug_selector(move || selector.clone())
+        // the arming state is a real toggle, not just a wash: a screen reader
+        // hears the label change and the pressed state
+        .a11y_toggle(label, armed)
+        .absolute()
+        // the pair is the row's action cluster; Open in Station stays rightmost
+        .top(px(18.))
+        .right(px(42.))
+        .h(px(22.))
+        .px(px(8.))
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .rounded(px(6.))
+        .cursor_pointer()
+        .text_size(px(theme::font_meta()))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(hue)
+        .opacity(if selected || armed { 1. } else { 0. })
+        .group_hover(ROW_GROUP, |style| style.opacity(1.))
+        .tooltip(tooltip_text(
+            "Forget this repository from the list; the folder itself is untouched",
+        ))
+        // the row selects on click, so the affordance keeps its own press
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if this.is_forget_armed(&path) {
+                this.forget_repository(&path, cx);
+            } else {
+                this.arm_forget(&path, cx);
+            }
+        }))
+        .child(icon("icons/icon-trash.svg", px(theme::icon_tiny()), hue));
+    if armed {
+        chip = chip
+            .bg(theme::danger_bg())
+            .border_1()
+            .border_color(theme::DANGER)
+            // The capture pass still sees a press that another control keeps
+            // from reaching the window's root (the star and Open in Station
+            // both stop their own), so an armed row disarms wherever a press
+            // lands outside the affordance.
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.disarm_forget(cx)));
+    } else {
+        chip = chip.hover(|style| style.bg(theme::raised()));
+    }
+    chip.child(if armed { "Click again" } else { "Forget" })
         .into_any_element()
 }
 

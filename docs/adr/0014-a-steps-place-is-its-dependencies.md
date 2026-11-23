@@ -24,9 +24,10 @@ unreadable); position as display order only, with `depends_on` still the truth
 nothing tells them which one won); a separate `after` list beside a positional
 order (two ways to say the same thing).
 
-Consequences: the editor draws waves — the steps that become ready together —
-as bands, and a step's dependencies are edited as a set of chips rather than
-implied by its row. Adding a step asks where it goes: at the front with no
+Consequences: the editor draws the graph as an indented tree — each step sits
+under its first dependency, and every further dependency is a chip on its row —
+and a step's dependencies are edited as a set of chips rather than implied by
+its position. Adding a step asks where it goes: at the front with no
 dependencies, after the selection, or at the end joined to the current leaves.
 A disabled step is transparent: its dependents inherit its own dependencies, so
 disabling a step closes the pipeline over it instead of breaking it. The engine

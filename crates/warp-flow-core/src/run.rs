@@ -1,9 +1,22 @@
 //! The engine loop: ready steps, attempts, repairs, questions and `run.md`.
 //!
-//! The runner is deliberately sequential: it runs one step at a time, writes
-//! `run.md` after every attempt, and stops on the first question or on an
-//! exhausted repair budget. Concurrency across ready tasks is a later step; the
-//! scheduler already honours task blockers and `per_task` steps.
+//! The loop is a scheduler. Each pass collects the enabled steps whose
+//! dependencies are done, expands a `per_task` step across the ready tasks it
+//! has not run for yet, and dispatches up to the workflow's `max_parallel` on
+//! their own threads; every write to the issue folder stays on this thread,
+//! which is what keeps `run.md` single-writer and `questions/` numbering
+//! collision-free. Every report is applied before the next pass, and a step
+//! that fails without its attempt budget left stops the run only after the
+//! reports of the steps that finished beside it are recorded.
+//!
+//! Three rules shape a pass, and none of them is a tie-break. A disabled step
+//! never runs, and its dependents wait for what it waited for instead
+//! ([`Workflow::resolve`]); `run.md` records it once, as `skipped`. A question
+//! stops only its own dependents: independent work keeps being dispatched while
+//! its file is open, and the run reports `waiting` only once nothing else can
+//! make progress. A merge step is a barrier — it waits for everything in flight
+//! and starts nothing while it runs, because the merge queue refuses a checkout
+//! with uncommitted work.
 //!
 //! When the config names a repository, a `per_task` step runs in that task's
 //! worktree and a `merge` step runs the merge queue. The merge step is the only
@@ -283,6 +296,12 @@ pub struct Runner<H> {
     /// started the next step yet, which is what a screen without a live
     /// session shows.
     current_step: Option<String>,
+    /// Questions this run has asked and is waiting on, by step id and task
+    /// number, with the file that holds the open question.
+    ///
+    /// A question is asked once: this is what stops a later pass from writing
+    /// a second file for one decision while the first is still open.
+    pending_questions: BTreeMap<(String, Option<u32>), PathBuf>,
     /// When this run started, as an RFC 3339 UTC timestamp.
     started: String,
     /// Why the run stopped, rendered into `run.md` when it is not `Done`.
@@ -355,6 +374,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
             attempts: BTreeMap::new(),
             rows: Vec::new(),
             current_step: None,
+            pending_questions: BTreeMap::new(),
             started: timestamp(SystemTime::now()),
             note: None,
             resumed: false,
@@ -466,16 +486,58 @@ impl<H: Harness + Send + 'static> Runner<H> {
                     return Ok(status);
                 }
 
+                // A question stops its own dependents and nothing else. It is
+                // asked alone — there is no session to put beside it — and a
+                // later pass that finds its file still open does not ask again:
+                // the answer arrives in that file, not in `run.md`. Steps that
+                // depend on it never become candidates while it is open, which
+                // is all the blocking it needs.
+                if step.kind == StepKind::Question {
+                    let key = (step.id.clone(), task.as_ref().map(|task| task.number));
+                    if self.pending_questions.contains_key(&key) {
+                        // An answer may have arrived while other work ran; if
+                        // it did not, there is nothing to do in this pass.
+                        if self.answered_question(&step, task.as_ref())?.is_none() {
+                            continue;
+                        }
+                        self.pending_questions.remove(&key);
+                    }
+                    // Work already collected in this pass is dispatched before
+                    // the question is asked, so the record's rows and the
+                    // question's arrival stay in the order they happened.
+                    if !jobs.is_empty() {
+                        break;
+                    }
+                    match self.run_step(&step, task.as_ref())? {
+                        StepRun::Done => {
+                            ran = true;
+                            self.mark_done(&step, task.as_ref());
+                            issue = Issue::open(&self.issue)?;
+                        }
+                        StepRun::Waiting(path) => {
+                            self.pending_questions.insert(key, path);
+                            ran = true;
+                        }
+                        StepRun::Blocked => {
+                            self.status = RunStatus::Blocked;
+                            self.write_run()?;
+                            self.log_line("run blocked");
+                            return Ok(RunStatus::Blocked);
+                        }
+                    }
+                    continue;
+                }
+
                 // A merge step is a barrier: it runs alone, and nothing starts
                 // while it does. The merge queue refuses a dirty checkout, and
                 // every step writes `run.md` into it.
-                if step.kind == StepKind::Merge || step.kind == StepKind::Question {
+                if step.kind == StepKind::Merge {
                     if !jobs.is_empty() {
                         break;
                     }
                     match self.run_step(&step, task.as_ref())? {
                         StepRun::Done => {}
-                        StepRun::Waiting => {
+                        StepRun::Waiting(_) => {
                             self.status = RunStatus::Waiting;
                             self.write_run()?;
                             self.log_line("run waiting on a question");
@@ -532,28 +594,43 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 // Name the steps that are about to run before they start, so
                 // `run.md` says what the engine is doing while a session works
                 // — a step can run for minutes, and the record otherwise only
-                // changes when it finishes.
+                // changes when it finishes. A per-task job names its task
+                // (`code@01`): two tasks' jobs of one step sit in the same list,
+                // and a bare id would say "code, code".
                 self.current_step = Some(
                     jobs.iter()
-                        .map(|job| job.step.id.clone())
+                        .map(|job| {
+                            running_label(&job.step.id, job.task.as_ref().map(|task| task.number))
+                        })
                         .collect::<Vec<_>>()
                         .join(", "),
                 );
                 self.write_run()?;
                 let reports = self.dispatch(jobs)?;
+                // Every report is applied, even when an earlier one stops the
+                // run: a step that finished in the same pass still gets its
+                // row and its `mark_done`. The first stopping status is what
+                // the run returns, once nothing is left unrecorded.
+                let mut stopped = None;
                 for report in reports {
                     if let Some(status) = self.apply_report(report)? {
-                        return Ok(status);
+                        stopped.get_or_insert(status);
                     }
+                }
+                if let Some(status) = stopped {
+                    return Ok(status);
                 }
                 issue = Issue::open(&self.issue)?;
             }
 
             let finished = self.graph_done(&issue);
+            // A disabled step never runs, so it is never finished: only the
+            // enabled steps decide whether the run is over.
             if self
                 .workflow
                 .steps
                 .iter()
+                .filter(|step| step.enabled)
                 .all(|step| finished.contains(&step.id))
             {
                 self.status = RunStatus::Done;
@@ -563,6 +640,16 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 return Ok(RunStatus::Done);
             }
             if !ran {
+                // An open question is a person's turn, not a stall: report
+                // `waiting` — and write it — once nothing else in the graph
+                // can advance.
+                if let Some(path) = self.pending_questions.values().next().cloned() {
+                    self.note = Some(format!("waiting on {}", path.display()));
+                    self.status = RunStatus::Waiting;
+                    self.write_run()?;
+                    self.log_line("run waiting on a question");
+                    return Ok(RunStatus::Waiting);
+                }
                 let reason = self.stall_reason(&issue);
                 self.note = Some(reason.clone());
                 self.status = RunStatus::Blocked;
@@ -600,13 +687,19 @@ impl<H: Harness + Send + 'static> Runner<H> {
     /// file, so the scheduler stays the only writer. A harness that cannot be
     /// built or a session that fails comes back as a report, not as an error
     /// that would abandon the other steps in flight.
+    ///
+    /// A worker that could not be started, or one that panicked, is still an
+    /// error — but only after every handle already spawned has been joined: a
+    /// dropped `JoinHandle` detaches its thread, and a detached worker keeps
+    /// writing into the checkout after the run has reported the failure.
     fn dispatch(&mut self, jobs: Vec<StepJob>) -> Result<Vec<StepReport>> {
         let factory = self.harness_factory.clone();
         let mut handles = Vec::with_capacity(jobs.len());
+        let mut spawn_error = None;
         for job in jobs {
             let factory = Arc::clone(&factory);
             let issue = self.issue.clone();
-            let handle = std::thread::Builder::new()
+            let spawned = std::thread::Builder::new()
                 .name(format!("warp-flow-step-{}", job.step.id))
                 .spawn(move || {
                     let failure_outcome = job.work.failure_outcome();
@@ -645,16 +738,28 @@ impl<H: Harness + Send + 'static> Runner<H> {
                         failure_outcome,
                         result,
                     }
-                })
-                .map_err(|error| Error::Run(format!("cannot start a step worker: {error}")))?;
-            handles.push(handle);
+                });
+            match spawned {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    spawn_error = Some(Error::Run(format!("cannot start a step worker: {error}")));
+                    break;
+                }
+            }
         }
         let mut reports = Vec::with_capacity(handles.len());
+        let mut panicked = false;
         for handle in handles {
-            let report = handle
-                .join()
-                .map_err(|_| Error::Run("a step worker panicked".to_owned()))?;
-            reports.push(report);
+            match handle.join() {
+                Ok(report) => reports.push(report),
+                Err(_) => panicked = true,
+            }
+        }
+        if let Some(error) = spawn_error {
+            return Err(error);
+        }
+        if panicked {
+            return Err(Error::Run("a step worker panicked".to_owned()));
         }
         Ok(reports)
     }
@@ -737,13 +842,27 @@ impl<H: Harness + Send + 'static> Runner<H> {
     }
 
     /// Reset the in-memory run and write the initial `run.md`.
+    ///
+    /// A fresh run is also where the disabled steps are recorded: one `skipped`
+    /// row per disabled step, in declaration order, before the first step runs.
+    /// A resume replays `run.md` and must not append them again, which is why
+    /// this is here and not in the loop.
     fn start(&mut self) -> Result<()> {
         self.status = RunStatus::Running;
         self.done.clear();
         self.completed.clear();
         self.rows.clear();
+        self.pending_questions.clear();
         self.note = None;
-        self.started = timestamp(SystemTime::now());
+        // One timestamp for the record and the skipped rows: they are written
+        // together, before anything runs.
+        let now = timestamp(SystemTime::now());
+        self.started = now.clone();
+        // A disabled step makes no attempt, so its row's attempt stays 0: the
+        // step is part of the run's record without ever having been run.
+        for step in self.workflow.steps.iter().filter(|step| !step.enabled) {
+            self.rows.push(row_line(&step.id, None, 0, "skipped", &now));
+        }
         self.write_run()?;
         let line = format!(
             "run: `{}` revision {} on {}",
@@ -760,7 +879,9 @@ impl<H: Harness + Send + 'static> Runner<H> {
     /// Rows are read in order because the last row for a step and task wins: a
     /// step is complete only when its latest row is one of the successful
     /// outcomes. A step or task the graph no longer has stays in the record but
-    /// contributes nothing to the sets.
+    /// contributes nothing to the sets. A `skipped` row is a disabled step that
+    /// never ran: it is neither a success nor a failure, so it leaves the step
+    /// exactly where the graph has it — out of the work list for being disabled.
     fn load_run(&mut self) -> Result<()> {
         let path = self.issue.join("run.md");
         let text = match fs::read_to_string(&path) {
@@ -778,11 +899,15 @@ impl<H: Harness + Send + 'static> Runner<H> {
         self.done.clear();
         self.completed.clear();
         self.rows.clear();
+        self.pending_questions.clear();
         for line in document.body.split_inclusive('\n') {
             let Some(row) = LogRow::parse(line) else {
                 continue;
             };
             self.rows.push(row.line);
+            if row.outcome == "skipped" {
+                continue;
+            }
             let Some(step) = self.workflow.step(&row.step) else {
                 continue;
             };
@@ -811,13 +936,16 @@ impl<H: Harness + Send + 'static> Runner<H> {
 
     /// The steps that may run in this pass, in declaration order.
     ///
-    /// A non-per-task step needs every dependency in the graph-done set. A
-    /// per-task step only needs its non-per-task dependencies there; its
-    /// per-task dependencies are checked for one task at a time.
+    /// A disabled step is never a candidate: it does not run, and its dependents
+    /// are made ready by [`Workflow::resolve`] instead. A non-per-task step
+    /// needs every resolved dependency in the graph-done set. A per-task step
+    /// needs the same there; its own outstanding tasks are expanded when the
+    /// work list is built.
     fn candidate_ids(&self) -> Vec<String> {
         self.workflow
             .steps
             .iter()
+            .filter(|step| step.enabled)
             .filter(|step| self.deps_met(step, None))
             .filter(|step| step.per_task || !self.done.contains(&step.id))
             .map(|step| step.id.clone())
@@ -826,8 +954,10 @@ impl<H: Harness + Send + 'static> Runner<H> {
 
     /// Whether `step`'s dependencies are met, either for the graph (`task` is
     /// `None`) or for one task.
-    /// Whether `step`'s dependencies are met, either for the graph (`task` is
-    /// `None`) or for one task.
+    ///
+    /// A disabled dependency is looked through by [`Workflow::resolve`]: it
+    /// never runs, so waiting for it would wait forever, and its dependents wait
+    /// for what it waited for instead.
     ///
     /// A per-task step waits for its non-per-task dependencies to be done for
     /// the graph, and for its per-task ones to be done for *its* task. A
@@ -836,7 +966,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
     /// lets a step after the task lanes (`bump`, `summary`) run once, at the
     /// end, instead of once per task.
     fn deps_met(&self, step: &Step, task: Option<u32>) -> bool {
-        step.depends_on.iter().all(|dependency| {
+        self.workflow.resolve(step).iter().all(|dependency| {
             let Some(dependency) = self.workflow.step(dependency) else {
                 return false;
             };
@@ -845,6 +975,11 @@ impl<H: Harness + Send + 'static> Runner<H> {
                     .completed
                     .get(&dependency.id)
                     .is_some_and(|numbers| numbers.contains(&number)),
+                // A per-task step's per-task dependencies are measured one task
+                // at a time, in `eligible_task`. Requiring them here too would
+                // ask for every task to have the step before any task could
+                // start it, which deadlocks a per-task chain.
+                None if step.per_task && dependency.per_task => true,
                 _ => self.done.contains(&dependency.id),
             }
         })
@@ -857,7 +992,12 @@ impl<H: Harness + Send + 'static> Runner<H> {
     /// task lanes start, and what lets a run finish.
     fn graph_done(&self, issue: &Issue) -> BTreeSet<String> {
         let mut done = self.done.clone();
-        for step in self.workflow.steps.iter().filter(|step| step.per_task) {
+        for step in self
+            .workflow
+            .steps
+            .iter()
+            .filter(|step| step.enabled && step.per_task)
+        {
             let complete = issue.tasks().iter().all(|task| {
                 task.status.is_resolved()
                     || self
@@ -902,6 +1042,14 @@ impl<H: Harness + Send + 'static> Runner<H> {
                     self.log_line(&line);
                     return Ok(StepRun::Done);
                 }
+                // An open question is the same decision still waiting: asking
+                // again would write a second file for one answer, so the run
+                // waits on the file it already has.
+                if let Some(path) = self.open_question(step, task)? {
+                    let line = format!("{label}: still waiting on {}", path.display());
+                    self.log_line(&line);
+                    return Ok(StepRun::Waiting(path));
+                }
                 let path = self.write_question(step, task)?;
                 self.record_row(step, task, 1, "waiting")?;
                 self.note = Some(format!("waiting on {}", path.display()));
@@ -910,7 +1058,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
                     path.display()
                 );
                 self.log_line(&line);
-                return Ok(StepRun::Waiting);
+                return Ok(StepRun::Waiting(path));
             }
             StepKind::Merge => return self.run_merge_step(step, task),
             StepKind::Gate | StepKind::Harness => {}
@@ -1045,10 +1193,28 @@ impl<H: Harness + Send + 'static> Runner<H> {
     }
 
     /// The newest answered question for this step and task, if one exists.
+    fn answered_question(&self, step: &Step, task: Option<&Task>) -> Result<Option<PathBuf>> {
+        self.question_in_state(step, task, "answered")
+    }
+
+    /// The newest question for this step and task that is still open.
+    ///
+    /// This is how a run that found an unanswered question waits on it instead
+    /// of asking it again.
+    fn open_question(&self, step: &Step, task: Option<&Task>) -> Result<Option<PathBuf>> {
+        self.question_in_state(step, task, "open")
+    }
+
+    /// The newest question for this step and task whose `state:` is `state`.
     ///
     /// A question file names the step that asked it; a per-task question also
     /// names its task, so two tasks' answers never stand in for one another.
-    fn answered_question(&self, step: &Step, task: Option<&Task>) -> Result<Option<PathBuf>> {
+    fn question_in_state(
+        &self,
+        step: &Step,
+        task: Option<&Task>,
+        state: &str,
+    ) -> Result<Option<PathBuf>> {
         let dir = self.issue.join("questions");
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -1068,7 +1234,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
 
         for path in paths {
             let document = Document::read(&path)?;
-            if document.front.get("state") != Some("answered") {
+            if document.front.get("state") != Some(state) {
                 continue;
             }
             if document.front.get("asked_by") != Some(step.id.as_str()) {
@@ -1211,24 +1377,22 @@ impl<H: Harness + Send + 'static> Runner<H> {
         }
     }
 
-    /// The gates the merge queue runs for `step`: the gate steps it depends on,
-    /// in graph order.
+    /// The gates the merge queue runs for `step`: every enabled gate step above
+    /// it, in graph order.
     ///
     /// A rebase changes the branch the gates measured, so the merge re-runs
     /// them on the rebased tree. Which gates those are is the graph's answer
     /// (ADR-0015): a gate step the merge does not depend on does not gate the
-    /// merge. Disabled gate steps are skipped, and a gate step's own `cwd` is
-    /// resolved against the worktree the merge measures.
+    /// merge. The whole chain counts, not only the direct dependencies — a
+    /// merge below `test` which sits below `lint` runs both — so this asks the
+    /// graph for its ancestors rather than for [`Workflow::resolve`], which
+    /// stops at an enabled step. Disabled gate steps are transparent, and a
+    /// gate step's own `cwd` is resolved against the worktree the merge
+    /// measures.
     fn merge_gates(&self, step: &Step) -> Result<Vec<Gate>> {
         let mut gates = Vec::new();
-        for dependency in self.workflow.resolve(step) {
-            let Some(dependency) = self.workflow.step(&dependency) else {
-                continue;
-            };
-            if dependency.kind != StepKind::Gate {
-                continue;
-            }
-            gates.push(dependency.gate()?);
+        for ancestor in self.workflow.gate_ancestors(step) {
+            gates.push(ancestor.gate()?);
         }
         Ok(gates)
     }
@@ -1423,10 +1587,12 @@ impl<H: Harness + Send + 'static> Runner<H> {
         outcome: &str,
     ) -> Result<()> {
         let at = timestamp(SystemTime::now());
-        let task_cell = task.map_or_else(|| "-".to_owned(), |task| format!("{:02}", task.number));
-        self.rows.push(format!(
-            "| {} | {} | {attempt} | {outcome} | {at} |\n",
-            step.id, task_cell
+        self.rows.push(row_line(
+            &step.id,
+            task.map(|task| task.number),
+            attempt,
+            outcome,
+            &at,
         ));
         self.write_run()
     }
@@ -1483,7 +1649,9 @@ impl<H: Harness + Send + 'static> Runner<H> {
 /// A step's attempt loop outcome.
 enum StepRun {
     Done,
-    Waiting,
+    /// The step is waiting on an open question; the path is the file that holds
+    /// it, so the run can name what it waits for without asking again.
+    Waiting(PathBuf),
     Blocked,
 }
 
@@ -1566,6 +1734,25 @@ fn step_label(step: &Step, task: Option<&Task>) -> String {
         Some(task) => format!("{}/{:02}", step.id, task.number),
         None => step.id.clone(),
     }
+}
+
+/// One job as `run.md`'s `running:` names it: `code@01` for a task's job, the
+/// bare step id for a step that runs once.
+///
+/// The `@task` suffix is not decoration: the store's reader splits every entry
+/// on `@` to find the step it names, so two tasks' jobs of one step are two
+/// distinct entries instead of the literal `code, code`.
+fn running_label(step: &str, task: Option<u32>) -> String {
+    match task {
+        Some(number) => format!("{step}@{number:02}"),
+        None => step.to_owned(),
+    }
+}
+
+/// One row of `run.md`'s log table.
+fn row_line(step: &str, task: Option<u32>, attempt: u32, outcome: &str, at: &str) -> String {
+    let task_cell = task.map_or_else(|| "-".to_owned(), |number| format!("{number:02}"));
+    format!("| {step} | {task_cell} | {attempt} | {outcome} | {at} |\n")
 }
 
 /// Run one git command in `dir` with no terminal prompt.
@@ -2989,5 +3176,600 @@ skill = "code"
             0,
             "gate steps open no harness session"
         );
+    }
+
+    #[test]
+    fn a_disabled_step_is_never_called() {
+        // `off` sits between `analyze` and `code` and is switched off: it is
+        // not dispatched, and it does not hold `code` back either.
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let mut harness = FakeHarness::new();
+        harness.script(
+            "analyze",
+            Scripted::Done {
+                files: Vec::new(),
+                text: "analyzed".to_owned(),
+            },
+        );
+        harness.script(
+            "code",
+            Scripted::Done {
+                files: Vec::new(),
+                text: "coded".to_owned(),
+            },
+        );
+        let workflow = workflow(
+            r#"
+schema = 2
+name = "implement"
+revision = 1
+
+[[step]]
+id = "analyze"
+kind = "harness"
+skill = "analyze"
+
+[[step]]
+id = "off"
+kind = "harness"
+skill = "code"
+enabled = false
+depends_on = ["analyze"]
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+depends_on = ["off"]
+"#,
+        );
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.workdir = dir.path().to_path_buf();
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+        let called: Vec<String> = runner
+            .harness()
+            .calls()
+            .iter()
+            .map(|call| call.step.id.clone())
+            .collect();
+        assert_eq!(
+            called,
+            vec!["analyze".to_owned(), "code".to_owned()],
+            "a disabled step is never handed to a harness"
+        );
+        let document = run_md(&issue);
+        assert_eq!(
+            document.body.matches("| off |").count(),
+            1,
+            "the only row for a disabled step is its skipped row: {}",
+            document.body
+        );
+        assert!(
+            !document.body.contains("| off | - | 1 |"),
+            "{}",
+            document.body
+        );
+    }
+
+    #[test]
+    fn a_disabled_steps_dependent_waits_on_what_the_disabled_step_waited_for() {
+        // `code` depends only on `off`, which is disabled and depended on
+        // `prepare`. Waiting for `off` would wait forever, so `code` waits for
+        // what `off` waited for: it runs, and only after `prepare`.
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let mut harness = FakeHarness::new();
+        harness.script(
+            "code",
+            Scripted::Done {
+                files: Vec::new(),
+                text: "coded".to_owned(),
+            },
+        );
+        let workflow = workflow(
+            r#"
+schema = 2
+name = "implement"
+revision = 1
+
+[[step]]
+id = "prepare"
+kind = "gate"
+command = "true"
+cwd = "."
+timeout_secs = 5
+
+[[step]]
+id = "off"
+kind = "harness"
+skill = "code"
+enabled = false
+depends_on = ["prepare"]
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+depends_on = ["off"]
+"#,
+        );
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.workdir = dir.path().to_path_buf();
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+        let calls = runner.harness().calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "only the dependent opened a session: {:?}",
+            calls.iter().map(|call| &call.step.id).collect::<Vec<_>>()
+        );
+        assert_eq!(calls[0].step.id, "code");
+        let document = run_md(&issue);
+        let prepare = document
+            .body
+            .find("| prepare | - | 1 | passed |")
+            .expect("the gate ran");
+        let code = document
+            .body
+            .find("| code | - | 1 | done |")
+            .expect("the dependent ran");
+        assert!(
+            prepare < code,
+            "the dependent inherits the disabled step's dependencies: {}",
+            document.body
+        );
+    }
+
+    #[test]
+    fn a_disabled_merge_step_does_not_merge() {
+        // The task's branch has a commit to land, and the merge step that would
+        // land it is switched off: nothing may merge, and the run still ends
+        // rather than waiting for a step that will never run.
+        let dir = TempDir::new();
+        let root = repository(&dir);
+        let issue = issue_in(&root);
+        let mut graph = Workflow::parse(MERGE_WORKFLOW).expect("workflow parses");
+        let merge = graph
+            .steps
+            .iter_mut()
+            .find(|step| step.kind == StepKind::Merge)
+            .expect("the workflow names a merge step");
+        merge.enabled = false;
+        graph
+            .validate()
+            .expect("a disabled merge step still validates");
+
+        let mut config = RunnerConfig::new(&issue, graph, CommittingHarness::default());
+        config.workdir = root.clone();
+        config.repo = Some(Repo::open(&root).expect("repo opens"));
+        config.max_attempts = 2;
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+        let document = run_md(&issue);
+        assert!(
+            document.body.contains("| merge | - | 0 | skipped |"),
+            "{}",
+            document.body
+        );
+        assert!(
+            !document.body.contains("| merge | 01 |"),
+            "a disabled merge step does not merge: {}",
+            document.body
+        );
+        assert_eq!(
+            run_git(&root, &["log", "--merges", "--format=%s", "main"]),
+            "",
+            "no merge commit was made"
+        );
+        assert!(!root.join("feature.txt").exists(), "nothing landed on main");
+        assert_eq!(
+            Issue::open(&issue)
+                .expect("issue reopens")
+                .task(1)
+                .expect("task 1")
+                .status,
+            Status::ReadyForAgent,
+            "only a merge step resolves a task"
+        );
+    }
+
+    #[test]
+    fn a_disabled_question_step_does_not_ask() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let mut harness = FakeHarness::new();
+        harness.script(
+            "code",
+            Scripted::Done {
+                files: Vec::new(),
+                text: "coded".to_owned(),
+            },
+        );
+        let workflow = workflow(
+            r#"
+schema = 2
+name = "implement"
+revision = 1
+
+[[step]]
+id = "ask"
+kind = "question"
+enabled = false
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+depends_on = ["ask"]
+"#,
+        );
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.workdir = dir.path().to_path_buf();
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+        assert!(
+            !issue.join("questions").exists(),
+            "a disabled question step asks nothing"
+        );
+        let called: Vec<String> = runner
+            .harness()
+            .calls()
+            .iter()
+            .map(|call| call.step.id.clone())
+            .collect();
+        assert_eq!(called, vec!["code".to_owned()]);
+        assert!(
+            run_md(&issue).body.contains("| ask | - | 0 | skipped |"),
+            "{}",
+            run_md(&issue).body
+        );
+    }
+
+    #[test]
+    fn a_merge_runs_every_gate_above_it() {
+        // `merge` depends on `code`, which waits for `test`, which waits for
+        // `lint`: the merge re-runs both gates, not only its direct dependency.
+        let dir = TempDir::new();
+        let root = repository(&dir);
+        let issue = issue_in(&root);
+        let graph = workflow(
+            r#"
+schema = 2
+name = "implement"
+revision = 1
+
+[[step]]
+id = "lint"
+kind = "gate"
+command = "true"
+cwd = "."
+timeout_secs = 5
+
+[[step]]
+id = "test"
+kind = "gate"
+command = "true"
+cwd = "."
+timeout_secs = 5
+depends_on = ["lint"]
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+per_task = true
+depends_on = ["test"]
+
+[[step]]
+id = "merge"
+kind = "merge"
+per_task = true
+mode = "local"
+depends_on = ["code"]
+"#,
+        );
+        let mut config = RunnerConfig::new(&issue, graph, FakeHarness::new());
+        config.workdir = root.clone();
+        config.repo = Some(Repo::open(&root).expect("repo opens"));
+        let runner = Runner::new(config).expect("runner");
+        let merge = runner
+            .workflow
+            .step("merge")
+            .expect("the graph names a merge step");
+        let gates: Vec<String> = runner
+            .merge_gates(merge)
+            .expect("the gates resolve")
+            .into_iter()
+            .map(|gate| gate.name)
+            .collect();
+        assert_eq!(
+            gates,
+            vec!["lint".to_owned(), "test".to_owned()],
+            "the merge runs the whole gate chain in declaration order"
+        );
+    }
+
+    #[test]
+    fn a_fresh_run_records_a_disabled_step_as_skipped_once() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let graph = workflow(
+            r#"
+schema = 2
+name = "implement"
+revision = 1
+
+[[step]]
+id = "analyze"
+kind = "harness"
+skill = "analyze"
+
+[[step]]
+id = "off"
+kind = "harness"
+skill = "code"
+enabled = false
+depends_on = ["analyze"]
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+depends_on = ["off"]
+"#,
+        );
+        let mut harness = FakeHarness::new();
+        harness.script(
+            "analyze",
+            Scripted::Done {
+                files: Vec::new(),
+                text: "analyzed".to_owned(),
+            },
+        );
+        harness.script(
+            "code",
+            Scripted::Done {
+                files: Vec::new(),
+                text: "coded".to_owned(),
+            },
+        );
+        let mut config = RunnerConfig::new(&issue, graph.clone(), harness);
+        config.workdir = dir.path().to_path_buf();
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+        let document = run_md(&issue);
+        let skipped = document
+            .body
+            .find("| off | - | 0 | skipped |")
+            .expect("a disabled step is recorded as skipped");
+        let analyze = document
+            .body
+            .find("| analyze | - | 1 | done |")
+            .expect("the first step ran");
+        assert!(
+            skipped < analyze,
+            "the skipped rows are written before the first step runs: {}",
+            document.body
+        );
+        assert_eq!(document.body.matches("| off |").count(), 1);
+
+        // A resume replays `run.md`: the row is kept, and not written again.
+        let mut resumed =
+            Runner::resume(RunnerConfig::new(&issue, graph, FakeHarness::new())).expect("resume");
+        assert_eq!(resumed.run().expect("resumed run"), RunStatus::Done);
+        let document = run_md(&issue);
+        assert_eq!(
+            document.body.matches("| off |").count(),
+            1,
+            "a skipped row is not appended again on resume: {}",
+            document.body
+        );
+        assert!(
+            resumed.harness().calls().is_empty(),
+            "a skipped row must not resurrect a disabled step into the work list"
+        );
+    }
+
+    #[test]
+    fn running_names_the_task_of_a_per_task_job() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        fs::write(
+            issue.join("issues/01-first.md"),
+            task_text(1, "First task", "ready-for-agent"),
+        )
+        .expect("task");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let workflow = workflow(
+            r#"
+schema = 2
+name = "implement"
+revision = 1
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+per_task = true
+"#,
+        );
+        let mut config = RunnerConfig::new(
+            &issue,
+            workflow,
+            ReadingHarness {
+                issue: issue.clone(),
+                seen: Arc::clone(&seen),
+            },
+        );
+        config.workdir = dir.path().to_path_buf();
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+        assert_eq!(
+            *seen.lock().expect("seen lock"),
+            vec!["running/code@01".to_owned()],
+            "a per-task job names its task in `running:`"
+        );
+        assert_eq!(
+            run_md(&issue).front.get("running"),
+            Some("code@01"),
+            "two tasks' jobs of one step are two entries, not `code, code`"
+        );
+    }
+
+    #[test]
+    fn a_question_does_not_stop_an_independent_ready_step() {
+        // `code` does not depend on the question and must run while the
+        // question is open; `after` does depend on it and must not.
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let graph = workflow(
+            r#"
+schema = 2
+name = "implement"
+revision = 1
+
+[[step]]
+id = "ask"
+kind = "question"
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+
+[[step]]
+id = "after"
+kind = "harness"
+skill = "code"
+depends_on = ["ask"]
+"#,
+        );
+        let mut harness = FakeHarness::new();
+        harness.script(
+            "code",
+            Scripted::Done {
+                files: Vec::new(),
+                text: "coded".to_owned(),
+            },
+        );
+        let mut config = RunnerConfig::new(&issue, graph.clone(), harness);
+        config.workdir = dir.path().to_path_buf();
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Waiting);
+        let called: Vec<String> = runner
+            .harness()
+            .calls()
+            .iter()
+            .map(|call| call.step.id.clone())
+            .collect();
+        assert_eq!(
+            called,
+            vec!["code".to_owned()],
+            "the independent step ran, the dependent one waited"
+        );
+        assert!(issue.join("questions/01.md").is_file());
+        let document = run_md(&issue);
+        assert!(
+            document.body.contains("| code | - | 1 | done |"),
+            "work that finished beside the question is recorded: {}",
+            document.body
+        );
+        assert_eq!(document.front.get("status"), Some("waiting"));
+
+        // The question is open, not re-asked: a resume waits on the file it
+        // already has.
+        let mut resumed =
+            Runner::resume(RunnerConfig::new(&issue, graph, FakeHarness::new())).expect("resume");
+        assert_eq!(resumed.run().expect("resumed run"), RunStatus::Waiting);
+        assert!(
+            !issue.join("questions/02.md").exists(),
+            "an open question is not asked again"
+        );
+        assert!(
+            resumed.harness().calls().is_empty(),
+            "nothing was left to run"
+        );
+    }
+
+    /// A harness that blocks for task 01 and finishes for every other task, so
+    /// one pass has both a failure and a success to apply.
+    #[derive(Clone, Default)]
+    struct MixedHarness {
+        calls: Arc<Mutex<Vec<StepRequest>>>,
+    }
+
+    impl Harness for MixedHarness {
+        fn run(&mut self, request: &StepRequest) -> Result<StepOutcome> {
+            self.calls.lock().expect("calls lock").push(request.clone());
+            if request.task == Some(1) {
+                Ok(StepOutcome::Blocked {
+                    reason: "task 01 broke".to_owned(),
+                })
+            } else {
+                Ok(StepOutcome::Done {
+                    wrote: Vec::new(),
+                    text: "done".to_owned(),
+                })
+            }
+        }
+    }
+
+    #[test]
+    fn a_failure_still_records_a_step_that_finished_in_the_same_pass() {
+        let dir = TempDir::new();
+        let (root, issue) = two_task_repo(&dir);
+        let workflow = workflow(
+            r#"
+schema = 2
+name = "implement"
+revision = 1
+max_parallel = 2
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+per_task = true
+"#,
+        );
+        let harness = MixedHarness::default();
+        let calls = Arc::clone(&harness.calls);
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.workdir = root.clone();
+        config.repo = Some(Repo::open(&root).expect("repo opens"));
+        config.max_attempts = 1;
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Blocked);
+        assert_eq!(
+            calls.lock().expect("calls lock").len(),
+            2,
+            "both tasks' sessions ran in the same pass"
+        );
+        let document = run_md(&issue);
+        assert!(
+            document.body.contains("| code | 01 | 1 | blocked |"),
+            "{}",
+            document.body
+        );
+        assert!(
+            document.body.contains("| code | 02 | 1 | done |"),
+            "a step that finished beside the failure is still recorded: {}",
+            document.body
+        );
+        assert_eq!(document.front.get("status"), Some("blocked"));
+        assert!(issue.join("repairs/01.md").is_file());
     }
 }

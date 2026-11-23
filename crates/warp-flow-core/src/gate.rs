@@ -35,7 +35,8 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// A check a step's result must pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Gate {
-    /// The name a workflow's `gate = "..."` refers to.
+    /// The id of the gate step this gate was built from: what the engine
+    /// reports the outcome under.
     pub name: String,
     /// The shell command, run through `sh -c` on Unix.
     pub command: String,

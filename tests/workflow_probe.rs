@@ -61,6 +61,69 @@ command = "cargo test"
 depends_on = ["code"]
 "#;
 
+/// A graph whose declaration order is not its tree order: `test` is declared
+/// second, waits for `review` first, and joins back to `analyze`.
+const TREE: &str = r#"
+schema = 2
+name = "tree"
+revision = 2
+max_parallel = 2
+
+[[step]]
+id = "analyze"
+kind = "harness"
+skill = "analyze"
+
+[[step]]
+id = "test"
+kind = "gate"
+command = "cargo test"
+depends_on = ["review", "analyze"]
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+depends_on = ["analyze"]
+
+[[step]]
+id = "review"
+kind = "harness"
+skill = "review"
+depends_on = ["code"]
+"#;
+
+/// Two roots, and two children of the first: a step's siblings are the steps
+/// with the same parent, and nothing else.
+const SIBLINGS: &str = r#"
+schema = 2
+name = "siblings"
+revision = 3
+max_parallel = 2
+
+[[step]]
+id = "first"
+kind = "harness"
+skill = "analyze"
+
+[[step]]
+id = "second"
+kind = "harness"
+skill = "analyze"
+
+[[step]]
+id = "left"
+kind = "harness"
+skill = "code"
+depends_on = ["first"]
+
+[[step]]
+id = "right"
+kind = "harness"
+skill = "code"
+depends_on = ["first"]
+"#;
+
 /// A committed throwaway repository with one issue folder.
 fn seed_repo(home: &Path, workflow: Option<&str>) -> (PathBuf, PathBuf) {
     let repo = home.join("repo");
@@ -140,6 +203,38 @@ fn set_field(cx: &mut VisualTestContext, name: &str, value: &str) {
     settle(cx);
     cx.simulate_input(value);
     settle(cx);
+}
+
+/// A row's left edge in window pixels: its indent in the list's tree.
+fn indent_of(cx: &mut VisualTestContext, index: usize) -> f32 {
+    let bounds = cx
+        .debug_bounds(selector(&format!("flow-workflow-indent-{index}")))
+        .unwrap_or_else(|| panic!("row {index} has an indent selector"));
+    f32::from(bounds.origin.x)
+}
+
+/// A row's top edge in window pixels: where the tree draws it.
+fn row_top(cx: &mut VisualTestContext, index: usize) -> f32 {
+    let bounds = cx
+        .debug_bounds(selector(&format!("flow-workflow-step-{index}")))
+        .unwrap_or_else(|| panic!("step {index} is a row in the list"));
+    f32::from(bounds.origin.y)
+}
+
+/// The graph's step ids in declaration order, for a probe that reorders them.
+fn step_ids(handle: &gpui::WindowHandle<ScreenHost>, cx: &mut VisualTestContext) -> Vec<String> {
+    handle
+        .read_with(cx, |host, cx| {
+            host.0.read(cx).graph_for_probe().map(|graph| {
+                graph
+                    .steps
+                    .iter()
+                    .map(|step| step.id.clone())
+                    .collect::<Vec<String>>()
+            })
+        })
+        .expect("the window is open")
+        .expect("a graph")
 }
 
 fn screen_run(repo: &Path) -> ScreenRun {
@@ -252,8 +347,12 @@ fn a_run_with_no_workflow_starts_from_the_shipped_shape(cx: &mut TestAppContext)
         .read_with(cx, |host, cx| host.0.read(cx).graph_for_probe().cloned())
         .expect("the window is open")
         .expect("a graph is offered");
-    assert_eq!(graph.steps.len(), 1);
+    assert_eq!(graph.steps.len(), 11, "the known pipeline, not one step");
     assert_eq!(graph.steps[0].id, "analyze");
+    assert!(
+        graph.steps.iter().all(|step| !step.enabled),
+        "the default document is a menu: every step arrives off"
+    );
     assert!(!warp_flow_core::layout::pinned_workflow(&issue).is_file());
 
     // saving with no file creates it
@@ -261,7 +360,11 @@ fn a_run_with_no_workflow_starts_from_the_shipped_shape(cx: &mut TestAppContext)
     click(cx, "flow-workflow-save");
     let on_disk = Workflow::read(warp_flow_core::layout::pinned_workflow(&issue))
         .expect("the editor created the file");
-    assert_eq!(on_disk.steps.len(), 2);
+    assert_eq!(
+        on_disk.steps.len(),
+        12,
+        "the default document, plus the step the editor added"
+    );
     assert_eq!(on_disk.revision, 2, "a fresh graph starts at revision 1");
 
     let _ = std::fs::remove_dir_all(&home);
@@ -311,10 +414,14 @@ fn the_repository_template_is_what_the_repos_tab_edits(cx: &mut TestAppContext) 
             "step {index} is a row in the list"
         );
     }
-    // and the rows are grouped into waves: analyze alone, then code, then check
-    assert!(cx.debug_bounds("flow-workflow-wave-0").is_some());
-    assert!(cx.debug_bounds("flow-workflow-wave-1").is_some());
-    assert!(cx.debug_bounds("flow-workflow-wave-2").is_some());
+    // and the rows are an indented tree: analyze is the root, code sits under
+    // it, and check under code
+    let root = indent_of(cx, 0);
+    let child = indent_of(cx, 1);
+    assert!(
+        child > root,
+        "a child is indented under its parent: {root} vs {child}"
+    );
 
     // an edit, then a save: a save appends a revision to the repository's file,
     // not to an issue copy
@@ -547,7 +654,8 @@ fn a_gate_step_edits_its_folder_and_timeout(cx: &mut TestAppContext) {
 }
 
 /// A file that will not parse is left alone: the editor refuses to offer the
-/// shipped shape over it, because Save would replace nine steps with one.
+/// default document over it, because Save would replace the graph a person
+/// wrote with the all-off menu.
 #[gpui_kit::gpui::test]
 fn a_broken_template_is_not_overwritten(cx: &mut TestAppContext) {
     let _guard = hold_home();
@@ -584,6 +692,322 @@ fn a_broken_template_is_not_overwritten(cx: &mut TestAppContext) {
     // and the file is byte-for-byte what it was
     let after = std::fs::read_to_string(&path).expect("the file is still there");
     assert_eq!(after, broken, "the file was never touched");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The step list is an indented tree: a step sits one level under the step it
+/// waits for first, its children follow it depth first, and a later dependency
+/// is a chip on the row rather than a band of its own.
+#[gpui_kit::gpui::test]
+fn the_step_list_is_an_indented_tree(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("tree");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let (repo, _issue) = seed_repo(&home, Some(WORKFLOW));
+    std::fs::write(warp_flow_core::layout::workflow_file(&repo), TREE)
+        .expect("the repository template");
+
+    let host = Arc::new(Host::new());
+    let handle = cx.open_window(size(px(1200.), px(860.)), |_window, cx| {
+        let screen = cx.new(|cx| WorkflowScreen::new(Arc::clone(&host), cx));
+        screen.update(cx, |screen, cx| {
+            screen.show_repository(repo.clone(), cx);
+        });
+        ScreenHost(screen)
+    });
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    // the tree hangs each step under the dependency it names first:
+    // analyze(0) → code(2) → review(3) → test(1), so the declaration order and
+    // the drawing order differ on purpose
+    let root = indent_of(cx, 0);
+    let child = indent_of(cx, 2);
+    let grandchild = indent_of(cx, 3);
+    let join = indent_of(cx, 1);
+    assert!(
+        child > root,
+        "code is indented under analyze: {root} vs {child}"
+    );
+    assert!(grandchild > child, "review is indented under code");
+    assert!(
+        join > grandchild,
+        "the join waits for review first, so it hangs under it"
+    );
+    let level = child - root;
+    assert!(
+        (level - 14.).abs() < 1.5,
+        "one level is a small step, about 14px: {level}"
+    );
+    assert!((grandchild - child - level).abs() < 1.5);
+    assert!((join - grandchild - level).abs() < 1.5);
+
+    // and the rows are drawn depth first, not in declaration order
+    assert!(row_top(cx, 0) < row_top(cx, 2));
+    assert!(row_top(cx, 2) < row_top(cx, 3));
+    assert!(
+        row_top(cx, 3) < row_top(cx, 1),
+        "the join is drawn last even though it is declared second"
+    );
+    assert!(
+        cx.debug_bounds("flow-workflow-step-4").is_none(),
+        "every step is drawn exactly once"
+    );
+
+    // the extra dependency is a chip, and a step with one dependency has none
+    let chip = cx
+        .debug_bounds("flow-workflow-join-1-analyze")
+        .expect("the join's second dependency is a chip on its row");
+    let join_row = cx
+        .debug_bounds("flow-workflow-step-1")
+        .expect("the join's row is drawn");
+    assert!(
+        chip.origin.x >= join_row.origin.x
+            && chip.origin.x + chip.size.width <= join_row.origin.x + join_row.size.width,
+        "the chip is inside the row, so a join is visible without the inspector"
+    );
+    assert!(
+        cx.debug_bounds("flow-workflow-join-2-analyze").is_none(),
+        "code waits for analyze only, so it carries no chip"
+    );
+
+    // selecting a row at depth 3 works, and its mark stays at the row's edge
+    click(cx, "flow-workflow-step-1");
+    let selected = handle
+        .read_with(cx, |host, cx| host.0.read(cx).selected_for_probe())
+        .expect("the window is open");
+    assert_eq!(selected, 1, "clicking a deep row selects it");
+    let mark = cx
+        .debug_bounds("flow-workflow-selected-1")
+        .expect("the selected row carries its mark");
+    let row = cx
+        .debug_bounds("flow-workflow-step-1")
+        .expect("the row is drawn");
+    assert_eq!(
+        mark.origin.x, row.origin.x,
+        "the mark sits at the row's edge"
+    );
+    assert_eq!(mark.origin.y, row.origin.y);
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The arrows reorder siblings only: `↑` trades a step with the previous step
+/// under the same parent, `↓` with the next, and a step with no sibling leaves
+/// the graph clean and the buttons off.
+#[gpui_kit::gpui::test]
+fn the_arrows_move_a_step_only_among_its_siblings(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("siblings");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let (repo, _issue) = seed_repo(&home, Some(WORKFLOW));
+    std::fs::write(warp_flow_core::layout::workflow_file(&repo), SIBLINGS)
+        .expect("the repository template");
+
+    let host = Arc::new(Host::new());
+    let handle = cx.open_window(size(px(1200.), px(860.)), |_window, cx| {
+        let screen = cx.new(|cx| WorkflowScreen::new(Arc::clone(&host), cx));
+        screen.update(cx, |screen, cx| {
+            screen.show_repository(repo.clone(), cx);
+        });
+        ScreenHost(screen)
+    });
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    // the rows start clean, and the roots keep their declaration order
+    assert_eq!(
+        step_ids(&handle, cx),
+        vec!["first", "second", "left", "right"]
+    );
+    assert!(cx.debug_bounds("flow-workflow-dirty").is_none());
+
+    // a root with no previous sibling does not move, and leaves the graph clean
+    click(cx, "flow-workflow-step-0");
+    click(cx, "flow-workflow-up");
+    assert_eq!(
+        step_ids(&handle, cx),
+        vec!["first", "second", "left", "right"]
+    );
+    assert!(
+        cx.debug_bounds("flow-workflow-dirty").is_none(),
+        "a root with no previous sibling is not a change"
+    );
+
+    // the last root has no next sibling either
+    click(cx, "flow-workflow-step-1");
+    click(cx, "flow-workflow-down");
+    assert_eq!(
+        step_ids(&handle, cx),
+        vec!["first", "second", "left", "right"]
+    );
+    assert!(cx.debug_bounds("flow-workflow-dirty").is_none());
+
+    // ↑ on the second root trades it with the first, and the row visibly moves
+    // from the bottom of the tree to its top
+    let before = cx
+        .debug_bounds("flow-workflow-selected-1")
+        .expect("the selected row carries its mark")
+        .origin
+        .y;
+    click(cx, "flow-workflow-up");
+    assert_eq!(
+        step_ids(&handle, cx),
+        vec!["second", "first", "left", "right"],
+        "the root traded places with its previous sibling"
+    );
+    assert!(
+        cx.debug_bounds("flow-workflow-dirty").is_some(),
+        "a move a person can see is a change Save may offer"
+    );
+    let after = cx
+        .debug_bounds("flow-workflow-selected-0")
+        .expect("the mark follows the step")
+        .origin
+        .y;
+    assert!(
+        f32::from(after) < f32::from(before),
+        "the row moved up the list: {before:?} -> {after:?}"
+    );
+
+    // ↓ on a child trades it with its next sibling, never with a step in
+    // another branch: `left` and `right` are `first`'s children
+    click(cx, "flow-workflow-step-2");
+    click(cx, "flow-workflow-down");
+    assert_eq!(
+        step_ids(&handle, cx),
+        vec!["second", "first", "right", "left"]
+    );
+
+    // ↑ on the first child has no sibling above it, so it moves nowhere
+    click(cx, "flow-workflow-step-3");
+    click(cx, "flow-workflow-up");
+    assert_eq!(
+        step_ids(&handle, cx),
+        vec!["second", "first", "left", "right"]
+    );
+
+    // and it never crosses into the branch above it, which is what the old
+    // array swap did
+    let order = step_ids(&handle, cx);
+    click(cx, "flow-workflow-step-2");
+    click(cx, "flow-workflow-up");
+    assert_eq!(
+        step_ids(&handle, cx),
+        order,
+        "↑ stays inside the sibling group"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A folder with no `workflow.toml` gets the known pipeline, every step off: a
+/// person enables what the repository has instead of deleting what it does not,
+/// and the document is still one the engine accepts.
+#[gpui_kit::gpui::test]
+fn the_default_document_has_every_step_disabled(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("default");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let (repo, _issue) = seed_repo(&home, None);
+    let run = screen_run(&repo);
+
+    let handle = open(cx, run);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    let graph = handle
+        .read_with(cx, |host, cx| host.0.read(cx).graph_for_probe().cloned())
+        .expect("the window is open")
+        .expect("a graph is offered");
+    assert_eq!(
+        graph
+            .steps
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "analyze",
+            "split",
+            "approve-plan",
+            "code",
+            "review",
+            "fmt",
+            "clippy",
+            "test",
+            "bump",
+            "merge",
+            "summary",
+        ],
+        "the default document is the known pipeline"
+    );
+    assert!(
+        graph.steps.iter().all(|step| !step.enabled),
+        "every step arrives off; these were on: {:?}",
+        graph
+            .steps
+            .iter()
+            .filter(|step| step.enabled)
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    // the gates carry the commands this repository runs, so the document is a
+    // valid graph even with everything switched off
+    let command = |id: &str| {
+        graph
+            .step(id)
+            .and_then(|step| step.command.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(command("fmt"), "cargo fmt --all --check");
+    assert_eq!(
+        command("clippy"),
+        "cargo clippy --locked --all-targets -- -D warnings"
+    );
+    assert_eq!(command("test"), "cargo test --locked");
+    for id in ["fmt", "clippy", "test"] {
+        let gate = graph.step(id).expect("the gate is in the document");
+        assert_eq!(gate.cwd.as_deref(), Some("."));
+        assert!(gate.timeout_secs.is_some_and(|secs| secs > 0));
+        assert!(gate.per_task, "a gate measures every task");
+    }
+    let merge = graph.step("merge").expect("the merge step");
+    assert_eq!(merge.kind, StepKind::Merge);
+    assert_eq!(merge.mode.as_deref(), Some("local"));
+    assert!(merge.per_task);
+    assert!(!merge.push);
+    // a harness step never names a skill this build does not ship
+    for step in graph
+        .steps
+        .iter()
+        .filter(|step| step.kind == StepKind::Harness)
+    {
+        let skill = step.skill.as_deref().expect("a harness step names a skill");
+        assert!(
+            warp_flow_core::skill::NAMES.contains(&skill),
+            "the default document ships {skill}"
+        );
+    }
+    graph
+        .validate()
+        .expect("the default document is a graph the engine accepts");
+
+    // the list draws the whole tree, and it is still a tree while every step is
+    // off: the shape belongs to the graph, not to today's run
+    assert!(
+        cx.debug_bounds("flow-workflow-step-10").is_some(),
+        "eleven rows"
+    );
+    assert!(cx.debug_bounds("flow-workflow-step-11").is_none());
+    assert!(
+        indent_of(cx, 1) > indent_of(cx, 0),
+        "split sits under analyze even while it is off"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }

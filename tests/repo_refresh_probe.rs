@@ -93,6 +93,12 @@ fn selector(name: &str) -> &'static str {
     Box::leak(name.to_string().into_boxed_str())
 }
 
+fn repo_count(handle: &WindowHandle<FlowApp>, cx: &mut VisualTestContext) -> usize {
+    handle
+        .read_with(cx, |app, _| app.settings_for_probe().repos.len())
+        .expect("the window is open")
+}
+
 fn click(cx: &mut VisualTestContext, name: &str) {
     let bounds = cx
         .debug_bounds(selector(name))
@@ -217,6 +223,122 @@ fn a_repository_added_in_the_screen_reaches_the_board_at_once(cx: &mut TestAppCo
         "the other repository is untouched"
     );
     assert_eq!(store::Settings::load().repos.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[gpui_kit::gpui::test]
+fn forgetting_a_repository_takes_a_second_click(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("forget");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let first = seed_repo(&home, "repo-a", "alpha-run");
+    let second = seed_repo(&home, "repo-b", "beta-run");
+
+    let handle = open_app(cx, vec![first, second]);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    // both rows sit in the configured order, and neither is armed
+    assert!(cx.debug_bounds("flow-repo-repo-a").is_some());
+    assert!(cx.debug_bounds("flow-repo-repo-b").is_some());
+    assert!(cx.debug_bounds("flow-list-forget-0").is_some());
+    assert!(
+        cx.debug_bounds("flow-list-forget-armed-0").is_none(),
+        "no row starts armed"
+    );
+
+    // the first press only arms the row: it is the second that forgets
+    click(cx, "flow-list-forget-0");
+    assert!(
+        cx.debug_bounds("flow-list-forget-armed-0").is_some(),
+        "the press armed the row instead of acting"
+    );
+    assert!(
+        cx.debug_bounds("flow-repo-repo-a").is_some(),
+        "an armed row is still in the list"
+    );
+    assert_eq!(
+        repo_count(&handle, cx),
+        2,
+        "the arming press leaves the window's settings alone"
+    );
+    assert_eq!(
+        store::Settings::load().repos.len(),
+        2,
+        "and the arming press writes nothing to disk"
+    );
+    let selected = handle
+        .read_with(cx, |app, _| {
+            app.selected_repo_for_probe().map(Path::to_path_buf)
+        })
+        .expect("the window is open");
+    assert_eq!(
+        selected, None,
+        "the arming press is the affordance's own: it does not also select the row"
+    );
+
+    // the second press goes through the window's one remove path
+    click(cx, "flow-list-forget-armed-0");
+    assert_eq!(
+        repo_count(&handle, cx),
+        1,
+        "the confirmed press forgot the repository"
+    );
+    assert_eq!(
+        store::Settings::load().repos.len(),
+        1,
+        "the settings file the next launch reads names one repository"
+    );
+    assert!(
+        cx.debug_bounds("flow-repo-repo-a").is_none(),
+        "the forgotten repository's row is gone from the list"
+    );
+    assert!(
+        cx.debug_bounds("flow-repo-repo-b").is_some(),
+        "the other repository's row is untouched"
+    );
+    assert!(
+        cx.debug_bounds("flow-list-forget-armed-0").is_none(),
+        "nothing stays armed after the forget"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[gpui_kit::gpui::test]
+fn a_press_anywhere_else_disarms_a_forget(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("disarm");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let first = seed_repo(&home, "repo-a", "alpha-run");
+    let second = seed_repo(&home, "repo-b", "beta-run");
+
+    let handle = open_app(cx, vec![first, second]);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    click(cx, "flow-list-forget-0");
+    assert!(
+        cx.debug_bounds("flow-list-forget-armed-0").is_some(),
+        "the first press armed the row"
+    );
+
+    // a press anywhere else takes the arm back without removing anything
+    click(cx, "flow-repo-all");
+    assert!(
+        cx.debug_bounds("flow-list-forget-armed-0").is_none(),
+        "the press elsewhere disarmed the row"
+    );
+    assert!(
+        cx.debug_bounds("flow-list-forget-0").is_some(),
+        "the affordance is quiet again"
+    );
+    assert_eq!(repo_count(&handle, cx), 2, "nothing was forgotten");
+    assert_eq!(store::Settings::load().repos.len(), 2);
+    assert!(cx.debug_bounds("flow-repo-repo-a").is_some());
 
     let _ = std::fs::remove_dir_all(&home);
 }

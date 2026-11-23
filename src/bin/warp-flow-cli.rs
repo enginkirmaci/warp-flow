@@ -72,8 +72,8 @@ fn command_run(args: &[String]) -> Result<u8, String> {
     } = parse_run_args(args)?;
 
     // Everything a run needs is validated before the door is contacted, so a
-    // bad workflow or gate file cannot leave a session behind. The app's host
-    // prepares a run through the same core function.
+    // bad workflow file cannot leave a session behind. The app's host prepares
+    // a run through the same core function.
     let prepared = prepare(&issue).map_err(|error| error.to_string())?;
     if dry_run {
         print_plan(&prepared, max_attempts);

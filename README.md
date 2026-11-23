@@ -66,12 +66,13 @@ run puts its four tabs in the run's head:
 | Workflow | the revision the run uses, read-only: the template is edited in Repos › Workflow |
 
 `Repos` is the window a person edits: its `Workflow` tab is the repository's
-step graph with its revisions, drawn in waves — the steps that become ready
-together sit under one band, so a fork and a join are visible as such. A step
-is added at the front, after the selection or at the end, which is what decides
-what it waits for; a step can be disabled, and its dependents then inherit its
-own dependencies so the pipeline closes over it. A harness step chooses its
-harness, model and effort from the door's live catalog. `About` carries the
+step graph with its revisions, drawn as an indented tree — each step sits under
+its first dependency, and any further dependency is a chip on its row, so a
+fork and a join are visible as such. A step is added at the front, after the
+selection or at the end, which is what decides what it waits for; a step can be
+disabled, and its dependents then inherit its own dependencies so the pipeline
+closes over it. A harness step chooses its harness, model and effort from the
+door's live catalog. `About` carries the
 installed family, the build and the license; `Settings` the reduce-motion
 switch, where the app keeps its files, the door's state and the version.
 

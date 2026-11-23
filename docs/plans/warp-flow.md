@@ -102,9 +102,9 @@ artifact, question, approval, repair.
     because the engine and the two-second scan read those files at undefined
     moments. What differs is the permission: while this window drives a run, the
     artifacts screen is read-only with the reason on screen (the engine may be
-    between a step's read and its write), while the workflow and gate files may
-    still be saved because the engine re-reads them at step boundaries by design
-    (ADR-0010) — and both validate before writing, so a running engine can never
+    between a step's read and its write), while the workflow file may still be
+    saved because the engine re-reads it at each step boundary by design
+    (ADR-0010) — and it validates before writing, so a running engine can never
     pick up a graph it would refuse.
 18. **The app is the process that drives a run.** `Runner::run` is blocking and
     owns `&mut self`, so it moves onto the app's background executor and the
