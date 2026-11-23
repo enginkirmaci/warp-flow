@@ -660,7 +660,20 @@ impl FlowApp {
                     .child(why),
             );
 
-        if let Some(line) = host_failure_line(host).or_else(|| failure_line(run, failed)) {
+        // A run that stopped without a failing step has no repair to quote:
+        // its reason is the sentence the engine wrote into `run.md`, and it is
+        // the only one that is still true after the window restarts. The live
+        // log is the fallback, never the lead: its newest failure-shaped line
+        // can be an old attempt's, not this stop's.
+        let line = if failed.is_none() {
+            run.stop_reason
+                .clone()
+                .or_else(|| host_failure_line(host))
+                .or_else(|| failure_line(run, None))
+        } else {
+            host_failure_line(host).or_else(|| failure_line(run, failed))
+        };
+        if let Some(line) = line {
             card = card.child(
                 div()
                     .mt(px(10.))
@@ -2632,6 +2645,7 @@ mod tests {
             question: None,
             open_questions: Vec::new(),
             rows: Vec::new(),
+            stop_reason: None,
             graph: None,
             workflow_path: None,
             workflow_note: None,

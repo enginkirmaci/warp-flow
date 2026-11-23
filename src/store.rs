@@ -424,6 +424,10 @@ pub struct Run {
     pub open_questions: Vec<Question>,
     /// Every row of `run.md`'s log table, oldest first.
     pub rows: Vec<RunRow>,
+    /// `run.md`'s `**Run stopped:**` line, the engine's own sentence about why
+    /// a blocked run could not advance. Unlike the live log, it survives the
+    /// app restarting.
+    pub stop_reason: Option<String>,
     /// `workflow.toml`, whichever copy this run reads: its own, or the
     /// repository's template when the folder carries none.
     pub graph: Option<Workflow>,
@@ -761,6 +765,12 @@ fn scan_run(
         .unwrap_or_else(|| "needs-triage".to_owned());
     let rows = table_rows(run_body);
     let attempts = rows.len();
+    let stop_reason = run_body
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("**Run stopped:**"))
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map(str::to_owned);
     // `running:` names every step in flight, comma separated; a run with one
     // step in flight reads the same as it always did.
     let step = run_doc
@@ -817,6 +827,7 @@ fn scan_run(
         question,
         open_questions,
         rows,
+        stop_reason,
         graph,
         workflow_path,
         workflow_note,
@@ -1884,6 +1895,36 @@ depends_on = []
         fs::remove_file(layout::workflow_file(&dir)).expect("remove workflow.toml");
         let snapshot = scan(std::slice::from_ref(&dir));
         assert_eq!(snapshot.repos[0].gates, 0);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A blocked run's own sentence is the one the card quotes: it is in
+    /// `run.md`, so it survives the window that drove the run.
+    #[test]
+    fn a_blocked_run_carries_the_sentence_the_engine_wrote() {
+        let dir = scratch_dir("stop-reason");
+        let issue = dir.join(".scratch/demo");
+        fs::create_dir_all(&issue).expect("issue folder");
+        fs::write(issue.join("spec.md"), "# Demo\n").expect("spec");
+        fs::write(
+            issue.join("run.md"),
+            "---\nissue: demo\nworkflow: implement\nrevision: 1\nstatus: blocked\n\
+             started: 2026-01-01T00:00:00Z\nupdated: 2026-01-01T00:01:00Z\n---\n\n\
+             # Run: implement\n\n## Log\n\n\
+             | Step | Task | Attempt | Outcome | At |\n\
+             | --- | --- | --- | --- | --- |\n\
+             | test | 01 | 1 | passed | 2026-01-01T00:01:00Z |\n\n\
+             **Run stopped:** task 02 `Second` is not resolved and no step can advance it\n",
+        )
+        .expect("run.md");
+
+        let snapshot = scan(std::slice::from_ref(&dir));
+        let run = &snapshot.repos[0].runs[0];
+        assert_eq!(
+            run.stop_reason.as_deref(),
+            Some("task 02 `Second` is not resolved and no step can advance it")
+        );
 
         let _ = fs::remove_dir_all(dir);
     }

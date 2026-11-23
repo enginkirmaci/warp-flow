@@ -292,6 +292,9 @@ pub struct Runner<H> {
     /// Steps that have no outstanding work: every non-per-task step, and the
     /// per-task steps whose work is complete for every task (see `graph_done`).
     done: BTreeSet<String>,
+    /// The same set for a step above the merge queue, which does not count the
+    /// tasks the queue is about to unblock (see `graph_done_before_merge`).
+    premerge_done: BTreeSet<String>,
     /// Per-task steps that finished, by step id and task number.
     completed: BTreeMap<String, BTreeSet<u32>>,
     /// Attempts spent, by step id and task number (`None` for a step that runs
@@ -379,6 +382,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
             status: RunStatus::Running,
             worktrees: BTreeMap::new(),
             done: BTreeSet::new(),
+            premerge_done: BTreeSet::new(),
             completed: BTreeMap::new(),
             attempts: BTreeMap::new(),
             rows: Vec::new(),
@@ -456,6 +460,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
             // here, before the candidates are computed, is what lets `bump` and
             // `summary` run once at the end instead of never.
             self.done = self.graph_done(&issue);
+            self.premerge_done = self.graph_done_before_merge(&issue);
             let candidates = self.candidate_ids();
             let mut jobs: Vec<StepJob> = Vec::new();
             let mut busy: BTreeSet<PathBuf> = BTreeSet::new();
@@ -992,6 +997,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
     fn start(&mut self) -> Result<()> {
         self.status = RunStatus::Running;
         self.done.clear();
+        self.premerge_done.clear();
         self.completed.clear();
         self.rows.clear();
         self.pending_questions.clear();
@@ -1044,6 +1050,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
             self.started = started.to_owned();
         }
         self.done.clear();
+        self.premerge_done.clear();
         self.completed.clear();
         self.rows.clear();
         self.pending_questions.clear();
@@ -1146,6 +1153,13 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 // ask for every task to have the step before any task could
                 // start it, which deadlocks a per-task chain.
                 None if step.per_task && dependency.per_task => true,
+                // A step above the merge queue must not wait for a task the
+                // queue unblocks: a task `Blocked by:` another starts only once
+                // that blocker is resolved, and only the queue resolves it.
+                // `premerge_done` is `done` with those tasks set aside.
+                _ if dependency.per_task && self.workflow.precedes_merge(step) => {
+                    self.premerge_done.contains(&dependency.id)
+                }
                 _ => self.done.contains(&dependency.id),
             }
         })
@@ -1157,6 +1171,25 @@ impl<H: Harness + Send + 'static> Runner<H> {
     /// needed) or has that step recorded, which is what lets a `join` after the
     /// task lanes start, and what lets a run finish.
     fn graph_done(&self, issue: &Issue) -> BTreeSet<String> {
+        self.graph_done_where(issue, |_| true)
+    }
+
+    /// The graph-done set a step above the merge queue reads.
+    ///
+    /// It is [`Runner::graph_done`] with the tasks the queue is going to
+    /// unblock left out: only a task that can start now counts as outstanding.
+    /// Without this, a run whose tasks form a `Blocked by:` chain deadlocks as
+    /// soon as a run-wide step sits above the queue — the join waits for the
+    /// last task, that task waits for an earlier one to be resolved, and only
+    /// the merge the join holds back resolves it.
+    fn graph_done_before_merge(&self, issue: &Issue) -> BTreeSet<String> {
+        let ready: BTreeSet<u32> = issue.ready_tasks().iter().map(|task| task.number).collect();
+        self.graph_done_where(issue, |task| ready.contains(&task.number))
+    }
+
+    /// The graph-done set, counting a per-task step only for the tasks
+    /// `counts` admits.
+    fn graph_done_where(&self, issue: &Issue, counts: impl Fn(&Task) -> bool) -> BTreeSet<String> {
         let mut done = self.done.clone();
         for step in self
             .workflow
@@ -1166,6 +1199,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
         {
             let complete = issue.tasks().iter().all(|task| {
                 task.status.is_resolved()
+                    || !counts(task)
                     || self
                         .completed
                         .get(&step.id)

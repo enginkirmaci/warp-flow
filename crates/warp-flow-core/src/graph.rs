@@ -607,8 +607,7 @@ impl Workflow {
     /// ([`Workflow::validate`] refuses one), but the walk is guarded so a graph
     /// being edited in memory cannot make it recurse forever.
     pub fn gate_ancestors(&self, step: &Step) -> Vec<&Step> {
-        let mut reached = BTreeSet::new();
-        self.ancestors_into(step, &mut reached);
+        let reached = self.ancestors(step);
         self.steps
             .iter()
             .filter(|candidate| {
@@ -618,6 +617,23 @@ impl Workflow {
                     && reached.contains(candidate.id.as_str())
             })
             .collect()
+    }
+
+    /// Whether a merge step the graph may run waits for `step`, directly or
+    /// through what it waits for.
+    ///
+    /// Such a step runs before anything lands, so its answer cannot depend on
+    /// a task the merge queue is itself going to unblock: a task `Blocked by:`
+    /// another waits for that blocker to be *resolved*, and only the merge
+    /// step resolves one. [`crate::run`] uses this to read the join above the
+    /// queue against the tasks that can start now, instead of the whole lane.
+    pub fn precedes_merge(&self, step: &Step) -> bool {
+        self.steps.iter().any(|candidate| {
+            candidate.enabled
+                && candidate.kind == StepKind::Merge
+                && candidate.id != step.id
+                && self.ancestors(candidate).contains(step.id.as_str())
+        })
     }
 
     /// The step `step` sends the work back to, when it has a rework edge.
@@ -645,6 +661,13 @@ impl Workflow {
                 self.ancestors_into(dependency, reached);
             }
         }
+    }
+
+    /// Every step `step` depends on, transitively.
+    fn ancestors<'a>(&'a self, step: &Step) -> BTreeSet<&'a str> {
+        let mut reached = BTreeSet::new();
+        self.ancestors_into(step, &mut reached);
+        reached
     }
 
     /// Whether the graph has at least one enabled step.

@@ -60,6 +60,48 @@ mode = "local"
 depends_on = ["test"]
 "#;
 
+/// The shipped shape's ordering: a run-wide `bump` above the queue, naming
+/// nothing so it joins the whole lane, and a `merge` that names nothing so it
+/// waits for the join as well.
+const WORKFLOW_WITH_JOIN: &str = r#"
+schema = 2
+name = "chain"
+revision = 1
+
+[[step]]
+id = "analyze"
+kind = "harness"
+skill = "analyze"
+produces = "spec.md"
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+per_task = true
+depends_on = ["analyze"]
+
+[[step]]
+id = "test"
+kind = "gate"
+command = "true"
+cwd = "."
+timeout_secs = 30
+per_task = true
+depends_on = ["code"]
+
+[[step]]
+id = "bump"
+kind = "harness"
+skill = "bump"
+
+[[step]]
+id = "merge"
+kind = "merge"
+per_task = true
+mode = "local"
+"#;
+
 /// A temp directory that removes itself.
 struct ScratchDir {
     path: PathBuf,
@@ -156,7 +198,12 @@ impl Fixture {
 
     /// Write the workflow, then commit everything.
     fn write_config(&self) {
-        fs::write(layout::pinned_workflow(&self.issue), WORKFLOW).expect("workflow.toml");
+        self.write_workflow(WORKFLOW);
+    }
+
+    /// Write an arbitrary workflow into the pinned copy.
+    fn write_workflow(&self, workflow: &str) {
+        fs::write(layout::pinned_workflow(&self.issue), workflow).expect("workflow.toml");
     }
 
     /// Write one task file and return its path.
@@ -348,6 +395,89 @@ fn the_chain_merges_both_tasks_and_resolves_them() {
         );
         assert!(call.prompt.contains("task"));
     }
+}
+
+/// The shipped shape puts a run-wide `bump` above the queue. A task blocked by
+/// another starts only after that blocker's merge, so the join must not also
+/// wait for the blocked task: that is a cycle, and the run would stop with the
+/// work done but nothing left able to land it.
+#[test]
+fn a_join_above_the_queue_does_not_wait_for_the_task_the_queue_unblocks() {
+    let fixture = Fixture::new();
+    fixture.write_workflow(WORKFLOW_WITH_JOIN);
+    fixture.write_task(1, "First change", "None");
+    fixture.write_task(2, "Second change", "01");
+    fixture.commit_fixture();
+    branch_both(&fixture, "one.txt", "two.txt");
+
+    let mut harness = FakeHarness::new();
+    harness.script(
+        "analyze",
+        Scripted::Done {
+            files: vec![(fixture.issue.join("spec.md"), "# Spec\n".to_owned())],
+            text: "analyzed".to_owned(),
+        },
+    );
+    harness.script(
+        "code",
+        Scripted::Done {
+            files: Vec::new(),
+            text: "coded 01".to_owned(),
+        },
+    );
+    harness.script(
+        "bump",
+        Scripted::Done {
+            files: Vec::new(),
+            text: "bumped".to_owned(),
+        },
+    );
+    harness.script(
+        "code",
+        Scripted::Done {
+            files: Vec::new(),
+            text: "coded 02".to_owned(),
+        },
+    );
+
+    let mut runner = fixture.runner(harness, 3);
+    assert_eq!(runner.run().expect("the chain runs"), RunStatus::Done);
+
+    // The join ran once, before the first merge; 02 followed its blocker.
+    let calls = runner.harness().calls();
+    let steps: Vec<&str> = calls.iter().map(|call| call.step.id.as_str()).collect();
+    assert_eq!(steps, vec!["analyze", "code", "bump", "code"]);
+
+    let run = fixture.run_md();
+    assert_eq!(run.front.get("status"), Some("done"));
+    let mut last = 0;
+    for row in [
+        "| analyze | - | 1 | done |",
+        "| code | 01 | 1 | done |",
+        "| test | 01 | 1 | passed |",
+        "| bump | - | 1 | done |",
+        "| merge | 01 | 1 | merged |",
+        "| code | 02 | 1 | done |",
+        "| test | 02 | 1 | passed |",
+        "| merge | 02 | 1 | merged |",
+    ] {
+        let at = run
+            .body
+            .find(row)
+            .unwrap_or_else(|| panic!("run.md is missing `{row}` in:\n{}", run.body));
+        assert!(at > last, "`{row}` is out of order in:\n{}", run.body);
+        last = at;
+    }
+
+    let issue = Issue::open(&fixture.issue).expect("issue reopens");
+    assert!(
+        issue
+            .tasks()
+            .iter()
+            .all(|task| task.status == Status::Resolved),
+        "{:?}",
+        issue.tasks()
+    );
 }
 
 #[test]

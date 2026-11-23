@@ -1248,6 +1248,7 @@ mod tests {
             question: None,
             open_questions: Vec::new(),
             rows: Vec::new(),
+            stop_reason: None,
             graph: None,
             workflow_path: None,
             workflow_note: None,

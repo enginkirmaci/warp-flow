@@ -121,7 +121,12 @@ withdraws the door and asks a blocking engine to stop.
   `running:` is a comma-separated list because several steps may be in flight.
 - A step after the task lanes (`bump`, `summary`) is not per task: it waits for
   a per-task step, and a per-task dependency resolves for the graph as "every
-  task has it".
+  task has it". The one exception is a step **above the merge queue**: a task
+  `Blocked by:` another starts only after that blocker's merge resolves it, so
+  counting the blocked task would ask the join to wait for the merge that waits
+  for the join. `Runner::graph_done_before_merge` is that reading, and
+  `Workflow::precedes_merge` is what names the step; a step below the queue
+  (`summary`) keeps the strict one.
 - **The file is read downwards.** `depends_on` has three states (ADR-0018):
   omitted is every step declared before it, `[]` is a root, a list is exactly
   those. `Workflow::dependencies` is the one resolver — the scheduler, the cycle
