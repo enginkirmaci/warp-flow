@@ -118,8 +118,9 @@ struct Fields {
     id: Entity<InputState>,
     skill: Entity<InputState>,
     command: Entity<InputState>,
+    cwd: Entity<InputState>,
+    timeout: Entity<InputState>,
     produces: Entity<InputState>,
-    depends_on: Entity<InputState>,
     harness: Entity<InputState>,
     model: Entity<InputState>,
     effort: Entity<InputState>,
@@ -505,13 +506,26 @@ impl WorkflowScreen {
             step.command.clone().unwrap_or_default(),
             "the shell command a gate step runs",
         );
+        let cwd = make(
+            window,
+            cx,
+            step.cwd.clone().unwrap_or_default(),
+            "the folder the command runs in; empty is the worktree root",
+        );
+        let timeout = make(
+            window,
+            cx,
+            step.timeout_secs
+                .map(|secs| secs.to_string())
+                .unwrap_or_default(),
+            "seconds before the gate fails; empty is 900",
+        );
         let produces = make(
             window,
             cx,
             step.produces.clone().unwrap_or_default(),
             "an artifact in the run folder",
         );
-        let depends_on = make(window, cx, step.depends_on.join(", "), "another step's id");
         let harness = make(
             window,
             cx,
@@ -534,8 +548,9 @@ impl WorkflowScreen {
             (id.clone(), Field::Id),
             (skill.clone(), Field::Skill),
             (command.clone(), Field::Command),
+            (cwd.clone(), Field::Cwd),
+            (timeout.clone(), Field::Timeout),
             (produces.clone(), Field::Produces),
-            (depends_on.clone(), Field::DependsOn),
             (harness.clone(), Field::Harness),
             (model.clone(), Field::Model),
             (effort.clone(), Field::Effort),
@@ -552,18 +567,14 @@ impl WorkflowScreen {
                     Field::Id => step.id = text,
                     Field::Skill => step.skill = (!text.is_empty()).then_some(text),
                     Field::Command => step.command = (!text.is_empty()).then_some(text),
+                    Field::Cwd => step.cwd = (!text.is_empty()).then_some(text),
+                    Field::Timeout => {
+                        step.timeout_secs = text.parse::<u64>().ok().filter(|secs| *secs > 0)
+                    }
                     Field::Harness => step.harness = (!text.is_empty()).then_some(text),
                     Field::Model => step.model = (!text.is_empty()).then_some(text),
                     Field::Effort => step.effort = (!text.is_empty()).then_some(text),
                     Field::Produces => step.produces = (!text.is_empty()).then_some(text),
-                    Field::DependsOn => {
-                        step.depends_on = text
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|name| !name.is_empty())
-                            .map(str::to_owned)
-                            .collect()
-                    }
                 });
             })
             .detach();
@@ -572,8 +583,9 @@ impl WorkflowScreen {
             id,
             skill,
             command,
+            cwd,
+            timeout,
             produces,
-            depends_on,
             harness,
             model,
             effort,
@@ -597,6 +609,13 @@ impl WorkflowScreen {
                 fields.command.clone(),
                 step.command.clone().unwrap_or_default(),
             ),
+            (fields.cwd.clone(), step.cwd.clone().unwrap_or_default()),
+            (
+                fields.timeout.clone(),
+                step.timeout_secs
+                    .map(|secs| secs.to_string())
+                    .unwrap_or_default(),
+            ),
             (
                 fields.harness.clone(),
                 step.harness.clone().unwrap_or_default(),
@@ -610,7 +629,6 @@ impl WorkflowScreen {
                 fields.produces.clone(),
                 step.produces.clone().unwrap_or_default(),
             ),
-            (fields.depends_on.clone(), step.depends_on.join(", ")),
         ];
         for (input, value) in values {
             input.update(cx, |state, cx| {
@@ -1152,6 +1170,10 @@ impl WorkflowScreen {
                     ),
             );
         }
+        // How many steps a run may have in flight at once. It belongs to the
+        // graph, not to the selected step, so it sits above the fields rather
+        // than among them.
+        body = body.child(self.parallel_row(cx));
         body = body.child(self.kind_row(&step, cx));
         // A disabled step stays in the graph and never runs; its dependents
         // inherit its own dependencies, so switching it off closes the pipeline
@@ -1206,16 +1228,21 @@ impl WorkflowScreen {
                 "command",
                 fields.as_ref().map(|fields| fields.command.clone()),
             ));
+            rows.push((
+                "Folder",
+                "cwd",
+                fields.as_ref().map(|fields| fields.cwd.clone()),
+            ));
+            rows.push((
+                "Timeout, seconds",
+                "timeout",
+                fields.as_ref().map(|fields| fields.timeout.clone()),
+            ));
         }
         rows.push((
             "Produces",
             "produces",
             fields.as_ref().map(|fields| fields.produces.clone()),
-        ));
-        rows.push((
-            "Depends on",
-            "depends-on",
-            fields.as_ref().map(|fields| fields.depends_on.clone()),
         ));
         for (label, key, input) in rows {
             body = body.child(self.field_row(label, key, input, window, cx));
@@ -1225,6 +1252,10 @@ impl WorkflowScreen {
                 body = body.child(self.choice_row(key, choices, cx));
             }
         }
+        // A step's place is its dependencies (ADR-0014), so they are picked
+        // from the graph's own steps rather than typed: a mistyped id is a
+        // graph the engine refuses, and the fix is a name a person cannot see.
+        body = body.child(self.dependency_row(&step, cx));
         if let Some(error) = &self.error {
             body = body.child(
                 div()
@@ -1545,6 +1576,14 @@ impl WorkflowScreen {
         }
         if step.kind == StepKind::Gate {
             rows.insert(1, ("Command", mono_or_dash(step.command.as_deref())));
+            // The gate's own folder and timeout, from the graph rather than the
+            // row's summary: the read-only tab shows the revision this run
+            // reads, and a gate that measures the wrong tree is worth seeing.
+            if let Some(real) = graph.step(&step.id) {
+                rows.insert(2, ("Folder", mono_or_dash(real.cwd.as_deref())));
+                let timeout = real.timeout_secs.map(|secs| format!("{secs}s"));
+                rows.insert(3, ("Timeout", mono_or_dash(timeout.as_deref())));
+            }
         }
         for (label, value) in rows {
             card = card.child(
@@ -1677,6 +1716,82 @@ impl WorkflowScreen {
         row.into_any_element()
     }
 
+    /// How many steps a run may have in flight at once.
+    ///
+    /// A graph-level setting, not a step's: the engine reads it from
+    /// `workflow.toml`'s `max_parallel`, and it is what lets two ready steps
+    /// run together.
+    fn parallel_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self
+            .graph
+            .as_ref()
+            .map(|graph| graph.max_parallel)
+            .unwrap_or(1);
+        let row = div()
+            .debug_selector(|| "flow-workflow-parallel".into())
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .min_h(px(theme::scaled(FIELD_ROW_HEIGHT)))
+            .py(px(6.))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .w(px(theme::scaled(LABEL_WIDTH)))
+                    .text_size(px(theme::font_meta()))
+                    .text_color(theme::text_dim())
+                    .child("Steps at once"),
+            );
+        let mut chips = div().flex().items_center().gap(px(6.));
+        for count in [1u32, 2, 3, 4, 6, 8] {
+            let selected = current == count;
+            let selector = format!("flow-workflow-parallel-{count}");
+            chips = chips.child(
+                div()
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector.clone())
+                    .role(gpui::Role::Button)
+                    .aria_label(format!("Run {count} steps at once"))
+                    .cursor_pointer()
+                    .px(px(9.))
+                    .py(px(3.))
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(if selected {
+                        theme::accent()
+                    } else {
+                        theme::hairline()
+                    })
+                    .text_size(px(theme::font_micro()))
+                    .font_family(theme::code_font())
+                    .text_color(if selected {
+                        theme::text()
+                    } else {
+                        theme::text_muted()
+                    })
+                    .hover(|style| style.bg(theme::raised()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_parallel(count, cx);
+                        cx.notify();
+                    }))
+                    .child(count.to_string()),
+            );
+        }
+        row.child(chips).into_any_element()
+    }
+
+    /// Set the graph's `max_parallel` and mark it dirty.
+    fn set_parallel(&mut self, count: u32, cx: &mut Context<Self>) {
+        let Some(graph) = self.graph.as_mut() else {
+            return;
+        };
+        graph.max_parallel = count;
+        self.dirty = true;
+        self.status = None;
+        self.error = None;
+        cx.notify();
+    }
+
     /// The choices the catalog offers for one field, or `None` when the field
     /// is free text or the catalog has nothing to say.
     ///
@@ -1778,6 +1893,100 @@ impl WorkflowScreen {
             );
         }
         row.into_any_element()
+    }
+
+    /// The selected step's dependencies as chips: one per other step in the
+    /// graph, pressed to make the step wait for it.
+    fn dependency_row(&self, step: &Step, cx: &mut Context<Self>) -> AnyElement {
+        let row = div()
+            .debug_selector(|| "flow-step-depends".into())
+            .flex()
+            .items_start()
+            .gap(px(12.))
+            .min_h(px(theme::scaled(FIELD_ROW_HEIGHT)))
+            .py(px(6.))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .w(px(theme::scaled(LABEL_WIDTH)))
+                    .pt(px(3.))
+                    .text_size(px(theme::font_meta()))
+                    .text_color(theme::text_dim())
+                    .child("Depends on"),
+            );
+        // Every step the selected one may wait for: the rest of the graph, in
+        // the file's order. A step cannot wait for itself, and a cycle is what
+        // `validate` refuses at save.
+        let others: Vec<String> = self
+            .graph
+            .as_ref()
+            .map(|graph| {
+                graph
+                    .steps
+                    .iter()
+                    .filter(|other| other.id != step.id)
+                    .map(|other| other.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut chips = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.))
+            .flex_1()
+            .min_w_0();
+        if others.is_empty() {
+            chips = chips.child(quiet_word("No other steps yet."));
+        }
+        for id in others {
+            let selected = step.depends_on.contains(&id);
+            let selector = format!("flow-step-depends-{id}");
+            let value = id.clone();
+            chips = chips.child(
+                div()
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector.clone())
+                    .role(gpui::Role::Button)
+                    .aria_label(if selected {
+                        format!("Waits for {id}; press to stop waiting for it")
+                    } else {
+                        format!("Does not wait for {id}; press to wait for it")
+                    })
+                    .cursor_pointer()
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(if selected {
+                        theme::accent()
+                    } else {
+                        theme::hairline()
+                    })
+                    .text_size(px(theme::font_micro()))
+                    .font_family(theme::code_font())
+                    .text_color(if selected {
+                        theme::text()
+                    } else {
+                        theme::text_muted()
+                    })
+                    .hover(|style| style.bg(theme::raised()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let value = value.clone();
+                        this.edit_step(cx, |step| {
+                            if let Some(at) = step.depends_on.iter().position(|id| id == &value) {
+                                step.depends_on.remove(at);
+                            } else {
+                                step.depends_on.push(value);
+                            }
+                        });
+                        this.refill_fields(window, cx);
+                        cx.notify();
+                    }))
+                    .child(id),
+            );
+        }
+        row.child(chips).into_any_element()
     }
 
     /// The Revisions card: the loaded revision, then every one a save appended.
@@ -1970,8 +2179,9 @@ enum Field {
     Id,
     Skill,
     Command,
+    Cwd,
+    Timeout,
     Produces,
-    DependsOn,
     Harness,
     Model,
     Effort,

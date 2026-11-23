@@ -127,6 +127,21 @@ fn click(cx: &mut VisualTestContext, name: &str) {
     settle(cx);
 }
 
+/// Click into a field and type `value` into it.
+fn set_field(cx: &mut VisualTestContext, name: &str, value: &str) {
+    let bounds = cx
+        .debug_bounds(selector(name))
+        .unwrap_or_else(|| panic!("{name} is missing from the frame"));
+    let center = Point {
+        x: bounds.origin.x + bounds.size.width / 2.,
+        y: bounds.origin.y + bounds.size.height / 2.,
+    };
+    cx.simulate_click(center, Modifiers::default());
+    settle(cx);
+    cx.simulate_input(value);
+    settle(cx);
+}
+
 fn screen_run(repo: &Path) -> ScreenRun {
     let snapshot = store::scan(&[repo.to_path_buf()]);
     let run = snapshot
@@ -400,6 +415,133 @@ fn the_editor_adds_at_both_ends_and_disables_a_step(cx: &mut TestAppContext) {
         .expect("a graph");
     assert!(!graph.steps[1].enabled, "the step is off");
     assert_eq!(graph.steps.len(), 5, "and still in the graph");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A step's dependencies are chips picked from the graph, not a typed list: a
+/// mistyped id is a graph the engine refuses, and the fix is a name a person
+/// cannot see.
+#[gpui_kit::gpui::test]
+fn dependencies_are_chips_picked_from_the_graph(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("chips");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let (repo, _issue) = seed_repo(&home, Some(WORKFLOW));
+    std::fs::write(warp_flow_core::layout::workflow_file(&repo), WORKFLOW)
+        .expect("the repository template");
+
+    let host = Arc::new(Host::new());
+    let handle = cx.open_window(size(px(1200.), px(860.)), |_window, cx| {
+        let screen = cx.new(|cx| WorkflowScreen::new(Arc::clone(&host), cx));
+        screen.update(cx, |screen, cx| {
+            screen.show_repository(repo.clone(), cx);
+        });
+        ScreenHost(screen)
+    });
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    // the chips are there, one per other step, and never the step itself
+    assert!(cx.debug_bounds("flow-step-depends").is_some());
+    assert!(
+        cx.debug_bounds("flow-step-depends-code").is_some(),
+        "another step is a chip"
+    );
+    assert!(
+        cx.debug_bounds("flow-step-depends-check").is_some(),
+        "a gate step is a chip too"
+    );
+    assert!(
+        cx.debug_bounds("flow-step-depends-analyze").is_none(),
+        "a step is not its own dependency, because it is the selected one"
+    );
+
+    // pressing `check` on `analyze` makes analyze wait for it
+    handle
+        .update(cx, |host, _, cx| {
+            host.0.update(cx, |screen, cx| {
+                screen.select_for_probe(0, cx);
+            });
+        })
+        .expect("the window is open");
+    settle(cx);
+    click(cx, "flow-step-depends-check");
+    let graph = handle
+        .read_with(cx, |host, cx| host.0.read(cx).graph_for_probe().cloned())
+        .expect("the window is open")
+        .expect("a graph");
+    assert!(
+        graph.steps[0].depends_on.contains(&"check".to_owned()),
+        "pressing a chip adds the dependency: {:?}",
+        graph.steps[0].depends_on
+    );
+
+    // pressing it again takes it away
+    click(cx, "flow-step-depends-check");
+    let graph = handle
+        .read_with(cx, |host, cx| host.0.read(cx).graph_for_probe().cloned())
+        .expect("the window is open")
+        .expect("a graph");
+    assert!(
+        !graph.steps[0].depends_on.contains(&"check".to_owned()),
+        "pressing it again removes it: {:?}",
+        graph.steps[0].depends_on
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A gate step's folder and timeout are editable, and the graph's parallelism
+/// is a field of its own.
+#[gpui_kit::gpui::test]
+fn a_gate_step_edits_its_folder_and_timeout(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("gate-fields");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let (repo, _issue) = seed_repo(&home, Some(WORKFLOW));
+    std::fs::write(warp_flow_core::layout::workflow_file(&repo), WORKFLOW)
+        .expect("the repository template");
+
+    let host = Arc::new(Host::new());
+    let handle = cx.open_window(size(px(1200.), px(900.)), |_window, cx| {
+        let screen = cx.new(|cx| WorkflowScreen::new(Arc::clone(&host), cx));
+        screen.update(cx, |screen, cx| {
+            screen.show_repository(repo.clone(), cx);
+        });
+        ScreenHost(screen)
+    });
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    // select the gate step (the fixture's third) and type its folder and timeout
+    handle
+        .update(cx, |host, _, cx| {
+            host.0.update(cx, |screen, cx| {
+                screen.select_for_probe(2, cx);
+            });
+        })
+        .expect("the window is open");
+    settle(cx);
+    set_field(cx, "flow-field-cwd", "src");
+    set_field(cx, "flow-field-timeout", "45");
+    let graph = handle
+        .read_with(cx, |host, cx| host.0.read(cx).graph_for_probe().cloned())
+        .expect("the window is open")
+        .expect("a graph");
+    assert_eq!(graph.steps[2].cwd.as_deref(), Some("src"));
+    assert_eq!(graph.steps[2].timeout_secs, Some(45));
+
+    // the graph's parallelism is a chip row of its own
+    assert!(cx.debug_bounds("flow-workflow-parallel").is_some());
+    click(cx, "flow-workflow-parallel-4");
+    let graph = handle
+        .read_with(cx, |host, cx| host.0.read(cx).graph_for_probe().cloned())
+        .expect("the window is open")
+        .expect("a graph");
+    assert_eq!(graph.max_parallel, 4, "the graph carries the choice");
 
     let _ = std::fs::remove_dir_all(&home);
 }
