@@ -27,7 +27,7 @@ rules that still matter move into `README.md` or this file.
   document this build does not ship is refused during preparation, naming the
   step and the shipped set; add a document here when a graph names one. A
   document that quotes an artifact's shape is part of that shape's contract:
-  `split`'s task example is parsed by `artifact`'s tests, so a template that
+  `analyze`'s task example is parsed by `artifact`'s tests, so a template that
   teaches a word the parser refuses fails the suite instead of a run.
 - `src/main.rs` — the thin launcher for the desktop app; `src/lib.rs` is the
   probe boundary, and `src/store.rs` is the filesystem scan behind the board.
@@ -79,7 +79,8 @@ withdraws the door and asks a blocking engine to stop.
 
 - Markdown under `.scratch/<feature-slug>/` in the *target* repository is the
   only durable state. No database, nothing that exists only in memory.
-- A step is a harness session; the engine decides from artifacts and gate exit
+- A step is a harness session, a gate, a question, a merge, a cleanup — or the
+  conflict step a merge names; the engine decides from artifacts and gate exit
   codes, never from a model's opinion of itself. What a harness step declares it
   runs on — `harness`, `model`, `effort` — is resolved against the door's
   catalog at its turn and honoured exactly: an unpublished or unavailable name
@@ -110,11 +111,24 @@ withdraws the door and asks a blocking engine to stop.
 - **One step is one folder.** Two steps that would run in the same directory
   never run together: a non-`per_task` step measures the repository root, and
   two sessions in one checkout would fight over the index. Only `per_task` steps
-  for different tasks overlap, because their worktrees are disjoint.
+  for different tasks overlap, because their worktrees are disjoint. The
+  cleanup is engine work outside the checkout, so this rule does not serialize
+  it with a session; the rule exists for sessions and the index.
 - **A merge step is a barrier.** It waits for everything in flight and starts
   nothing while it runs, because `merge()` refuses a checkout with uncommitted
   work and every step writes `run.md` into it. Do not relax the dirty check to
   make the queue faster; the barrier is what makes it correct.
+- **A merge may name its conflict step.** `on_conflict` names an enabled,
+  per-task harness step declared after the merge and naming it; when the rebase
+  conflicts the engine records the attempt and its repair, runs that step inside
+  the merge's turn (the barrier still holds), and retries. The step never gets
+  an ordinary job — its task is resolved once the merge lands — and the merge's
+  attempt budget bounds the rounds (ADR-0020).
+- **A run cleans up after itself.** A `cleanup` step, not per task and declared
+  after the summary, names the merge like the summary does: it removes each
+  merged task's worktree, deletes its branch and prunes. `main`, the issue
+  folder and unresolved tasks are untouched; a cleanup that cannot finish blocks
+  the run, and it is idempotent (ADR-0021).
 - **One harness per dispatched step.** A door client's event stream is a single
   queue, so one client cannot serve two sessions — `await_idle` drops frames
   that belong to another session. The engine asks a `HarnessFactory` for one per
@@ -124,14 +138,20 @@ withdraws the door and asks a blocking engine to stop.
   `repairs/` and the commits are applied on the one thread, which is what keeps
   `run.md` single-writer and the folder numbering collision-free. `run.md`'s
   `running:` is a comma-separated list because several steps may be in flight.
-- A step after the task lanes (`bump`, `summary`) is not per task: it waits for
-  a per-task step, and a per-task dependency resolves for the graph as "every
-  task has it". The one exception is a step **above the merge queue**: a task
-  `Blocked by:` another starts only after that blocker's merge resolves it, so
-  counting the blocked task would ask the join to wait for the merge that waits
-  for the join. `Runner::graph_done_before_merge` is that reading, and
+- **The record's present beats the log.** While `run.md`'s status is `running`,
+  a step or lane that `running:` names is running whatever the log's last row
+  says; when the run stops, the log's last row is the step's state. An attempt
+  belongs to a budget window: a person's retry of a blocked run opens a new
+  window and `run.md` records the retry, so the log may say `attempt 1` twice
+  and the record says why.
+- A step after the task lanes (`bump`, `summary`, `cleanup`) is not per task:
+  it waits for a per-task step, and a per-task dependency resolves for the graph
+  as "every task has it". The one exception is a step **above the merge queue**:
+  a task `Blocked by:` another starts only after that blocker's merge resolves
+  it, so counting the blocked task would ask the join to wait for the merge that
+  waits for the join. `Runner::graph_done_before_merge` is that reading, and
   `Workflow::precedes_merge` is what names the step; a step below the queue
-  (`summary`) keeps the strict one.
+  (`summary`, `cleanup`) keeps the strict one.
 - **The file is read downwards.** `depends_on` has three states (ADR-0018):
   omitted is every step declared before it, `[]` is a root, a list is exactly
   those. `Workflow::dependencies` is the one resolver — the scheduler, the cycle

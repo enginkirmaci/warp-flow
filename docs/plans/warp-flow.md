@@ -1,15 +1,16 @@
 # warp-flow
 
-_Status: design closed; S0–S6 done and their open tickets closed. Six grill rounds; the build
-order below is accepted. This repository is the checkout; warp-suite links it
-at `apps/warp-flow` and pins it in `suite.toml`._
+_Status: design closed; S0–S6 done and their open tickets closed. Six grill
+rounds; the build order below is accepted. A later round added the merge's
+conflict step, the cleanup step and one analyze step that writes the plan
+(ADR-0020–0022). This repository is the checkout; warp-suite links it at
+`apps/warp-flow` and pins it in `suite.toml`._
 
 Takes a request — a feature, a bug, a change — and drives it to merged code:
-distil it into an issue, split it into tasks, write each task in its own
-worktree, review it, run the repository's gates, and merge it into the main
-branch. Every step that needs judgement is a harness session; the engine itself
-never calls a model. When the run needs a person it writes a question and
-waits.
+distil it into an issue and its tasks, write each task in its own worktree,
+review it, run the repository's gates, and merge it into the main branch. Every
+step that needs judgement is a harness session; the engine itself never calls a
+model. When the run needs a person it writes a question and waits.
 
 **Vocabulary** lives in [`GLOSSARY.md`](../../GLOSSARY.md#warp-flow): request,
 issue, task, blocker, step, workflow, revision, run, attempt, gate, skill,
@@ -34,10 +35,11 @@ artifact, question, approval, repair.
    A run copies the default graph into the issue folder and reads it at each
    step boundary, so a change — by a person or by the engine — lands on the next
    step and never inside a running session. Every change appends a revision.
-5. **Tasks are a dependency graph.** `split` writes `Blocked by:` lines, as the
-   tracker already does. A task starts only once every blocker has **merged**,
-   because its worktree branches from `main`. Ready tasks run in parallel up to
-   a per-repo budget (2 today); the merge queue is strictly serial.
+5. **Tasks are a dependency graph.** `analyze` writes `Blocked by:` lines, as the
+   tracker already does (ADR-0022). A task starts only once every blocker has
+   **merged**, because its worktree branches from `main`. Ready tasks run in
+   parallel up to a per-repo budget (2 today); the merge queue is strictly
+   serial.
 6. **A lane is serial.** `code → review → gate` per task: review may ask for
    changes, so the gate must measure the code that will actually merge.
    Parallelism is across ready tasks, not inside one.
@@ -51,9 +53,12 @@ artifact, question, approval, repair.
    An existing test may change only with a reason tied to the spec, and deleting
    one, skipping one or weakening an assertion needs a person's answer.
 9. **Merge is local and serial.** Rebase onto `main`, run the gates on the
-   rebased result, `--no-ff` merge, push only if the merge step says so. A conflict
-   is repaired on the task branch (never on `main`) for at most two attempts,
-   then it becomes a question. No force-push, ever.
+   rebased result, `--no-ff` merge, push only if the merge step says so. A
+   conflict is handed to the merge's conflict step, which resolves it on the
+   task branch (never on `main`) and finishes the rebase there; the merge then
+   retries, and its attempt budget bounds the rounds (ADR-0020). A merge with no
+   conflict step, and a conflict whose resolver spent its budget, retries the
+   identical rebase and blocks when the attempts are spent. No force-push, ever.
    A task branch with no commits of its own is a failed attempt, never a
    resolved task: the queue reports "nothing to merge" and the repair names the
    repository it measured, which is how a task written against another checkout
@@ -82,9 +87,12 @@ artifact, question, approval, repair.
     no other path is ever staged. Without them the merge queue would refuse its
     own run: writing `run.md` is what makes the main checkout dirty. A dirty
     tree outside the issue folder is still a refusal to start.
-14. **Artifacts outlive the run.** A merged issue folder stays with
-    `Status: merged`; an explicit `flow gc` archives old ones. Nothing is
-    deleted automatically.
+14. **The issue folder outlives the run; the working debris does not.** A
+    merged issue folder stays with `Status: merged`; an explicit `flow gc`
+    archives old ones. The run's own cleanup step removes each merged task's
+    worktree and deletes its branch once the run has landed (ADR-0021), so what
+    a person reads is the issue folder and the merge commits, not a checkout per
+    task. A blocked run's debris is left alone; `flow gc` is the command for it.
 15. **Dogfood order:** a warp-suite kit crate first (`cargo test -p …`, headless
     and fast), then warp-notes, then warp-flow itself.
 16. **The checkout is a sibling, like every other app's.** This repository
@@ -210,23 +218,34 @@ effort. Dispatch resolves the three against the door's catalog when the step's
 turn comes and refuses a name nothing publishes, so the record says what ran
 (ADR-0017).
 
+A merge step may name the step that resolves its conflict
+(`on_conflict = "resolve-conflict"`, ADR-0020), and a `cleanup` step ends the
+run (ADR-0021); both are declared in this one file like every other step.
+
 ## The graph
 
-`analyze → split → approve-plan → [ready tasks: code → review → fmt → clippy →
-test] → bump → merge → summary`, with two node kinds the engine may insert:
-`research` (when `analyze` finds an open question) and `repair` (after a failed
-attempt). A run's state lives in `run.md`; the live view is the graph itself.
+`analyze → approve-plan → [ready tasks: code → review → fmt → clippy → test] →
+bump → merge → [resolve-conflict] → summary ∥ cleanup`, with two node kinds the
+engine may still insert: `research` (when `analyze` finds an open question) and
+`repair` (after a failed attempt). The conflict step is declared and named by
+its merge, not inserted (ADR-0020); the cleanup is a step like any other
+(ADR-0021). A run's state lives in `run.md`; the live view is the graph itself.
 
-`bump` and `summary` are not per task: they wait for a per-task step, which
-means they run once, after every task has it. `bump` moves the version before
-the queue lands anything; `summary` writes the run's closing report.
+`bump`, `summary` and `cleanup` are not per task: they wait for a per-task step,
+which means they run once, after every task has it. `bump` moves the version
+before the queue lands anything; `summary` writes the run's closing report;
+`cleanup` removes the working debris. `summary` and `cleanup` are siblings —
+both name `merge`, so neither waits for the other, and the engine may run them
+in one wave.
 
 The engine runs a wave at once, bounded by the workflow's `max_parallel`, with
 two rules that are not choices: two steps that would run in the same folder
 never run together, and a merge step is a barrier — it waits for everything in
 flight and starts nothing while it runs, because the merge queue refuses a
-checkout with uncommitted work. A harness cannot serve two sessions, so each
-dispatched step gets its own door connection.
+checkout with uncommitted work. The cleanup is engine work that never touches
+the checkout, so the one-folder rule does not hold it back from the summary. A
+harness cannot serve two sessions, so each dispatched step gets its own door
+connection.
 
 ## The UI
 
@@ -327,12 +346,15 @@ filled primary per surface.
 The documents ship **inside `warp-flow-core`** (`crates/warp-flow-core/skills/`,
 embedded with `include_str!`), because a workflow names a skill and every
 repository warp-flow drives would otherwise have to carry the same text. Six
-are shipped: `analyze`, `split`, `code`, `review`, `bump` and `summary` — five
-of them are the skills the `implement` graph names today. `bump` stays shipped
-only because warp-suite's template and a run's pinned copy still name it: the
-graph runs the bump as a gate, `python3 scripts/bump.py`, now (ADR-0019).
-`summary` closes the run: it reads the whole issue folder and writes
+are shipped: `analyze`, `code`, `review`, `bump`, `summary` and
+`merge-conflict`. `analyze` writes the spec and the task files, because split's
+work was the same discovery in a second session (ADR-0022); the `split` document
+is gone, and a graph naming it is refused during preparation. `bump` stays
+shipped only because warp-suite's template and a run's pinned copy still name
+it: the graph runs the bump as a gate, `python3 scripts/bump.py`, now
+(ADR-0019). `summary` closes the run: it reads the whole issue folder and writes
 `summary.md`, the report a person who did not watch the run needs.
+`merge-conflict` is the step a merge names for its conflict (ADR-0020).
 `analyze-gates`, `merge` and `repair` are documents too, but only once a graph
 runs them as sessions: `merge` is the engine's own queue today, and `repair` is
 a future node kind. `research` and `prototype` are v2.

@@ -1,7 +1,7 @@
 # warp-flow
 
 Takes a request — a feature, a bug, a change — and drives it to merged code:
-distil it into an issue, split it into tasks, write each task in its own
+distil it into an issue and the tasks it needs, write each task in its own
 worktree, review it, run the repository's gates, bump the version, merge it,
 and write the report a person reads afterwards.
 
@@ -62,7 +62,7 @@ run puts its four tabs in the run's head:
 | --- | --- |
 | Run | the workflow as step bands, the task chips, the question, the attempt history, the engine's log and the harness sessions each step recorded |
 | Artifacts | the issue folder's documents, edited in place and saved atomically |
-| Task & diff | the files the run wrote, conflicts first, the diff beside them, and the run's gates with the outcome each last produced |
+| Task & diff | the task's branch, its files and diff while the run holds them, and the run's gates with the outcome each last produced |
 | Workflow | the revision the run uses, read-only: the template is edited in Repos › Workflow |
 
 `Repos` is the window a person edits: its `Workflow` tab is the repository's
@@ -88,6 +88,12 @@ names that step, the `verdict` in the artifact's front matter — `ready` or
 `changes` — decides whether the run advances or walks back, and `rework_max` is
 the budget. A budget spent with no round saying `ready` fails the step and
 stops the run.
+
+A merge step can name the step that resolves its conflict: `on_conflict` runs
+that step in the task's worktree when the rebase conflicts, and the merge
+retries. The run closes with two sibling steps — `summary` writes the report,
+`cleanup` removes each merged task's worktree and branch — so the issue folder
+outlives the run while the working debris does not (ADR-0020, ADR-0021).
 
 The engine owns an issue folder while it drives a run: Artifacts refuses an
 edit then (one line says why), while the repository's Workflow template may
