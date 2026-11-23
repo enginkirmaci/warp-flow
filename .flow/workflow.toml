@@ -24,11 +24,11 @@
 # What a harness step runs on is picked per step (ADR-0017): `harness`, `model`
 # and `effort` are resolved against warp-agent's catalog when the step's turn
 # comes, and a name nothing publishes blocks the step instead of being swapped
-# for another. Every harness step here runs on dsh with
+# for another. Every remaining harness step runs on dsh with
 # `opencode-go/deepseek-v4.1-flash`; the effort is the one thing that differs,
 # because it is the only knob that should: the steps that decide and write get
-# `max`, the ones that read and report get `high`, and the mechanical one gets
-# `low`.
+# `max`, and the ones that read and report get `high`. `bump` is no longer a
+# harness step: it is the gate below, a command that moves the version.
 schema = 2
 name = "implement"
 revision = 1
@@ -130,20 +130,20 @@ depends_on = ["clippy"]
 # for a per-task step means waiting for every task to have it: exactly what a
 # step after the task lanes should do.
 #
-# The version moves once, before the queue lands anything: the engine's own
-# commits pass `--no-verify`, so the pre-commit hook that bumps PATCH never runs
-# on them. One bump per run, never one per task — two task branches that each
-# bumped the same file would conflict on the second merge.
-#
-# It edits two files and runs the version script, and the script decides the
-# number: `low` is the right effort for a step with nothing to think about.
+# The version moves once, before the queue lands anything, and the gate command
+# does the mechanical work itself: `scripts/bump.py` bumps PATCH, runs the
+# writer's check and commits the writer's files. It commits with `--no-verify`,
+# because the per-commit hook would bump PATCH a second time; the script's clean
+# guard is what makes that one commit the writer's files only. One bump per run,
+# never one per task — two task branches that each bumped the same file would
+# conflict on the second merge.
 [[step]]
 id = "bump"
-kind = "harness"
-skill = "bump"
-harness = "dsh"
-model = "opencode-go/deepseek-v4.1-flash"
-effort = "low"
+kind = "gate"
+command = "python3 scripts/bump.py"
+cwd = "."
+timeout_secs = 300
+per_task = false
 
 [[step]]
 id = "merge"

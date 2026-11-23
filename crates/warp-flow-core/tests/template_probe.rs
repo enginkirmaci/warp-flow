@@ -96,6 +96,54 @@ fn the_repositorys_own_template_reads_downwards() {
 }
 
 #[test]
+fn the_repositorys_own_template_ships_the_bump_as_a_gate() {
+    // The bump is mechanical — move PATCH, check it, commit it — so it is a
+    // gate whose command does the work, not a session. `scripts/bump.py` is
+    // that command; it joins the task lane above the queue and runs once for
+    // the run, never once per task (ADR-0019).
+    let graph = template();
+    let bump = graph.step("bump").expect("bump is in the template");
+    assert_eq!(bump.kind, StepKind::Gate);
+    assert_eq!(
+        bump.command.as_deref(),
+        Some("python3 scripts/bump.py"),
+        "the gate runs the repository's bump script"
+    );
+    assert_eq!(
+        bump.cwd.as_deref(),
+        Some("."),
+        "the script runs at the root"
+    );
+    assert_eq!(bump.timeout_secs, Some(300));
+    assert!(!bump.per_task, "the bump runs once, not once per task");
+    assert_eq!(bump.depends_on, None, "the join takes the file's order");
+    for (field, value) in [
+        ("skill", &bump.skill),
+        ("harness", &bump.harness),
+        ("model", &bump.model),
+        ("effort", &bump.effort),
+    ] {
+        assert!(value.is_none(), "the bump gate names no {field}");
+    }
+
+    let waits_for = graph.dependencies(bump);
+    for id in ["fmt", "clippy", "test"] {
+        assert!(
+            waits_for.iter().any(|dependency| dependency == id),
+            "`bump` waits for `{id}`: {waits_for:?}"
+        );
+    }
+    let merge = graph.step("merge").expect("merge is in the template");
+    let merge_waits_for = graph.dependencies(merge);
+    assert!(
+        merge_waits_for
+            .iter()
+            .any(|dependency| dependency == "bump"),
+        "the merge queue waits for the bump: {merge_waits_for:?}"
+    );
+}
+
+#[test]
 fn every_harness_step_names_what_it_runs_on() {
     // A step with no pick is the engine's choice, which is fine for a template
     // someone else writes; this repository's own runs say what they use, so a
