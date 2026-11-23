@@ -327,10 +327,10 @@ filled primary per surface.
 The documents ship **inside `warp-flow-core`** (`crates/warp-flow-core/skills/`,
 embedded with `include_str!`), because a workflow names a skill and every
 repository warp-flow drives would otherwise have to carry the same text. Six
-are shipped: `analyze`, `split`, `code`, `review`, `bump` and `summary` — the
-ones the `implement` graph names today. `bump` moves the version once before
-the merge queue lands anything, because the engine's own commits pass
-`--no-verify` and so never trigger the pre-commit hook that bumps PATCH.
+are shipped: `analyze`, `split`, `code`, `review`, `bump` and `summary` — five
+of them are the skills the `implement` graph names today. `bump` stays shipped
+only because warp-suite's template and a run's pinned copy still name it: the
+graph runs the bump as a gate, `python3 scripts/bump.py`, now (ADR-0019).
 `summary` closes the run: it reads the whole issue folder and writes
 `summary.md`, the report a person who did not watch the run needs.
 `analyze-gates`, `merge` and `repair` are documents too, but only once a graph
