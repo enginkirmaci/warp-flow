@@ -1,6 +1,6 @@
 # 05: Record that the bump is a gate and update the words that describe it
 
-**Status:** ready-for-agent
+**Status:** resolved
 **Category:** enhancement
 **Blocked by:** None
 
