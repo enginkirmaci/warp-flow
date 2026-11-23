@@ -29,9 +29,10 @@ decision it makes is written down before the next step reads it.
 | **attempt** | One try of one step inside a run; a retry or a repair opens a new attempt. |
 | **gate** | A check a step's result must pass: a shell command, its working directory, a timeout, and what its exit code means. A gate is carried by a gate step, not declared apart from it. |
 | **skill** | The markdown document a step hands to its harness session, telling it how to perform that step. |
-| **harness** | The program a step's session runs in, chosen per step. A model belongs to one harness, so choosing a model chooses the harness. |
-| **model** | The model a step's session asks for, chosen per step from the door's live catalog. Unset means the engine picks the first model of the chosen harness. |
-| **effort** | How hard a step's session is asked to think, chosen per step from the chosen model's variants. Unset means the model's own default. |
+| **catalog** | The harnesses, models and efforts warp-agent's door publishes right now. Warp Flow caches the last answer and offers it in the three catalog fields of a harness step, because a name nothing publishes is a step that blocks when its turn comes. |
+| **harness** | The program a step's session runs in, chosen per step from the door's catalog. A model belongs to one harness, so choosing a model chooses the harness. Unset means the engine's choice, and a name the door does not publish is refused when the step's turn comes rather than replaced by another (ADR-0017). |
+| **model** | The model a step's session asks for, chosen per step from the door's catalog. Unset means the engine picks the first model of the chosen harness, and a model the harness does not publish blocks the step. |
+| **effort** | How hard a step's session is asked to think: one of the chosen model's variants, picked per step. Unset means the model's own default, and an effort belongs to a model the way a model belongs to a harness. |
 | **artifact** | A markdown file a step writes inside the issue's folder: its result and the next step's input. |
 | **question** | Something the run needs a person to answer before it continues: an approval, one choice, several choices, or free text. It is written into the issue folder, and the run pauses until the answer is written back. |
 | **approval** | A question whose answer is yes or no — merge or not, plan or not. |

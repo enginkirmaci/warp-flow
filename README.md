@@ -71,8 +71,12 @@ its first dependency, and any further dependency is a chip on its row, so a
 fork and a join are visible as such. A step is added at the front, after the
 selection or at the end, which is what decides what it waits for; a step can be
 disabled, and its dependents then inherit its own dependencies so the pipeline
-closes over it. A harness step chooses its harness, model and effort from the
-door's live catalog. `About` carries the
+closes over it. A harness step picks its harness, model and effort from the
+door's catalog — three selects beside the text fields, each cascading to the
+next, with an empty choice meaning the engine's own — and the engine runs
+exactly what the step names: a harness it does not publish is a step that stops
+at its own boundary with a repair naming it, never a silent substitution
+(ADR-0017). `About` carries the
 installed family, the build and the license; `Settings` the reduce-motion
 switch, where the app keeps its files, the door's state and the version.
 

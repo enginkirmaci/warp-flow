@@ -8,11 +8,12 @@
 //! thread. Answer frames are routed to the request that is waiting for their
 //! `id`; id-less `{"event":…}` frames are queued for
 //! [`DoorClient::next_event`]. [`DoorHarness`] runs one workflow step as one
-//! harness session: `harness metadata` and `models` pick the backend,
-//! `harness start` attaches the event pump, a broad subscription learns the
-//! new session id from the `session-changed` push (the create reply cannot
-//! carry it), and a narrow subscription carries the prompt and the idle
-//! status. The transcript, never the prompt echo, supplies the text.
+//! harness session: `harness metadata` and `models` pick the backend, honouring
+//! the harness, model and effort the step declares, `harness start` attaches
+//! the event pump, a broad subscription learns the new session id from the
+//! `session-changed` push (the create reply cannot carry it), and a narrow
+//! subscription carries the prompt and the idle status. The transcript, never
+//! the prompt echo, supplies the text.
 //!
 //! The client never calls `open-workspace` and never uses `run-prompt`: a
 //! session created with `harness create` does not become a workspace row in
@@ -33,6 +34,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value, json};
 
 use crate::artifact::{Document, FrontMatter};
+use crate::graph::Step;
 use crate::harness::{Harness, StepOutcome, StepRequest};
 use crate::run::timestamp;
 use crate::{Error, Result};
@@ -491,6 +493,11 @@ pub struct CatalogHarness {
     pub id: String,
     /// The harness's label, for a person.
     pub label: String,
+    /// Whether the door reports it able to run right now.
+    pub available: bool,
+    /// Whether it is a managed connection, which the engine prefers: an
+    /// attached adapter has no event pump of its own.
+    pub managed: bool,
     /// The models this harness publishes, each with its effort variants.
     pub models: Vec<CatalogModel>,
 }
@@ -504,67 +511,271 @@ pub struct CatalogModel {
     pub variants: Vec<String>,
 }
 
-/// Read the door's live catalog: every enabled harness and its models.
+/// Parse the door's `harness metadata` and `models` answers into its catalog.
 ///
-/// The workflow editor offers these as choices, so a step's `harness`, `model`
-/// and `effort` are picked from what the door actually publishes rather than
-/// typed from memory. A door that is not running is an error the caller shows
-/// as a note; the editor still works, with the fields left free.
-pub fn read_catalog() -> Result<Vec<CatalogHarness>> {
-    let client = DoorClient::local()?;
-    let metadata = client.request("harness", json!({"method": "metadata", "params": {}}))?;
+/// Every harness the door publishes is kept, in the door's order, with its
+/// availability and connection; each catalog model is attached to the harness
+/// its `harness` field names, and a harness with no catalog entry keeps an
+/// empty `models`. A catalog entry that names no published harness, or has no
+/// key, attaches to nothing.
+///
+/// The parser decides nothing about who may pick what: the editor offers the
+/// enabled harnesses and dispatch may only select an available one, so those
+/// filters live at the two callers instead of being baked into the shape.
+fn parse_catalog(metadata: &Value, models: &Value) -> Result<Vec<CatalogHarness>> {
     let published = metadata
         .get("harnesses")
         .and_then(Value::as_array)
         .ok_or_else(|| {
             Error::Harness("`harness metadata` answered without a `harnesses` array".to_owned())
         })?;
-    let models = client.request("models", json!({"refresh": false}))?;
     let catalog = models
         .get("catalog")
         .and_then(Value::as_array)
-        .cloned()
+        .map(Vec::as_slice)
         .unwrap_or_default();
 
-    let mut harnesses = Vec::new();
-    for entry in published {
-        if entry.get("enabled") != Some(&Value::Bool(true)) {
-            continue;
-        }
-        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+    let mut harnesses: Vec<CatalogHarness> = published
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.get("id").and_then(Value::as_str)?;
+            Some(CatalogHarness {
+                id: id.to_owned(),
+                label: entry
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id)
+                    .to_owned(),
+                available: entry.get("available") == Some(&Value::Bool(true)),
+                managed: entry.get("connection").and_then(Value::as_str) == Some("managed"),
+                models: Vec::new(),
+            })
+        })
+        .collect();
+
+    for entry in catalog {
+        let Some(key) = entry.get("key").and_then(Value::as_str) else {
             continue;
         };
-        let label = entry
-            .get("label")
-            .and_then(Value::as_str)
-            .unwrap_or(id)
-            .to_owned();
-        let models = catalog
-            .iter()
-            .filter(|model| model.get("harness").and_then(Value::as_str) == Some(id))
-            .filter_map(|model| {
-                let key = model.get("key").and_then(Value::as_str)?.to_owned();
-                let variants = model
-                    .get("variants")
-                    .and_then(Value::as_array)
-                    .map(|variants| {
-                        variants
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Some(CatalogModel { key, variants })
+        let published_as = entry.get("harness").and_then(Value::as_str);
+        let Some(harness) = harnesses
+            .iter_mut()
+            .find(|harness| Some(harness.id.as_str()) == published_as)
+        else {
+            continue;
+        };
+        let variants = entry
+            .get("variants")
+            .and_then(Value::as_array)
+            .map(|variants| {
+                variants
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
             })
-            .collect();
-        harnesses.push(CatalogHarness {
-            id: id.to_owned(),
-            label,
-            models,
+            .unwrap_or_default();
+        harness.models.push(CatalogModel {
+            key: key.to_owned(),
+            variants,
         });
     }
     Ok(harnesses)
+}
+
+/// The ids `harness metadata` reports enabled.
+fn enabled_ids(metadata: &Value) -> HashSet<&str> {
+    metadata
+        .get("harnesses")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.get("enabled") == Some(&Value::Bool(true)))
+        .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+        .collect()
+}
+
+/// Read the door's live catalog: every enabled harness and its models.
+///
+/// The workflow editor offers these as choices, so a step's `harness`, `model`
+/// and `effort` are picked from what the door actually publishes rather than
+/// typed from memory. A door that is not running is an error the caller shows
+/// as a note; the editor still works, with the fields left free.
+///
+/// An enabled harness is offered whether or not it is available right now: a
+/// person may pick it while its backend is stopped, and dispatch refuses the
+/// pick at the step's turn with a message naming the step.
+pub fn read_catalog() -> Result<Vec<CatalogHarness>> {
+    let client = DoorClient::local()?;
+    let metadata = client.request("harness", json!({"method": "metadata", "params": {}}))?;
+    let models = client.request("models", json!({"refresh": false}))?;
+    let enabled = enabled_ids(&metadata);
+    Ok(parse_catalog(&metadata, &models)?
+        .into_iter()
+        .filter(|harness| enabled.contains(harness.id.as_str()))
+        .collect())
+}
+
+/// What one workflow step will run, resolved against the door's catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Choice {
+    /// The harness the step's session runs in.
+    harness: String,
+    /// The model the session asks for.
+    model: String,
+    /// The reasoning effort the session asks for, when the step names one.
+    effort: Option<String>,
+}
+
+/// The order the engine prefers an available harness in: a managed connection
+/// first (an attached adapter has no event pump through the door), then `dsh`,
+/// then the id.
+fn rank(harness: &CatalogHarness) -> (bool, bool, &str) {
+    (!harness.managed, harness.id != "dsh", harness.id.as_str())
+}
+
+/// The available harnesses, in the engine's preference order.
+fn preferred(catalog: &[CatalogHarness]) -> Vec<&CatalogHarness> {
+    let mut available: Vec<&CatalogHarness> =
+        catalog.iter().filter(|harness| harness.available).collect();
+    available.sort_by(|left, right| rank(left).cmp(&rank(right)));
+    available
+}
+
+/// A comma-separated list for an error a person reads, or `none` when empty.
+fn listed(items: &[&str]) -> String {
+    if items.is_empty() {
+        "none".to_owned()
+    } else {
+        items.join(", ")
+    }
+}
+
+/// Decide the harness, model and effort one step runs.
+///
+/// A pick is honoured exactly: a step that names `dsh` runs `dsh`, never the
+/// better-ranked harness the engine would otherwise have taken, because the
+/// session file and `run.md` must report what the workflow declared. Only an
+/// available harness is selectable, a model must be one the chosen harness
+/// publishes, and an effort must be one of the chosen model's variants. Every
+/// refusal names the step and the value that did not match, so the person who
+/// edited the workflow can fix the step instead of guessing what was run.
+fn choose(catalog: &[CatalogHarness], step: &Step) -> Result<Choice> {
+    if catalog.is_empty() {
+        return Err(Error::Harness(format!(
+            "the door publishes no harness, so step `{}` cannot run; start warp-agent with a \
+             harness enabled before the run",
+            step.id
+        )));
+    }
+    // The graph refuses this pair before a run begins; this function must not
+    // guess which of the model's variants was meant when it is handed one.
+    if step.effort.is_some() && step.model.is_none() {
+        let effort = step.effort.as_deref().unwrap_or_default();
+        return Err(Error::Harness(format!(
+            "step `{}` names the effort `{effort}` but no model; an effort is one of a model's \
+             variants, so name the model it belongs to",
+            step.id
+        )));
+    }
+
+    let ranked = preferred(catalog);
+    let chosen = match step.harness.as_deref() {
+        Some(id) => {
+            let harness = catalog
+                .iter()
+                .find(|harness| harness.id == id)
+                .ok_or_else(|| {
+                    let ids: Vec<&str> =
+                        catalog.iter().map(|harness| harness.id.as_str()).collect();
+                    Error::Harness(format!(
+                        "step `{}` names the harness `{id}`, which the door does not publish; \
+                         it publishes: {}",
+                        step.id,
+                        listed(&ids)
+                    ))
+                })?;
+            if !harness.available {
+                return Err(Error::Harness(format!(
+                    "step `{}` names the harness `{id}`, which the door reports unavailable; \
+                     make it ready in warp-agent or pick a harness the door offers",
+                    step.id
+                )));
+            }
+            harness
+        }
+        None => match step.model.as_deref() {
+            Some(model) => ranked
+                .iter()
+                .copied()
+                .find(|harness| harness.models.iter().any(|entry| entry.key == model))
+                .ok_or_else(|| {
+                    Error::Harness(format!(
+                        "step `{}` names the model `{model}`, which no available harness \
+                         publishes; pick a model from the door's catalog",
+                        step.id
+                    ))
+                })?,
+            None => ranked.first().copied().ok_or_else(|| {
+                Error::Harness(format!(
+                    "the door publishes no available harness, so step `{}` cannot run; make one \
+                     ready in warp-agent before the run",
+                    step.id
+                ))
+            })?,
+        },
+    };
+
+    let model = match step.model.as_deref() {
+        Some(key) => chosen
+            .models
+            .iter()
+            .find(|entry| entry.key == key)
+            .ok_or_else(|| {
+                let keys: Vec<&str> = chosen
+                    .models
+                    .iter()
+                    .map(|entry| entry.key.as_str())
+                    .collect();
+                Error::Harness(format!(
+                    "step `{}` names the model `{key}`, which harness `{}` does not publish; \
+                     it publishes: {}",
+                    step.id,
+                    chosen.id,
+                    listed(&keys)
+                ))
+            })?,
+        None => chosen.models.first().ok_or_else(|| {
+            Error::Harness(format!(
+                "step `{}` runs in harness `{}`, which publishes no model; pick a harness that \
+                 publishes one",
+                step.id, chosen.id
+            ))
+        })?,
+    };
+
+    let effort = match step.effort.as_deref() {
+        Some(effort) => {
+            if !model.variants.iter().any(|variant| variant == effort) {
+                let variants: Vec<&str> = model.variants.iter().map(String::as_str).collect();
+                return Err(Error::Harness(format!(
+                    "step `{}` names the effort `{effort}`, which model `{}` does not offer; \
+                     it offers: {}",
+                    step.id,
+                    model.key,
+                    listed(&variants)
+                )));
+            }
+            Some(effort.to_owned())
+        }
+        None => None,
+    };
+
+    Ok(Choice {
+        harness: chosen.id.clone(),
+        model: model.key.clone(),
+        effort,
+    })
 }
 
 /// The [`Harness`] the app uses: one door session per workflow step.
@@ -659,21 +870,22 @@ impl DoorHarness {
 
     /// Run one step as one harness session.
     fn run_step(&self, request: &StepRequest) -> Result<StepOutcome> {
-        let (harness, model) = self.select_harness()?;
+        let choice = self.choose_harness(&request.step)?;
+        let harness = choice.harness.as_str();
+        let model = choice.model.as_str();
         let directory = request.workdir.to_string_lossy().into_owned();
 
         // `harness start` is what attaches the event pump for a
         // workspace-scoped harness; it is a fast no-op for an already ready
         // managed one, and this client never opens a workspace instead.
-        self.call("start", base_params(&harness, &directory))?;
+        self.call("start", base_params(harness, &directory))?;
 
         // The create reply cannot carry a session id (`id` is the reserved
         // request id and the door drops payload keys with that name), so
         // subscribe to the harness before create and learn the id from the
         // push. Pushes are live only: a subscription made afterwards misses it.
         let create_subscription = unique_name("warp-flow-create");
-        self.client
-            .subscribe(&create_subscription, &harness, None)?;
+        self.client.subscribe(&create_subscription, harness, None)?;
         let mut known: HashSet<String> = HashSet::new();
         while let Some(event) = self.client.next_event(Duration::ZERO) {
             if let Some(session) = event.session() {
@@ -682,16 +894,16 @@ impl DoorHarness {
         }
 
         let title = session_title(&request.step.id);
-        let mut create = base_params(&harness, &directory);
+        let mut create = base_params(harness, &directory);
         insert(&mut create, "title", &title);
-        insert(&mut create, "model", &model);
+        insert(&mut create, "model", model);
         if let Err(error) = self.call("create", create) {
             // The run is already failing; drop the broad subscription on a
             // best-effort basis so it does not keep feeding this connection.
             let _ = self.client.unsubscribe(&create_subscription);
             return Err(error);
         }
-        let session = match self.await_session(&harness, &title, &mut known) {
+        let session = match self.await_session(harness, &title, &mut known) {
             Ok(session) => session,
             Err(error) => {
                 let _ = self.client.unsubscribe(&create_subscription);
@@ -702,32 +914,31 @@ impl DoorHarness {
         self.client.unsubscribe(&create_subscription)?;
         let run_subscription = unique_name("warp-flow-run");
         self.client
-            .subscribe(&run_subscription, &harness, Some(&session))?;
+            .subscribe(&run_subscription, harness, Some(&session))?;
 
-        let mut prompt = base_params(&harness, &directory);
-        insert(&mut prompt, "session", &session);
-        insert(&mut prompt, "text", &request.prompt);
-        insert(&mut prompt, "model", &model);
         // `ok` here is only the adapter's acceptance, not a finished turn;
         // completion is the `session-status` `idle` push below.
-        self.call("send_prompt", prompt)?;
+        self.call(
+            "send_prompt",
+            prompt_params(&choice, &session, &directory, &request.prompt),
+        )?;
 
-        match self.await_idle(&harness, &session)? {
+        match self.await_idle(harness, &session)? {
             Status::Idle => {
-                let text = self.transcript_text(&harness, &session, &directory)?;
-                let wrote = record_session(request, &harness, &session, "done", &text)
+                let text = self.transcript_text(harness, &session, &directory)?;
+                let wrote = record_session(request, harness, &session, "done", &text)
                     .into_iter()
                     .collect();
                 Ok(StepOutcome::Done { wrote, text })
             }
             Status::Failed(message) => {
-                let transcript = self.transcript_text(&harness, &session, &directory);
+                let transcript = self.transcript_text(harness, &session, &directory);
                 let recorded = match &transcript {
                     Ok(text) => text.clone(),
                     Err(error) => error.to_string(),
                 };
                 let reason = with_partial_text(message, transcript);
-                record_session(request, &harness, &session, "failed", &recorded);
+                record_session(request, harness, &session, "failed", &recorded);
                 Ok(StepOutcome::Blocked { reason })
             }
             Status::TimedOut(cap) => {
@@ -753,89 +964,31 @@ impl DoorHarness {
                         interrupted.push_str(&format!("; interrupt failed: {error}"));
                     }
                 }
-                let transcript = self.transcript_text(&harness, &session, &directory);
+                let transcript = self.transcript_text(harness, &session, &directory);
                 let recorded = match &transcript {
                     Ok(text) => text.clone(),
                     Err(error) => error.to_string(),
                 };
                 let reason = with_partial_text(interrupted, transcript);
-                record_session(request, &harness, &session, "timed-out", &recorded);
+                record_session(request, harness, &session, "timed-out", &recorded);
                 Ok(StepOutcome::Blocked { reason })
             }
         }
     }
 
-    /// Pick an enabled, available harness and the first model of its catalog.
+    /// Resolve what the step will run, against the door's live catalog.
     ///
-    /// A managed connection wins over an attached one (attached adapters have
-    /// no event pump through the door), and `dsh` is preferred among equals.
-    /// Nothing is hardcoded to `opencode`: the v1 harness is workspace-scoped
-    /// and often disabled. The model is looked up only after the harness has
-    /// been chosen, from the cached catalog (`refresh: false`).
-    fn select_harness(&self) -> Result<(String, String)> {
+    /// The two requests are the ones [`read_catalog`] makes: `harness metadata`
+    /// and the cached `models` (`refresh: false`). The decision itself is
+    /// [`choose`], which is pure, so every rule about a named pick is tested
+    /// without a door. A door that publishes no harness at all is an error
+    /// saying so, rather than a session started nowhere.
+    fn choose_harness(&self, step: &Step) -> Result<Choice> {
         let metadata = self
             .client
             .request("harness", json!({"method": "metadata", "params": {}}))?;
-        let published = metadata
-            .get("harnesses")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                Error::Harness("`harness metadata` answered without a `harnesses` array".to_owned())
-            })?;
-
-        let candidates: Vec<&Value> = published
-            .iter()
-            .filter(|entry| {
-                entry.get("enabled") == Some(&Value::Bool(true))
-                    && entry.get("available") == Some(&Value::Bool(true))
-                    && entry.get("id").and_then(Value::as_str).is_some()
-            })
-            .collect();
-        if candidates.is_empty() {
-            return Err(Error::Harness(
-                "the door publishes no enabled, available harness".to_owned(),
-            ));
-        }
-
         let models = self.client.request("models", json!({"refresh": false}))?;
-        let catalog = models
-            .get("catalog")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let model_for = |id: &str| -> Option<String> {
-            catalog
-                .iter()
-                .find(|entry| entry.get("harness").and_then(Value::as_str) == Some(id))
-                .and_then(|entry| entry.get("key"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        };
-
-        let mut ranked: Vec<((bool, bool, String), &Value)> = candidates
-            .into_iter()
-            .map(|entry| {
-                let id = entry.get("id").and_then(Value::as_str).unwrap_or_default();
-                let managed = entry.get("connection").and_then(Value::as_str) == Some("managed");
-                let rank = (!managed, id != "dsh", id.to_owned());
-                (rank, entry)
-            })
-            .collect();
-        ranked.sort_by(|left, right| left.0.cmp(&right.0));
-
-        let chosen = ranked
-            .first()
-            .map(|(_, entry)| *entry)
-            .ok_or_else(|| Error::Harness("no selectable harness was reported".to_owned()))?;
-        let id = chosen
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let model = model_for(&id).ok_or_else(|| {
-            Error::Harness(format!("the door publishes no model for harness `{id}`"))
-        })?;
-        Ok((id, model))
+        choose(&parse_catalog(&metadata, &models)?, step)
     }
 
     /// Wait for the push that names the session `harness create` just made.
@@ -1329,6 +1482,22 @@ fn base_params(harness: &str, directory: &str) -> Value {
     json!({"harness": harness, "directory": directory})
 }
 
+/// The params of `harness send_prompt` for one step's choice.
+///
+/// The effort travels as the door's `variant`, which the `dsh` adapter applies
+/// through `session/selectModel` before the turn starts. A step with no effort
+/// sends no `variant`, so the model's own default stands.
+fn prompt_params(choice: &Choice, session: &str, directory: &str, text: &str) -> Value {
+    let mut params = base_params(&choice.harness, directory);
+    insert(&mut params, "session", session);
+    insert(&mut params, "text", text);
+    insert(&mut params, "model", &choice.model);
+    if let Some(effort) = &choice.effort {
+        insert(&mut params, "variant", effort);
+    }
+    params
+}
+
 /// A title unique enough to identify the session on a busy harness.
 fn session_title(step: &str) -> String {
     let token = unique_token();
@@ -1414,6 +1583,365 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::StepKind;
+
+    /// The two answers the fake door sends, in the door's own shape.
+    fn metadata() -> Value {
+        json!({
+            "harnesses": [
+                {
+                    "id": "opencode-v2",
+                    "label": "opencode v2",
+                    "connection": "attached",
+                    "enabled": true,
+                    "available": true,
+                },
+                {
+                    "id": "dsh",
+                    "label": "DeepSeek (dsh)",
+                    "connection": "managed",
+                    "enabled": true,
+                    "available": true,
+                },
+                {
+                    "id": "cold",
+                    "label": "cold managed",
+                    "connection": "managed",
+                    "enabled": true,
+                    "available": false,
+                },
+                {
+                    "id": "quiet",
+                    "label": "quiet",
+                    "connection": "attached",
+                    "enabled": true,
+                    "available": true,
+                },
+            ]
+        })
+    }
+
+    fn models() -> Value {
+        json!({
+            "catalog": [
+                {
+                    "key": "opencode-v2/free-model",
+                    "harness": "opencode-v2",
+                    "variants": [],
+                },
+                {
+                    "key": "opencode-go/deepseek-v4.1-flash",
+                    "harness": "dsh",
+                    "variants": ["low", "high", "max"],
+                },
+            ]
+        })
+    }
+
+    /// The parsed fixture, for a decision that needs no door.
+    fn catalog() -> Vec<CatalogHarness> {
+        vec![
+            CatalogHarness {
+                id: "opencode-v2".to_owned(),
+                label: "opencode v2".to_owned(),
+                available: true,
+                managed: false,
+                models: vec![CatalogModel {
+                    key: "opencode-v2/free-model".to_owned(),
+                    variants: Vec::new(),
+                }],
+            },
+            CatalogHarness {
+                id: "dsh".to_owned(),
+                label: "DeepSeek (dsh)".to_owned(),
+                available: true,
+                managed: true,
+                models: vec![CatalogModel {
+                    key: "opencode-go/deepseek-v4.1-flash".to_owned(),
+                    variants: vec!["low".to_owned(), "high".to_owned(), "max".to_owned()],
+                }],
+            },
+            CatalogHarness {
+                id: "cold".to_owned(),
+                label: "cold managed".to_owned(),
+                available: false,
+                managed: true,
+                models: vec![CatalogModel {
+                    key: "cold/model".to_owned(),
+                    variants: Vec::new(),
+                }],
+            },
+            CatalogHarness {
+                id: "quiet".to_owned(),
+                label: "quiet".to_owned(),
+                available: true,
+                managed: false,
+                models: Vec::new(),
+            },
+        ]
+    }
+
+    /// A harness step, with nothing picked.
+    fn step(id: &str) -> Step {
+        Step {
+            id: id.to_owned(),
+            kind: StepKind::Harness,
+            enabled: true,
+            skill: Some("code".to_owned()),
+            harness: None,
+            model: None,
+            effort: None,
+            command: None,
+            cwd: None,
+            timeout_secs: None,
+            depends_on: Vec::new(),
+            produces: None,
+            rework_to: None,
+            rework_max: None,
+            per_task: false,
+            mode: None,
+            push: false,
+        }
+    }
+
+    /// A harness step that names some of a harness, model and effort.
+    fn picked(harness: Option<&str>, model: Option<&str>, effort: Option<&str>) -> Step {
+        let mut step = step("code");
+        step.harness = harness.map(str::to_owned);
+        step.model = model.map(str::to_owned);
+        step.effort = effort.map(str::to_owned);
+        step
+    }
+
+    #[test]
+    fn parse_catalog_reads_every_harness_in_order_and_attaches_its_models() {
+        let catalog = parse_catalog(&metadata(), &models()).expect("the two answers parse");
+        let ids: Vec<&str> = catalog.iter().map(|harness| harness.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["opencode-v2", "dsh", "cold", "quiet"],
+            "the door's order is kept"
+        );
+        assert_eq!(catalog[1].label, "DeepSeek (dsh)");
+        assert!(
+            catalog[0].available && !catalog[0].managed,
+            "an attached harness that is ready is available and not managed"
+        );
+        assert!(catalog[1].managed, "a managed connection is marked");
+        assert!(
+            !catalog[2].available,
+            "a harness the door reports unavailable keeps that flag"
+        );
+        assert_eq!(catalog[0].models.len(), 1);
+        assert_eq!(catalog[0].models[0].key, "opencode-v2/free-model");
+        assert!(catalog[0].models[0].variants.is_empty());
+        assert_eq!(catalog[1].models.len(), 1);
+        assert_eq!(catalog[1].models[0].variants, vec!["low", "high", "max"]);
+        assert!(
+            catalog[2].models.is_empty() && catalog[3].models.is_empty(),
+            "a harness with no catalog entry keeps an empty list"
+        );
+    }
+
+    #[test]
+    fn parse_catalog_refuses_an_answer_without_harnesses() {
+        let error = parse_catalog(&json!({"harnesses": null}), &json!({"catalog": []}))
+            .expect_err("an answer without the array is refused");
+        assert!(error.to_string().contains("`harnesses`"), "{error}");
+    }
+
+    #[test]
+    fn a_step_with_no_pick_takes_the_preferred_harness_and_its_first_model_with_no_effort() {
+        let choice = choose(&catalog(), &step("code")).expect("an available harness is picked");
+        assert_eq!(
+            choice.harness, "dsh",
+            "a managed harness outranks an attached one"
+        );
+        assert_eq!(
+            choice.model, "opencode-go/deepseek-v4.1-flash",
+            "the harness's first model is used"
+        );
+        assert!(
+            choice.effort.is_none(),
+            "an unpicked effort leaves the model's default"
+        );
+    }
+
+    #[test]
+    fn a_named_harness_is_honoured_over_a_better_ranked_one() {
+        let choice = choose(&catalog(), &picked(Some("opencode-v2"), None, None))
+            .expect("a published harness is honoured");
+        assert_eq!(choice.harness, "opencode-v2");
+        assert_eq!(choice.model, "opencode-v2/free-model");
+    }
+
+    #[test]
+    fn an_unpublished_harness_is_refused_with_the_step_and_the_id() {
+        let error = choose(&catalog(), &picked(Some("nowhere"), None, None))
+            .expect_err("a harness the door does not publish is refused");
+        let text = error.to_string();
+        assert!(
+            text.contains("step `code`"),
+            "the refusal names the step: {text}"
+        );
+        assert!(
+            text.contains("`nowhere`"),
+            "the refusal names the id: {text}"
+        );
+        assert!(
+            text.contains("opencode-v2, dsh, cold, quiet"),
+            "the refusal lists the ids the door publishes: {text}"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_harness_is_refused() {
+        let error = choose(&catalog(), &picked(Some("cold"), None, None))
+            .expect_err("a harness the door reports unavailable is refused");
+        let text = error.to_string();
+        assert!(
+            text.contains("step `code`") && text.contains("`cold`"),
+            "the refusal names the step and the id: {text}"
+        );
+        assert!(text.contains("unavailable"), "{text}");
+    }
+
+    #[test]
+    fn a_model_the_chosen_harness_does_not_publish_is_refused_with_both_names() {
+        let error = choose(
+            &catalog(),
+            &picked(Some("dsh"), Some("opencode-v2/free-model"), None),
+        )
+        .expect_err("a model belongs to its harness");
+        let text = error.to_string();
+        assert!(
+            text.contains("step `code`") && text.contains("`opencode-v2/free-model`"),
+            "the refusal names the step and the model: {text}"
+        );
+        assert!(
+            text.contains("`dsh`"),
+            "the refusal names the harness: {text}"
+        );
+        assert!(
+            text.contains("opencode-go/deepseek-v4.1-flash"),
+            "the refusal lists the keys its harness publishes: {text}"
+        );
+    }
+
+    #[test]
+    fn a_named_model_chooses_the_harness_that_publishes_it() {
+        let choice = choose(
+            &catalog(),
+            &picked(None, Some("opencode-v2/free-model"), None),
+        )
+        .expect("the harness publishing the model is chosen");
+        assert_eq!(
+            choice.harness, "opencode-v2",
+            "the publishing harness wins over the preferred one"
+        );
+        assert_eq!(choice.model, "opencode-v2/free-model");
+    }
+
+    #[test]
+    fn a_named_model_no_available_harness_publishes_is_refused() {
+        let error = choose(&catalog(), &picked(None, Some("cold/model"), None))
+            .expect_err("an unavailable harness does not make its model selectable");
+        let text = error.to_string();
+        assert!(
+            text.contains("step `code`") && text.contains("`cold/model`"),
+            "the refusal names the step and the model: {text}"
+        );
+    }
+
+    #[test]
+    fn an_effort_the_model_does_not_offer_is_refused() {
+        let error = choose(
+            &catalog(),
+            &picked(
+                Some("dsh"),
+                Some("opencode-go/deepseek-v4.1-flash"),
+                Some("medium"),
+            ),
+        )
+        .expect_err("an effort is one of the model's variants");
+        let text = error.to_string();
+        assert!(text.contains("`medium`"), "{text}");
+        assert!(
+            text.contains("low, high, max"),
+            "the refusal lists the variants the model offers: {text}"
+        );
+    }
+
+    #[test]
+    fn an_effort_without_a_model_is_refused() {
+        let error = choose(&catalog(), &picked(Some("dsh"), None, Some("high")))
+            .expect_err("an effort without a model cannot be checked");
+        let text = error.to_string();
+        assert!(
+            text.contains("`high`") && text.contains("no model"),
+            "the refusal names the effort and says what is missing: {text}"
+        );
+    }
+
+    #[test]
+    fn a_harness_with_no_model_is_refused() {
+        let error = choose(&catalog(), &picked(Some("quiet"), None, None))
+            .expect_err("a harness with no model cannot run a session");
+        let text = error.to_string();
+        assert!(
+            text.contains("step `code`") && text.contains("`quiet`"),
+            "the refusal names the step and the harness: {text}"
+        );
+    }
+
+    #[test]
+    fn a_door_that_publishes_no_available_harness_is_refused() {
+        let mut catalog = catalog();
+        for harness in &mut catalog {
+            harness.available = false;
+        }
+        let error = choose(&catalog, &step("code")).expect_err("nothing selectable is refused");
+        assert!(error.to_string().contains("available"), "{error}");
+    }
+
+    #[test]
+    fn a_door_that_publishes_no_harness_is_refused() {
+        let error = choose(&[], &step("code")).expect_err("an empty door is refused");
+        assert!(
+            error.to_string().contains("publishes no harness"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_named_effort_is_carried_into_the_choice_and_the_prompts_variant() {
+        let choice = choose(
+            &catalog(),
+            &picked(
+                Some("dsh"),
+                Some("opencode-go/deepseek-v4.1-flash"),
+                Some("high"),
+            ),
+        )
+        .expect("the effort is one of the model's variants");
+        assert_eq!(choice.effort.as_deref(), Some("high"));
+        let prompt = prompt_params(&choice, "ses_1", "/tmp/repo", "do it");
+        assert_eq!(prompt["harness"], json!("dsh"));
+        assert_eq!(prompt["model"], json!("opencode-go/deepseek-v4.1-flash"));
+        assert_eq!(prompt["session"], json!("ses_1"));
+        assert_eq!(prompt["text"], json!("do it"));
+        assert_eq!(prompt["variant"], json!("high"));
+    }
+
+    #[test]
+    fn a_prompt_for_a_step_with_no_effort_carries_no_variant() {
+        let choice = choose(&catalog(), &step("code")).expect("the preferred harness is chosen");
+        let prompt = prompt_params(&choice, "ses_1", "/tmp/repo", "do it");
+        assert!(
+            prompt.get("variant").is_none(),
+            "the model's own default stands: {prompt}"
+        );
+    }
 
     #[test]
     fn a_partial_transcript_is_quoted_and_bounded() {

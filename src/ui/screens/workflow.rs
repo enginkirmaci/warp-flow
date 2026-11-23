@@ -15,12 +15,13 @@
 //! rewrites an older one.
 
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Context, Entity, FocusHandle, FontWeight, IntoElement, Render, ScrollHandle,
+    AnyElement, App, Context, Entity, FocusHandle, FontWeight, IntoElement, Render, ScrollHandle,
     SharedString, Window, div, px, relative,
 };
 use gpui_kit::component::input::{InputEvent, InputState};
@@ -36,6 +37,7 @@ use warpui_kit_core::{icon, motion, tooltip::tooltip_text};
 use crate::host::Host;
 use crate::store::{self, StepState};
 use crate::theme;
+use crate::ui::select::{self, Anchors, Choice, Select};
 
 use super::{ScreenRun, placeholder};
 
@@ -49,6 +51,59 @@ enum Place {
     /// After everything: it waits for the current leaves.
     End,
 }
+
+/// The three step fields that are picked from the door's catalog rather than
+/// typed. A harness step names the harness it runs on, one of that harness's
+/// models and one of that model's efforts; empty means the engine chooses
+/// (`docs/adr/0017-a-step-names-the-harness-it-runs-on.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CatalogField {
+    Harness,
+    Model,
+    Effort,
+}
+
+impl CatalogField {
+    /// The selector base: the trigger answers to it, a row to
+    /// `<base>-<value>`, and the clear row to `<base>-clear`.
+    fn id(self) -> &'static str {
+        match self {
+            CatalogField::Harness => "flow-step-harness",
+            CatalogField::Model => "flow-step-model",
+            CatalogField::Effort => "flow-step-effort",
+        }
+    }
+
+    /// The row's label in the form.
+    fn label(self) -> &'static str {
+        match self {
+            CatalogField::Harness => "Harness",
+            CatalogField::Model => "Model",
+            CatalogField::Effort => "Effort",
+        }
+    }
+
+    /// What an empty value means, in the words the trigger shows and the
+    /// clear row offers.
+    fn unset(self) -> &'static str {
+        match self {
+            CatalogField::Harness => "The engine's choice",
+            CatalogField::Model => "The harness's first",
+            CatalogField::Effort => "The model's default",
+        }
+    }
+}
+
+/// The three catalog fields, in the form's order.
+const CATALOG_FIELDS: [CatalogField; 3] = [
+    CatalogField::Harness,
+    CatalogField::Model,
+    CatalogField::Effort,
+];
+
+/// What a field says when the door has never answered: the lists are empty, and
+/// inventing a harness name would be a value the engine refuses at dispatch.
+const NO_CATALOG: &str = "warp-agent has published no catalog yet. Start it and reopen this tab.";
 
 /// The schema every workflow file this editor writes carries.
 const SCHEMA: u32 = 2;
@@ -130,9 +185,6 @@ struct Fields {
     cwd: Entity<InputState>,
     timeout: Entity<InputState>,
     produces: Entity<InputState>,
-    harness: Entity<InputState>,
-    model: Entity<InputState>,
-    effort: Entity<InputState>,
     /// How many times the step may send the work back: the rework budget. The
     /// picker beside it is stateless (it reads the selection), so only the
     /// budget is an input that has to be carried between selections.
@@ -168,9 +220,17 @@ pub struct WorkflowScreen {
     focus: FocusHandle,
     list_scroll: ScrollHandle,
     /// The door's catalog as last read, for the harness, model and effort
-    /// choices. Empty until the first read lands, and empty again when the door
-    /// has never answered — the fields stay free text either way.
+    /// lists. Empty until the first read lands, and empty again when the door
+    /// has never answered — a select with nothing to offer says so.
     catalog: Vec<store::CatalogEntry>,
+    /// Which catalog list is open, if any. One at a time: the list floats over
+    /// the form, so two would overlap.
+    open_select: Option<CatalogField>,
+    /// Where each trigger was drawn, which is what an open list anchors to.
+    select_anchors: Anchors,
+    /// One focus handle per trigger: the field box tracks it, so the border
+    /// lights on the field that is focused and Escape reaches it.
+    select_focus: [FocusHandle; 3],
 }
 
 impl WorkflowScreen {
@@ -192,6 +252,9 @@ impl WorkflowScreen {
             focus: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
             catalog: store::Settings::load().catalog,
+            open_select: None,
+            select_anchors: Anchors::new(),
+            select_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
         }
     }
 
@@ -520,24 +583,6 @@ impl WorkflowScreen {
             step.produces.clone().unwrap_or_default(),
             "an artifact in the run folder",
         );
-        let harness = make(
-            window,
-            cx,
-            step.harness.clone().unwrap_or_default(),
-            "a harness the door publishes; empty is the engine's choice",
-        );
-        let model = make(
-            window,
-            cx,
-            step.model.clone().unwrap_or_default(),
-            "a model of that harness; empty is its first",
-        );
-        let effort = make(
-            window,
-            cx,
-            step.effort.clone().unwrap_or_default(),
-            "one of that model's variants",
-        );
         let rework_max = make(
             window,
             cx,
@@ -553,9 +598,6 @@ impl WorkflowScreen {
             (cwd.clone(), Field::Cwd),
             (timeout.clone(), Field::Timeout),
             (produces.clone(), Field::Produces),
-            (harness.clone(), Field::Harness),
-            (model.clone(), Field::Model),
-            (effort.clone(), Field::Effort),
             (rework_max.clone(), Field::ReworkMax),
         ];
         for (input, which) in watched {
@@ -574,9 +616,6 @@ impl WorkflowScreen {
                     Field::Timeout => {
                         step.timeout_secs = text.parse::<u64>().ok().filter(|secs| *secs > 0)
                     }
-                    Field::Harness => step.harness = (!text.is_empty()).then_some(text),
-                    Field::Model => step.model = (!text.is_empty()).then_some(text),
-                    Field::Effort => step.effort = (!text.is_empty()).then_some(text),
                     Field::Produces => step.produces = (!text.is_empty()).then_some(text),
                     // `validate` refuses a budget of 0, and an empty field is
                     // "unset", which means one.
@@ -594,9 +633,6 @@ impl WorkflowScreen {
             cwd,
             timeout,
             produces,
-            harness,
-            model,
-            effort,
             rework_max,
         };
         self.fields = Some(fields.clone());
@@ -624,15 +660,6 @@ impl WorkflowScreen {
                 step.timeout_secs
                     .map(|secs| secs.to_string())
                     .unwrap_or_default(),
-            ),
-            (
-                fields.harness.clone(),
-                step.harness.clone().unwrap_or_default(),
-            ),
-            (fields.model.clone(), step.model.clone().unwrap_or_default()),
-            (
-                fields.effort.clone(),
-                step.effort.clone().unwrap_or_default(),
             ),
             (
                 fields.produces.clone(),
@@ -1297,22 +1324,20 @@ impl WorkflowScreen {
                 "skill",
                 fields.as_ref().map(|fields| fields.skill.clone()),
             ));
-            rows.push((
-                "Harness",
-                "harness",
-                fields.as_ref().map(|fields| fields.harness.clone()),
-            ));
-            rows.push((
-                "Model",
-                "model",
-                fields.as_ref().map(|fields| fields.model.clone()),
-            ));
-            rows.push((
-                "Effort",
-                "effort",
-                fields.as_ref().map(|fields| fields.effort.clone()),
-            ));
         }
+        for (label, key, input) in rows {
+            body = body.child(self.field_row(label, key, input, window, cx));
+        }
+        // What the step runs on is picked from the door's catalog rather than
+        // typed, and the three cascade: an effort belongs to a model, and a
+        // model to a harness, so a name that nothing publishes would be a run
+        // that blocks at dispatch instead of a graph that saves.
+        if step.kind == StepKind::Harness {
+            for field in CATALOG_FIELDS {
+                body = body.child(self.catalog_row(field, &step, window, cx));
+            }
+        }
+        let mut rows: Vec<(&'static str, &'static str, Option<Entity<InputState>>)> = Vec::new();
         if step.kind == StepKind::Gate {
             rows.push((
                 "Command",
@@ -1337,11 +1362,6 @@ impl WorkflowScreen {
         ));
         for (label, key, input) in rows {
             body = body.child(self.field_row(label, key, input, window, cx));
-            // The catalog-backed fields offer what the door publishes, so a
-            // choice is picked from what exists rather than typed from memory.
-            if let Some(choices) = self.choices_for(key, &step) {
-                body = body.child(self.choice_row(key, choices, cx));
-            }
         }
         // A step's place is its dependencies (ADR-0014), so they are picked
         // from the graph's own steps rather than typed: a mistyped id is a
@@ -1380,6 +1400,10 @@ impl WorkflowScreen {
         }
         body = body.child(self.render_revisions());
 
+        // the open catalog list is a child of the pane, not of the form: it has
+        // to paint over the scroller and be able to reach past the pane's edge
+        let panel = self.select_panel(cx);
+
         div()
             .id("flow-workflow")
             .debug_selector(|| "flow-workflow".into())
@@ -1401,6 +1425,7 @@ impl WorkflowScreen {
                     .min_w_0()
                     .h_full()
                     .min_h_0()
+                    .relative()
                     .bg(theme::panel())
                     .child(head)
                     .child(
@@ -1424,7 +1449,8 @@ impl WorkflowScreen {
                                     .gap(px(12.))
                                     .child(body),
                             ),
-                    ),
+                    )
+                    .children(panel),
             )
             .into_any_element()
     }
@@ -1675,6 +1701,14 @@ impl WorkflowScreen {
         }
         if step.kind == StepKind::Harness {
             rows.insert(1, ("Skill", mono_or_dash(step.skill.as_deref())));
+            // What the step asked to run on, from the graph rather than the
+            // row's summary: the reading shows the revision this run carries,
+            // and a step that named a harness is worth seeing as it was written.
+            if let Some(real) = graph.step(&step.id) {
+                rows.insert(2, ("Harness", mono_or_dash(real.harness.as_deref())));
+                rows.insert(3, ("Model", mono_or_dash(real.model.as_deref())));
+                rows.insert(4, ("Effort", mono_or_dash(real.effort.as_deref())));
+            }
         }
         if step.kind == StepKind::Gate {
             rows.insert(1, ("Command", mono_or_dash(step.command.as_deref())));
@@ -1900,107 +1934,222 @@ impl WorkflowScreen {
         cx.notify();
     }
 
-    /// The choices the catalog offers for one field, or `None` when the field
-    /// is free text or the catalog has nothing to say.
+    /// One catalog field as the select draws it: the step's value, the list of
+    /// what the door publishes for it, and the line the list leads with.
     ///
-    /// `harness` lists every enabled harness; `model` lists the models of the
-    /// harness the step names (or every model when it names none); `effort`
-    /// lists the variants of the model the step names.
-    fn choices_for(&self, key: &str, step: &Step) -> Option<Vec<String>> {
-        if self.catalog.is_empty() {
-            return None;
-        }
-        let choices: Vec<String> = match key {
-            "harness" => self
-                .catalog
-                .iter()
-                .map(|harness| harness.id.clone())
-                .collect(),
-            "model" => self
-                .catalog
-                .iter()
-                .filter(|harness| {
-                    step.harness
-                        .as_deref()
-                        .is_none_or(|wanted| wanted == harness.id)
-                })
-                .flat_map(|harness| harness.models.iter().map(|model| model.key.clone()))
-                .collect(),
-            "effort" => {
-                let model = step.model.as_deref()?;
+    /// The three cascade. `harness` lists every harness the door publishes;
+    /// `model` lists the models of the harness the step names, or every model
+    /// when it names none (picking one then names its harness too); `effort`
+    /// lists the variants of the model the step names, and a field that waits
+    /// on another says so rather than showing an empty list.
+    fn select_of(&self, field: CatalogField) -> Option<Select<'_>> {
+        let step = self.step()?;
+        let (value, choices, note) = match field {
+            CatalogField::Harness => (
+                step.harness.clone(),
                 self.catalog
                     .iter()
-                    .flat_map(|harness| harness.models.iter())
-                    .find(|entry| entry.key == model)
-                    .map(|entry| entry.variants.clone())
-                    .unwrap_or_default()
+                    .map(|harness| Choice::new(&harness.id).with_hint(Some(harness.label.clone())))
+                    .collect(),
+                (self.catalog.is_empty()).then(|| NO_CATALOG.to_owned()),
+            ),
+            CatalogField::Model => {
+                let mut choices = Vec::new();
+                let mut published = false;
+                for harness in &self.catalog {
+                    if step
+                        .harness
+                        .as_deref()
+                        .is_some_and(|wanted| wanted != harness.id)
+                    {
+                        continue;
+                    }
+                    published = true;
+                    for model in &harness.models {
+                        // with no harness named, the row says which harness it
+                        // belongs to: picking it names that harness
+                        let hint = step.harness.is_none().then(|| harness.id.clone());
+                        choices.push(Choice::new(&model.key).with_hint(hint));
+                    }
+                }
+                let note = match &step.harness {
+                    None if self.catalog.is_empty() => Some(NO_CATALOG.to_owned()),
+                    Some(id) if !published && !self.catalog.is_empty() => Some(format!(
+                        "The door publishes no harness `{id}`, so it publishes no models for \
+                         this step. Pick a harness first."
+                    )),
+                    _ => None,
+                };
+                (step.model.clone(), choices, note)
             }
-            _ => return None,
+            CatalogField::Effort => {
+                let model = step.model.as_deref();
+                let variants = model.and_then(|model| self.model_entry(step, model));
+                let choices = variants
+                    .map(|model| {
+                        model
+                            .variants
+                            .iter()
+                            .map(|effort| Choice::new(effort))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let note = match (model, &variants) {
+                    (None, _) => {
+                        Some("An effort is a variant of a model: pick a model first.".to_owned())
+                    }
+                    (Some(model), Some(entry)) if entry.variants.is_empty() => Some(format!(
+                        "`{model}` publishes no efforts, so it runs with its own default."
+                    )),
+                    (Some(model), None) => Some(format!(
+                        "`{model}` is not in the door's catalog, so its efforts are unknown."
+                    )),
+                    _ => None,
+                };
+                (step.effort.clone(), choices, note)
+            }
         };
-        (!choices.is_empty()).then_some(choices)
+        Some(Select {
+            id: field.id(),
+            label: field.label(),
+            value: value.clone(),
+            unset: field.unset(),
+            choices: with_current(choices, value.as_deref()),
+            note,
+            open: self.open_select == Some(field),
+        })
     }
 
-    /// One row of choices under a field: a chip per value, the current one
-    /// marked.
-    fn choice_row(&self, key: &str, choices: Vec<String>, cx: &mut Context<Self>) -> AnyElement {
-        let current = self.step().and_then(|step| match key {
-            "harness" => step.harness.clone(),
-            "model" => step.model.clone(),
-            "effort" => step.effort.clone(),
-            _ => None,
+    /// The catalog's entry for `model`, as the step's harness publishes it, or
+    /// the first harness that publishes it when the step names none.
+    fn model_entry<'a>(&'a self, step: &Step, model: &str) -> Option<&'a store::CatalogModelEntry> {
+        let harness = match step.harness.as_deref() {
+            Some(id) => self.catalog.iter().find(|harness| harness.id == id),
+            None => self
+                .catalog
+                .iter()
+                .find(|harness| harness.models.iter().any(|entry| entry.key == model)),
+        }?;
+        harness.models.iter().find(|entry| entry.key == model)
+    }
+
+    /// One catalog field of the form: its trigger, and the click that opens it.
+    fn catalog_row(
+        &self,
+        field: CatalogField,
+        _step: &Step,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(select) = self.select_of(field) else {
+            return div().into_any_element();
+        };
+        let index = CATALOG_FIELDS
+            .iter()
+            .position(|other| *other == field)
+            .unwrap_or_default();
+        let focus = self
+            .select_focus
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| cx.focus_handle());
+        let sheet = cx.entity();
+        let toggle_sheet = sheet.clone();
+        let dismiss_sheet = sheet.clone();
+        select::row(
+            &select,
+            theme::scaled(LABEL_WIDTH),
+            &self.select_anchors,
+            &focus,
+            move |_: &gpui::ClickEvent, window, cx| {
+                toggle_sheet.update(cx, |this, cx| this.toggle_select(field, window, cx));
+            },
+            move |cx| {
+                dismiss_sheet.update(cx, |this, cx| this.close_select(cx));
+            },
+            window,
+        )
+    }
+
+    /// The open list, rendered by the inspector rather than by the row: the
+    /// form scrolls, and a list that is a child of it would be clipped by the
+    /// scroller and could not open past the pane's edge.
+    fn select_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let field = self.open_select?;
+        let select = self.select_of(field)?;
+        let sheet = cx.entity();
+        let pick_sheet = sheet.clone();
+        let dismiss_sheet = sheet.clone();
+        let pick: select::PickFn =
+            Rc::new(move |value: &str, window: &mut Window, cx: &mut App| {
+                let value = value.to_owned();
+                pick_sheet.update(cx, |this, cx| {
+                    this.pick_select(field, &value, window, cx);
+                });
+            });
+        let dismiss: select::DismissFn = Rc::new(move |cx: &mut App| {
+            dismiss_sheet.update(cx, |this, cx| this.close_select(cx));
         });
-        let mut row = div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(px(6.))
-            .pb(px(6.))
-            .pl(px(theme::scaled(LABEL_WIDTH) + 12.));
-        for choice in choices {
-            let selected = current.as_deref() == Some(choice.as_str());
-            let selector = format!("flow-choice-{key}-{choice}");
-            let value = choice.clone();
-            let field = key.to_owned();
-            row = row.child(
-                div()
-                    .id(SharedString::from(selector.clone()))
-                    .debug_selector(move || selector.clone())
-                    .role(gpui::Role::Button)
-                    .aria_label(choice.clone())
-                    .cursor_pointer()
-                    .px(px(8.))
-                    .py(px(3.))
-                    .rounded(px(5.))
-                    .border_1()
-                    .border_color(if selected {
-                        theme::accent()
-                    } else {
-                        theme::hairline()
-                    })
-                    .text_size(px(theme::font_micro()))
-                    .font_family(theme::code_font())
-                    .text_color(if selected {
-                        theme::text()
-                    } else {
-                        theme::text_muted()
-                    })
-                    .hover(|style| style.bg(theme::raised()))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let value = value.clone();
-                        let field = field.clone();
-                        this.edit_step(cx, |step| match field.as_str() {
-                            "harness" => step.harness = Some(value),
-                            "model" => step.model = Some(value),
-                            "effort" => step.effort = Some(value),
-                            _ => {}
-                        });
-                        this.refill_fields(window, cx);
-                        cx.notify();
-                    }))
-                    .child(choice),
-            );
+        select::panel(&select, &self.select_anchors, pick, dismiss)
+    }
+
+    /// Open `field`'s list, or close it when it is the one showing. The
+    /// trigger takes focus, so Escape closes the list from the keyboard too.
+    fn toggle_select(&mut self, field: CatalogField, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_select = (self.open_select != Some(field)).then_some(field);
+        if self.open_select.is_some()
+            && let Some(index) = CATALOG_FIELDS.iter().position(|other| *other == field)
+            && let Some(focus) = self.select_focus.get(index)
+        {
+            window.focus(focus, cx);
         }
-        row.into_any_element()
+        cx.notify();
+    }
+
+    /// Close whichever list is open.
+    fn close_select(&mut self, cx: &mut Context<Self>) {
+        if self.open_select.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Write a pick: the value, or `None` for the row that clears the field.
+    ///
+    /// A pick can invalidate what it no longer explains, so the step is settled
+    /// afterwards: a harness that does not publish the step's model drops the
+    /// model and its effort, and a model that does not offer the effort drops
+    /// the effort. Picking a model while the step names no harness names the
+    /// harness that publishes it, so what the run uses is what the form shows.
+    fn pick_select(
+        &mut self,
+        field: CatalogField,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let value = (!value.is_empty()).then(|| value.to_owned());
+        let catalog = self.catalog.clone();
+        self.edit_step(cx, |step| {
+            match field {
+                CatalogField::Harness => step.harness = value,
+                CatalogField::Model => {
+                    if step.harness.is_none()
+                        && let Some(model) = value.as_deref()
+                    {
+                        step.harness = catalog
+                            .iter()
+                            .find(|harness| harness.models.iter().any(|entry| entry.key == model))
+                            .map(|harness| harness.id.clone());
+                    }
+                    step.model = value;
+                }
+                CatalogField::Effort => step.effort = value,
+            }
+            settle_catalog_fields(step, &catalog);
+        });
+        self.open_select = None;
+        self.refill_fields(window, cx);
+        cx.notify();
     }
 
     /// The selected step's dependencies as chips: one per other step in the
@@ -2399,6 +2548,13 @@ impl WorkflowScreen {
     pub fn read_only_for_probe(&self) -> bool {
         self.read_only
     }
+
+    /// Which catalog list is open, by its selector base, for a probe that
+    /// checks the trigger without reading the frame.
+    #[doc(hidden)]
+    pub fn open_select_for_probe(&self) -> Option<&'static str> {
+        self.open_select.map(CatalogField::id)
+    }
 }
 
 impl Render for WorkflowScreen {
@@ -2429,10 +2585,71 @@ enum Field {
     Cwd,
     Timeout,
     Produces,
-    Harness,
-    Model,
-    Effort,
     ReworkMax,
+}
+
+/// The step's value as a row of its list: the value itself is offered when the
+/// catalog does not publish it, so an old file's name is visible and clearable
+/// instead of silently missing from a list that shows nothing selected.
+fn with_current(mut choices: Vec<Choice>, value: Option<&str>) -> Vec<Choice> {
+    if let Some(value) = value
+        && !choices.iter().any(|choice| choice.value == value)
+    {
+        choices.insert(
+            0,
+            Choice::new(value).with_hint(Some("not in the catalog".to_owned())),
+        );
+    }
+    choices
+}
+
+/// Keep a step's harness, model and effort consistent after a pick.
+///
+/// The three cascade, so a pick can invalidate what the step still holds: a
+/// model its harness does not publish, and an effort its model does not offer,
+/// are names the engine would refuse at dispatch. Dropping them here means the
+/// form never shows a graph that cannot run.
+///
+/// An empty catalog is skipped rather than trusted: it means the door has never
+/// answered, and a person clearing a harness must not lose the model and effort
+/// a file still names.
+fn settle_catalog_fields(step: &mut Step, catalog: &[store::CatalogEntry]) {
+    if catalog.is_empty() {
+        return;
+    }
+    if let Some(model) = step.model.clone() {
+        let harness = match step.harness.as_deref() {
+            Some(id) => catalog.iter().find(|harness| harness.id == id),
+            None => catalog
+                .iter()
+                .find(|harness| harness.models.iter().any(|entry| entry.key == model)),
+        };
+        let published =
+            harness.is_some_and(|harness| harness.models.iter().any(|entry| entry.key == model));
+        if !published {
+            step.model = None;
+        }
+    }
+    // an effort without a model is a graph `validate` refuses
+    if step.model.is_none() {
+        step.effort = None;
+        return;
+    }
+    if let Some(effort) = step.effort.clone() {
+        let offered = step
+            .model
+            .as_deref()
+            .and_then(|model| {
+                catalog
+                    .iter()
+                    .flat_map(|harness| harness.models.iter())
+                    .find(|entry| entry.key == model)
+            })
+            .is_some_and(|entry| entry.variants.contains(&effort));
+        if !offered {
+            step.effort = None;
+        }
+    }
 }
 
 /// The word a step kind shows.

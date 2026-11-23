@@ -1487,3 +1487,275 @@ fn the_shipped_template_draws_its_fork_and_its_join(cx: &mut TestAppContext) {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ---- the catalog selects ---------------------------------------------------
+
+/// The door's catalog as the editor caches it: two harnesses, one model with
+/// efforts and one without.
+fn seed_catalog() {
+    let mut settings = store::Settings::load();
+    settings.catalog = vec![
+        store::CatalogEntry {
+            id: "dsh".to_owned(),
+            label: "DeepSeek Harness".to_owned(),
+            models: vec![
+                store::CatalogModelEntry {
+                    key: "deepseek/v4".to_owned(),
+                    variants: vec!["low".to_owned(), "high".to_owned()],
+                },
+                // a model with no efforts of its own
+                store::CatalogModelEntry {
+                    key: "deepseek/v4-mini".to_owned(),
+                    variants: Vec::new(),
+                },
+            ],
+        },
+        store::CatalogEntry {
+            id: "oc".to_owned(),
+            label: "OpenCode".to_owned(),
+            models: vec![store::CatalogModelEntry {
+                key: "anthropic/x".to_owned(),
+                variants: Vec::new(),
+            }],
+        },
+    ];
+    settings.save();
+}
+
+/// A step that already names a harness the catalog does not publish.
+const GHOST: &str = r#"
+schema = 2
+name = "ghost"
+revision = 3
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+harness = "ghost"
+model = "nowhere/model"
+"#;
+
+#[gpui_kit::gpui::test]
+fn a_step_picks_its_harness_model_and_effort_from_the_catalog(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("select");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    seed_catalog();
+    let (repo, _issue) = seed_repo(&home, Some(WORKFLOW));
+    let handle = open_template(cx, &repo, WORKFLOW);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+    select(&handle, cx, 0);
+
+    // the field is a box, not a text input, and the list starts closed
+    assert!(cx.debug_bounds("flow-step-harness").is_some());
+    assert!(
+        cx.debug_bounds("flow-step-harness-panel").is_none(),
+        "the list starts closed"
+    );
+    assert!(
+        cx.debug_bounds("flow-field-harness").is_none(),
+        "a harness is picked, never typed: there is no text field"
+    );
+
+    // the trigger opens the catalog under itself
+    click(cx, "flow-step-harness");
+    let open = handle
+        .read_with(cx, |host, cx| host.0.read(cx).open_select_for_probe())
+        .expect("the window is open");
+    assert_eq!(
+        open,
+        Some("flow-step-harness"),
+        "the harness list is the one open"
+    );
+    let trigger = cx.debug_bounds("flow-step-harness").expect("the trigger");
+    let panel = cx
+        .debug_bounds("flow-step-harness-panel")
+        .expect("the list is open");
+    assert!(
+        panel.origin.y >= trigger.origin.y + trigger.size.height,
+        "the list opens under its trigger"
+    );
+    assert_eq!(
+        panel.origin.x, trigger.origin.x,
+        "the list starts at the trigger's edge"
+    );
+    assert!(cx.debug_bounds("flow-step-harness-dsh").is_some());
+    assert!(cx.debug_bounds("flow-step-harness-oc").is_some());
+
+    // a pick writes the graph and closes the list
+    click(cx, "flow-step-harness-oc");
+    assert!(
+        cx.debug_bounds("flow-step-harness-panel").is_none(),
+        "a pick closes the list"
+    );
+    assert_eq!(
+        graph_of(&handle, cx).steps[0].harness.as_deref(),
+        Some("oc")
+    );
+
+    // the model list is what that harness publishes, and nothing else
+    click(cx, "flow-step-model");
+    assert!(cx.debug_bounds("flow-step-model-anthropic/x").is_some());
+    assert!(
+        cx.debug_bounds("flow-step-model-deepseek/v4").is_none(),
+        "oc does not publish deepseek/v4"
+    );
+    click(cx, "flow-step-model-anthropic/x");
+    assert_eq!(
+        graph_of(&handle, cx).steps[0].model.as_deref(),
+        Some("anthropic/x")
+    );
+
+    // a model without efforts says so instead of offering an empty list
+    click(cx, "flow-step-effort");
+    assert!(
+        cx.debug_bounds("flow-step-effort-note").is_some(),
+        "the effort list explains why it is empty"
+    );
+    assert!(cx.debug_bounds("flow-step-effort-high").is_none());
+    click(cx, "flow-step-effort-clear");
+
+    // what the form shows is what the file keeps
+    click(cx, "flow-workflow-save");
+    let saved = Workflow::read(warp_flow_core::layout::workflow_file(&repo))
+        .expect("the template was written");
+    assert_eq!(saved.steps[0].harness.as_deref(), Some("oc"));
+    assert_eq!(saved.steps[0].model.as_deref(), Some("anthropic/x"));
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[gpui_kit::gpui::test]
+fn an_effort_belongs_to_a_model_and_goes_with_it(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("effort");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    seed_catalog();
+    let (repo, _issue) = seed_repo(&home, Some(WORKFLOW));
+    let handle = open_template(cx, &repo, WORKFLOW);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+    select(&handle, cx, 0);
+
+    click(cx, "flow-step-harness");
+    click(cx, "flow-step-harness-dsh");
+
+    // a model is needed before an effort means anything
+    click(cx, "flow-step-effort");
+    assert!(cx.debug_bounds("flow-step-effort-note").is_some());
+    click(cx, "flow-step-effort-clear");
+    click(cx, "flow-step-model");
+    click(cx, "flow-step-model-deepseek/v4");
+    click(cx, "flow-step-effort");
+    assert!(cx.debug_bounds("flow-step-effort-low").is_some());
+    assert!(cx.debug_bounds("flow-step-effort-high").is_some());
+    click(cx, "flow-step-effort-high");
+    assert_eq!(
+        graph_of(&handle, cx).steps[0].effort.as_deref(),
+        Some("high")
+    );
+
+    // a model that offers no efforts drops the effort that belonged to the old
+    // one: the form never shows a pair the engine would refuse at dispatch
+    click(cx, "flow-step-model");
+    click(cx, "flow-step-model-deepseek/v4-mini");
+    let graph = graph_of(&handle, cx);
+    assert_eq!(graph.steps[0].model.as_deref(), Some("deepseek/v4-mini"));
+    assert_eq!(graph.steps[0].effort, None);
+
+    // and a harness that does not publish the model drops the model with it
+    click(cx, "flow-step-harness");
+    click(cx, "flow-step-harness-oc");
+    let graph = graph_of(&handle, cx);
+    assert_eq!(graph.steps[0].harness.as_deref(), Some("oc"));
+    assert_eq!(graph.steps[0].model, None);
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[gpui_kit::gpui::test]
+fn picking_a_model_names_the_harness_that_publishes_it(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("cascade");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    seed_catalog();
+    let (repo, _issue) = seed_repo(&home, Some(WORKFLOW));
+    let handle = open_template(cx, &repo, WORKFLOW);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+    select(&handle, cx, 0);
+
+    // with no harness named, every harness's models are offered
+    click(cx, "flow-step-model");
+    assert!(cx.debug_bounds("flow-step-model-deepseek/v4").is_some());
+    assert!(cx.debug_bounds("flow-step-model-anthropic/x").is_some());
+    click(cx, "flow-step-model-deepseek/v4");
+
+    // and the pick names the harness, so what the run uses is what the form
+    // shows
+    let graph = graph_of(&handle, cx);
+    assert_eq!(graph.steps[0].harness.as_deref(), Some("dsh"));
+    assert_eq!(graph.steps[0].model.as_deref(), Some("deepseek/v4"));
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[gpui_kit::gpui::test]
+fn the_clear_row_unsets_a_field(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("clear");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    seed_catalog();
+    let (repo, _issue) = seed_repo(&home, Some(GHOST));
+    let handle = open_template(cx, &repo, GHOST);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+    select(&handle, cx, 0);
+
+    // a name the catalog does not publish is still shown: a file written by
+    // hand must not read as an empty field
+    assert!(cx.debug_bounds("flow-step-harness").is_some());
+    click(cx, "flow-step-harness");
+    assert!(
+        cx.debug_bounds("flow-step-harness-ghost").is_some(),
+        "the step's own value is a row, so it can be seen and cleared"
+    );
+    click(cx, "flow-step-harness-clear");
+    assert_eq!(graph_of(&handle, cx).steps[0].harness, None);
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[gpui_kit::gpui::test]
+fn a_field_with_no_catalog_says_so(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("no-catalog");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    // no catalog seeded: the door has never answered
+    let (repo, _issue) = seed_repo(&home, Some(WORKFLOW));
+    let handle = open_template(cx, &repo, WORKFLOW);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+    select(&handle, cx, 0);
+
+    click(cx, "flow-step-harness");
+    assert!(
+        cx.debug_bounds("flow-step-harness-note").is_some(),
+        "an empty catalog is a sentence, not a blank list"
+    );
+    assert!(
+        cx.debug_bounds("flow-step-harness-clear").is_some(),
+        "the field can still be cleared"
+    );
+    click(cx, "flow-step-harness-clear");
+    assert!(cx.debug_bounds("flow-step-harness-panel").is_none());
+
+    let _ = std::fs::remove_dir_all(&home);
+}

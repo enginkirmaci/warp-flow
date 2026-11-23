@@ -215,12 +215,11 @@ impl Workflow {
     ///
     /// The schema refusal, or TOML's own error.
     pub fn parse(text: &str) -> Result<Self> {
-        if let Ok(header) = toml::from_str::<Header>(text) {
-            if let Some(schema) = header.schema {
-                if schema != SCHEMA {
-                    return Err(schema_refusal(schema));
-                }
-            }
+        if let Ok(header) = toml::from_str::<Header>(text)
+            && let Some(schema) = header.schema
+            && schema != SCHEMA
+        {
+            return Err(schema_refusal(schema));
         }
         toml::from_str(text).map_err(|error| Error::Workflow(error.to_string()))
     }
@@ -381,12 +380,12 @@ impl Workflow {
                         step.id
                     )));
                 }
-                if let Some(mode) = step.mode.as_deref() {
-                    if mode != "local" {
-                        return Err(Error::Unsupported(
-                            "the `pr` merge mode is not implemented yet; use `mode = \"local\"`",
-                        ));
-                    }
+                if let Some(mode) = step.mode.as_deref()
+                    && mode != "local"
+                {
+                    return Err(Error::Unsupported(
+                        "the `pr` merge mode is not implemented yet; use `mode = \"local\"`",
+                    ));
                 }
             } else if step.mode.is_some() || step.push {
                 return Err(Error::Workflow(format!(

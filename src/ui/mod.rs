@@ -9,4 +9,5 @@ pub mod repos;
 pub mod run;
 pub mod runs;
 pub mod screens;
+pub mod select;
 pub mod window;

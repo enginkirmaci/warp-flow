@@ -80,7 +80,11 @@ withdraws the door and asks a blocking engine to stop.
 - Markdown under `.scratch/<feature-slug>/` in the *target* repository is the
   only durable state. No database, nothing that exists only in memory.
 - A step is a harness session; the engine decides from artifacts and gate exit
-  codes, never from a model's opinion of itself. The prompt is the skill
+  codes, never from a model's opinion of itself. What a harness step declares it
+  runs on — `harness`, `model`, `effort` — is resolved against the door's
+  catalog at its turn and honoured exactly: an unpublished or unavailable name
+  blocks the step with a repair naming it, and the engine never substitutes the
+  harness it would have preferred (ADR-0017). The prompt is the skill
   document plus the step's inputs; a step's time budget is a silence window
   that progress resets, not a cap on the whole turn. The one place a step's
   judgement moves a run is a **rework edge** (ADR-0016): a step that declares

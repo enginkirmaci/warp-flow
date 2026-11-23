@@ -127,6 +127,10 @@ client must follow, not guesses:
 
 - Auth is one line (`{"auth": token}` → `{"ok": true}`), protocol 3, token read
   before port; a wrong token closes the connection.
+- **`send_prompt` carries the model and the effort.** `model` is a catalog key
+  (`provider/name`) and `variant` is the effort; the `dsh` adapter applies both
+  through `session/selectModel` before the turn starts. A step that names no
+  effort sends no `variant`, so the model's own default stands (ADR-0017).
 - **Subscribe before create.** `harness create` never returns the session id —
   `id` is the reserved framing field and the payload's `id` is dropped — so the
   id is learned from the first `session-changed` push that names the new title,
@@ -198,7 +202,12 @@ covered by the same shape. A step's place is its `depends_on` set, not its
 position in the file (ADR-0014): a step may name several dependencies, and two
 steps with no dependency between them may run at the same time, up to
 `max_parallel`. A step may be `enabled = false`, in which case it never runs and
-its dependents inherit its own dependencies.
+its dependents inherit its own dependencies. A harness step may also name what
+it runs on — `harness`, `model`, `effort` — and an empty value is the engine's
+choice: a managed harness (dsh first), its first model, the model's own default
+effort. Dispatch resolves the three against the door's catalog when the step's
+turn comes and refuses a name nothing publishes, so the record says what ran
+(ADR-0017).
 
 ## The graph
 
