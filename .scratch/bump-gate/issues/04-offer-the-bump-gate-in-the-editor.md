@@ -1,6 +1,6 @@
 # 04: Offer the bump gate in the editor's default document
 
-**Status:** ready-for-agent
+**Status:** resolved
 **Category:** enhancement
 **Blocked by:** None
 
