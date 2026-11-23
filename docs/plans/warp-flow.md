@@ -43,15 +43,15 @@ artifact, question, approval, repair.
    Parallelism is across ready tasks, not inside one.
 7. **Gates are discovered, then approved.** An agent reads the repository
    (markers, build files, CI if there is any) and proposes commands; a person
-   approves them; the result is written to `.flow/flow.toml` and committed. A gate is
-   a shell command, a working directory, a timeout and an exit-code meaning —
-   nothing language-specific. No `ci.yml` is required.
+   approves them; the result is written into `.flow/workflow.toml` as gate steps
+   and committed. A gate is a shell command, a working directory, a timeout and
+   an exit-code meaning — nothing language-specific. No `ci.yml` is required.
 8. **Tests are written by the code step.** The gate still runs the
    repository's own suite; agent-written tests are evidence, not a replacement.
    An existing test may change only with a reason tied to the spec, and deleting
    one, skipping one or weakening an assertion needs a person's answer.
 9. **Merge is local and serial.** Rebase onto `main`, run the gates on the
-   rebased result, `--no-ff` merge, push only if `.flow/flow.toml` says so. A conflict
+   rebased result, `--no-ff` merge, push only if the merge step says so. A conflict
    is repaired on the task branch (never on `main`) for at most two attempts,
    then it becomes a question. No force-push, ever.
    A task branch with no commits of its own is a failed attempt, never a
@@ -96,8 +96,8 @@ artifact, question, approval, repair.
     exception bought nothing the shared build did not already give, and it left
     this app as the only one that could not be opened from its own repository.
 17. **The app may edit a run's files, but the engine owns them while it
-    drives.** The screens write `spec.md`, the task files, `.flow/workflow.toml`
-    and `.flow/flow.toml` — the issue folder is a person's working surface, not
+    drives.** The screens write `spec.md`, the task files and
+    `.flow/workflow.toml` — the issue folder is a person's working surface, not
     a read-only record — through one atomic writer (a temp file and a rename),
     because the engine and the two-second scan read those files at undefined
     moments. What differs is the permission: while this window drives a run, the
@@ -162,35 +162,61 @@ a non-reserved key (e.g. `session`) in the `create` reply, and give attached
 harnesses the same event pump — neither blocks S2.
 
 
-## The gate file (`.flow/flow.toml`)
+## The workflow file (`.flow/workflow.toml`)
 
-Every repository warp-flow drives carries one in its `.flow/` folder, written
-once by the gate-discovery step and approved by a person:
+Every repository warp-flow drives carries one in its `.flow/` folder. It is the
+repository's only flow document: a gate is a step that carries its own command,
+and the merge policy is the merge step's fields (ADR-0015).
 
 ```toml
-schema = 1
+schema = 2
+name = "implement"
+revision = 1
+max_parallel = 2
 
-[merge]
-mode = "local"      # local | pr
-push = false
-
-[[gate]]
-name = "test"
+[[step]]
+id = "test"
+kind = "gate"
 command = "cargo test -p warp-notes"
 cwd = "."           # relative to the worktree root
 timeout_secs = 900  # default 900
+per_task = true
+depends_on = ["review"]
+
+[[step]]
+id = "merge"
+kind = "merge"
+per_task = true
+mode = "local"      # local | pr
+push = false
+depends_on = ["test"]
 ```
 
-A workflow's gate step names one of these by `name`. Nothing in the file is
-language-specific: a gate is a shell command, a directory, a timeout and an exit
-code, so a repository in any language is covered by the same shape.
+Nothing in the file is language-specific: a gate is a shell command, a
+directory, a timeout and an exit code, so a repository in any language is
+covered by the same shape. A step's place is its `depends_on` set, not its
+position in the file (ADR-0014): a step may name several dependencies, and two
+steps with no dependency between them may run at the same time, up to
+`max_parallel`. A step may be `enabled = false`, in which case it never runs and
+its dependents inherit its own dependencies.
 
 ## The graph
 
-`analyze → split → approve-plan → [ready tasks: code → review → gate] → join →
-merge → approve-merge`, with two node kinds the engine may insert: `research`
-(when `analyze` finds an open question) and `repair` (after a failed attempt).
-A run's state lives in `run.md`; the live view is the graph itself.
+`analyze → split → approve-plan → [ready tasks: code → review → fmt → clippy →
+test] → bump → merge → summary`, with two node kinds the engine may insert:
+`research` (when `analyze` finds an open question) and `repair` (after a failed
+attempt). A run's state lives in `run.md`; the live view is the graph itself.
+
+`bump` and `summary` are not per task: they wait for a per-task step, which
+means they run once, after every task has it. `bump` moves the version before
+the queue lands anything; `summary` writes the run's closing report.
+
+The engine runs a wave at once, bounded by the workflow's `max_parallel`, with
+two rules that are not choices: two steps that would run in the same folder
+never run together, and a merge step is a barrier — it waits for everything in
+flight and starts nothing while it runs, because the merge queue refuses a
+checkout with uncommitted work. A harness cannot serve two sessions, so each
+dispatched step gets its own door connection.
 
 ## The UI
 
@@ -222,7 +248,7 @@ filled primary per surface.
   timeout; **S2b (done)** per-task worktrees through the kit and the merge
   queue — dirty `main` refused, rebase, gates on the rebased tree, `--no-ff`,
   conflict aborts, no force-push. **S2c (done)** the CLI (`run`, `answer`,
-  `status`, `--dry-run`), `.flow/flow.toml` loading, a `merge` step kind, resuming
+  `status`, `--dry-run`), gate steps in the graph, a `merge` step kind, resuming
   from `run.md`, and an end-to-end probe that drives a real throwaway
   repository to merged, resolved tasks.
 - **S3 — the app shell.** **S3a (done)** the shell over the issue folders: a
@@ -268,8 +294,8 @@ filled primary per surface.
   patch through the kit's renderer, from `core::diff`), **Workflow** (the graph
   as rows with an inspector, validated and saved as a new revision through
   `Workflow::write`/`save`), **Repos & gates** (the window's repositories with
-  add/remove, and `.flow/flow.toml`'s gates edited, validated and runnable once
-  through `FlowConfig::write` and `gate::run_once`) and **Settings** (reduced
+  add/remove, and the graph's gate steps edited, validated and runnable once
+  through `gate::run_once`) and **Settings** (reduced
   motion persisted beside the repositories, the folders, the door's state, the
   version). The screens are entities behind `ui::screens`' one seam, so each
   loads what it shows on the background executor and none of them writes a file
@@ -290,11 +316,16 @@ filled primary per surface.
 
 The documents ship **inside `warp-flow-core`** (`crates/warp-flow-core/skills/`,
 embedded with `include_str!`), because a workflow names a skill and every
-repository warp-flow drives would otherwise have to carry the same text. Four
-are shipped: `analyze`, `split`, `code`, `review` — the ones the `implement`
-graph names today. `analyze-gates`, `merge` and `repair` are documents too, but
-only once a graph runs them as sessions: `merge` is the engine's own queue
-today, and `repair` is a future node kind. `research` and `prototype` are v2.
+repository warp-flow drives would otherwise have to carry the same text. Six
+are shipped: `analyze`, `split`, `code`, `review`, `bump` and `summary` — the
+ones the `implement` graph names today. `bump` moves the version once before
+the merge queue lands anything, because the engine's own commits pass
+`--no-verify` and so never trigger the pre-commit hook that bumps PATCH.
+`summary` closes the run: it reads the whole issue folder and writes
+`summary.md`, the report a person who did not watch the run needs.
+`analyze-gates`, `merge` and `repair` are documents too, but only once a graph
+runs them as sessions: `merge` is the engine's own queue today, and `repair` is
+a future node kind. `research` and `prototype` are v2.
 
 A workflow that names a document this build does not ship is refused during
 preparation, naming the step and the shipped set, so a misconfigured graph
@@ -303,12 +334,11 @@ never spends a session's turn looking for it.
 ## Next
 
 S2 — the full chain on a real repository, CLI only: the door client (built on
-the measured contract above), per-task worktrees, real gates from `.flow/flow.toml`,
+the measured contract above), per-task worktrees, real gate steps,
 answering questions and resuming from `run.md`, and the merge queue. S1 left
-these deliberately: concurrent ready tasks within the per-repo budget,
-re-reading `workflow.toml` at each step boundary, richer question kinds, repairs
-that inject a graph node, the Windows gate, and repairing a malformed artifact
-discovered mid-run.
+these deliberately: re-reading `workflow.toml` at each step boundary, richer
+question kinds, repairs that inject a graph node, the Windows gate, and
+repairing a malformed artifact discovered mid-run.
 
 ## After the build
 

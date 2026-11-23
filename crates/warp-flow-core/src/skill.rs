@@ -19,9 +19,13 @@ const SPLIT: &str = include_str!("../skills/split.md");
 const CODE: &str = include_str!("../skills/code.md");
 /// The document behind `skill = "review"`.
 const REVIEW: &str = include_str!("../skills/review.md");
+/// The document behind `skill = "bump"`.
+const BUMP: &str = include_str!("../skills/bump.md");
+/// The document behind `skill = "summary"`.
+const SUMMARY: &str = include_str!("../skills/summary.md");
 
 /// Every skill this build ships, in the order a workflow should offer them.
-pub const NAMES: &[&str] = &["analyze", "split", "code", "review"];
+pub const NAMES: &[&str] = &["analyze", "split", "code", "review", "bump", "summary"];
 
 /// The document for `name`, or `None` when this build does not ship it.
 ///
@@ -33,6 +37,8 @@ pub fn document(name: &str) -> Option<&'static str> {
         "split" => Some(SPLIT),
         "code" => Some(CODE),
         "review" => Some(REVIEW),
+        "bump" => Some(BUMP),
+        "summary" => Some(SUMMARY),
         _ => None,
     }
 }
@@ -66,6 +72,6 @@ mod tests {
     fn a_name_that_is_not_shipped_has_no_document() {
         assert!(document("repair").is_none());
         assert!(document("").is_none());
-        assert_eq!(shipped(), "analyze, split, code, review");
+        assert_eq!(shipped(), "analyze, split, code, review, bump, summary");
     }
 }

@@ -13,10 +13,11 @@ rules that still matter move into `README.md` or this file.
 - `crates/warp-flow-core/` — the engine. No UI, no model client, no network of
   its own: it talks to warp-agent through the door.
 - `crates/warp-flow-core/src/layout.rs` — the one place that knows where a
-  repository keeps warp-flow's files: `<repo>/.flow/flow.toml` (the gates) and
-  `<repo>/.flow/workflow.toml` (the template). Never build either path by hand
-  in the engine or the app; a reader and a writer that disagree about the
-  folder is the failure this module exists to prevent. An issue folder's pinned
+  repository keeps warp-flow's file: `<repo>/.flow/workflow.toml`. Never build
+  that path by hand in the engine or the app; a reader and a writer that
+  disagree about the folder is the failure this module exists to prevent. There
+  is one file, not two: a gate is a step that carries its own command, and the
+  merge policy is the merge step's fields (ADR-0015). An issue folder's pinned
   copy is the exception and stays beside its other artifacts
   (`.scratch/<slug>/workflow.toml`), because the issue folder is the protocol.
 - `crates/warp-flow-core/skills/` — the skill documents, embedded with
@@ -53,17 +54,19 @@ rules that still matter move into `README.md` or this file.
   `DANGER`, the rest quiet. `new_run.rs` is the column's one filled primary: it
   asks for a title and a request, writes `.scratch/<slug>/spec.md`, and hands
   the window the run key to open once the next scan holds it.
-- `src/ui/screens/` — the run's five screens, one entity each: `artifacts.rs`,
-  `diff.rs`, `workflow.rs`, `gates.rs`, `settings.rs`. `mod.rs` owns the
-  `Screen` vocabulary, the `ScreenRun` a screen is handed, and the two rules
-  they all follow: `edit_permission` (the engine owns the folder while it
-  drives) and `write_artifact`/`write_atomic_raw` (the only writers).
+- `src/ui/screens/` — the run's four screens, one entity each: `artifacts.rs`,
+  `diff.rs`, `workflow.rs`, `settings.rs`. `mod.rs` owns the `Screen`
+  vocabulary, the `ScreenRun` a screen is handed, and the two rules they all
+  follow: `edit_permission` (the engine owns the folder while it drives) and
+  `write_artifact`/`write_atomic_raw` (the only writers). The Gates screen is
+  gone: a gate is a step, so `workflow.rs` edits it (ADR-0015).
 - Sections and tabs are state, not routes: `Section` (Runs, Repos, About,
   Settings) picks the rail's page, `RunTab` the open run's four screens and
-  `RepoTab` the repository's Gates and Workflow. The run's Workflow tab is
+  `RepoTab` the repository's one tab, Workflow. The run's Workflow tab is
   `ScreenRun::read_only` — a reading of the revision the run uses — and the
   template is edited in Repos › Workflow, so a running run never reads a file
-  that changes under it.
+  that changes under it. Repositories are added and forgotten from the list
+  pane's `+` popover, which is why the window owns those settings.
 - `app.toml`, `version.toml`, `rust-toolchain.toml`, `scripts/version.py` and
   `.githooks/pre-commit` follow the family's rules; do not hand-edit a version.
 

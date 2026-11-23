@@ -2,7 +2,8 @@
 
 Takes a request — a feature, a bug, a change — and drives it to merged code:
 distil it into an issue, split it into tasks, write each task in its own
-worktree, review it, run the repository's gates, and merge it.
+worktree, review it, run the repository's gates, bump the version, merge it,
+and write the report a person reads afterwards.
 
 Every step that needs judgement is a coding-agent session on
 [Warp Agent](https://github.com/enginkirmaci/warp-agent)'s door; the engine
@@ -47,7 +48,7 @@ The app is the process that drives a run, and it wears the suite's one shell: a
 76 rail of sections, the 432 repository list, then the detail. The `Runs`
 section's detail holds the 320 run column — the board read downwards, one lane
 band per state the issue folders fall into — beside the open run. The `Repos`
-section holds the selected repository's gates and workflow template.
+section holds the selected repository's workflow graph.
 
 The run column's **New run** is the one screen action that creates an issue
 folder: a title and the request become `.scratch/<slug>/spec.md` (a title
@@ -64,10 +65,14 @@ run puts its four tabs in the run's head:
 | Task & diff | the files the run wrote, conflicts first, the diff beside them, and the run's gates with the outcome each last produced |
 | Workflow | the revision the run uses, read-only: the template is edited in Repos › Workflow |
 
-`Repos` is the window a person edits: its `Gates` tab is the repository's
-`.flow/flow.toml` as a work list and one gate editor (run once, save, remove),
-and its `Workflow` tab is the step template with its revisions. `About` carries
-the installed family, the build and the license; `Settings` the reduce-motion
+`Repos` is the window a person edits: its `Workflow` tab is the repository's
+step graph with its revisions, drawn in waves — the steps that become ready
+together sit under one band, so a fork and a join are visible as such. A step
+is added at the front, after the selection or at the end, which is what decides
+what it waits for; a step can be disabled, and its dependents then inherit its
+own dependencies so the pipeline closes over it. A harness step chooses its
+harness, model and effort from the door's live catalog. `About` carries the
+installed family, the build and the license; `Settings` the reduce-motion
 switch, where the app keeps its files, the door's state and the version.
 
 The engine owns an issue folder while it drives a run: Artifacts refuses an
@@ -80,18 +85,24 @@ package, and it is the way to run a flow on a machine with no window.
 
 ## What a repository carries
 
-Two files belong to warp-flow rather than to the project, so they live in one
-folder of their own:
+One file belongs to warp-flow rather than to the project, so it lives in a
+folder of its own:
 
 ```text
-<repo>/.flow/flow.toml       the gates and the merge policy
 <repo>/.flow/workflow.toml   the workflow template a run copies
 ```
 
-`warp-flow-core`'s `layout` module owns both paths, so the engine and the app
-cannot disagree about where a file lives. A repository that has never been
-driven has no `.flow/` yet: the first save from `Repos › Gates` or
-`Repos › Workflow` creates the folder.
+It is the repository's only flow document. A gate is a step that carries its
+own command, folder and timeout, and the merge policy is the merge step's
+fields — there is no second file to keep in step with this one. A step's place
+is its `depends_on` set, not its position in the file: a step may name several
+dependencies, and two steps with no dependency between them may run at the same
+time, up to the workflow's `max_parallel`.
+
+`warp-flow-core`'s `layout` module owns the path, so the engine and the app
+cannot disagree about where the file lives. A repository that has never been
+driven has no `.flow/` yet: the first save from `Repos › Workflow` creates the
+folder.
 
 An issue folder keeps its own pinned copy beside its other artifacts
 (`.scratch/<feature-slug>/workflow.toml`): that is the revision the run started
@@ -119,7 +130,7 @@ and Warp Agent's Flow surface is its first client.
 | `~/.warp/flow/settings.json` | the remembered repositories |
 | `~/.warp/flow/ipc.port`, `ipc.token` | the door endpoint |
 | `~/.warp/logs/` | the suite's shared rolling logs |
-| `<repo>/.flow/` | the repository's gates and workflow template |
+| `<repo>/.flow/` | the repository's workflow template |
 | `<repo>/.scratch/<slug>/` | one run's record |
 
 ## Siblings

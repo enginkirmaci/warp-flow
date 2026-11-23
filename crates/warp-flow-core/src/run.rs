@@ -422,6 +422,11 @@ impl<H: Harness + Send + 'static> Runner<H> {
             // itself — a question, a merge — runs inline and may end the run; a
             // harness or gate step is dispatched, and its report is applied
             // before the next pass.
+            // A per-task step is done for the graph once every task has it, and
+            // a step after the task lanes waits for exactly that. Folding it in
+            // here, before the candidates are computed, is what lets `bump` and
+            // `summary` run once at the end instead of never.
+            self.done = self.graph_done(&issue);
             let candidates = self.candidate_ids();
             let mut jobs: Vec<StepJob> = Vec::new();
             let mut busy: BTreeSet<PathBuf> = BTreeSet::new();
@@ -813,17 +818,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
         self.workflow
             .steps
             .iter()
-            .filter(|step| {
-                step.depends_on.iter().all(|dependency| {
-                    self.workflow.step(dependency).is_some_and(|dependency| {
-                        if step.per_task {
-                            dependency.per_task || self.done.contains(&dependency.id)
-                        } else {
-                            self.done.contains(&dependency.id)
-                        }
-                    })
-                })
-            })
+            .filter(|step| self.deps_met(step, None))
             .filter(|step| step.per_task || !self.done.contains(&step.id))
             .map(|step| step.id.clone())
             .collect()
@@ -831,18 +826,26 @@ impl<H: Harness + Send + 'static> Runner<H> {
 
     /// Whether `step`'s dependencies are met, either for the graph (`task` is
     /// `None`) or for one task.
+    /// Whether `step`'s dependencies are met, either for the graph (`task` is
+    /// `None`) or for one task.
+    ///
+    /// A per-task step waits for its non-per-task dependencies to be done for
+    /// the graph, and for its per-task ones to be done for *its* task. A
+    /// non-per-task step waits for every dependency to be done for the graph —
+    /// which, for a per-task dependency, means every task has it. That is what
+    /// lets a step after the task lanes (`bump`, `summary`) run once, at the
+    /// end, instead of once per task.
     fn deps_met(&self, step: &Step, task: Option<u32>) -> bool {
         step.depends_on.iter().all(|dependency| {
             let Some(dependency) = self.workflow.step(dependency) else {
                 return false;
             };
             match task {
-                None => self.done.contains(&dependency.id),
                 Some(number) if dependency.per_task => self
                     .completed
                     .get(&dependency.id)
                     .is_some_and(|numbers| numbers.contains(&number)),
-                Some(_) => self.done.contains(&dependency.id),
+                _ => self.done.contains(&dependency.id),
             }
         })
     }
@@ -2664,6 +2667,76 @@ depends_on = ["first"]
         run_git(&root, &["add", "-A"]);
         run_git(&root, &["commit", "--quiet", "-m", "second task"]);
         (root, issue)
+    }
+
+    #[test]
+    fn a_step_after_the_task_lanes_runs_once_at_the_end() {
+        // `summary` waits for a per-task step, so it runs once — after every
+        // task has that step — rather than once per task or never.
+        let dir = TempDir::new();
+        let (root, issue) = two_task_repo(&dir);
+        let workflow = workflow(
+            r#"
+schema = 2
+name = "implement"
+revision = 1
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+per_task = true
+
+[[step]]
+id = "summary"
+kind = "harness"
+skill = "summary"
+depends_on = ["code"]
+"#,
+        );
+        let mut harness = FakeHarness::new();
+        for _ in 0..2 {
+            harness.script(
+                "code",
+                Scripted::Done {
+                    files: Vec::new(),
+                    text: "coded".to_owned(),
+                },
+            );
+        }
+        harness.script(
+            "summary",
+            Scripted::Done {
+                files: Vec::new(),
+                text: "summarized".to_owned(),
+            },
+        );
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.workdir = root.clone();
+        config.repo = Some(Repo::open(&root).expect("repo opens"));
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+        let calls = runner.harness().calls();
+        let summary: Vec<&StepRequest> = calls
+            .iter()
+            .filter(|call| call.step.id == "summary")
+            .collect();
+        assert_eq!(summary.len(), 1, "summary ran once, not once per task");
+        assert_eq!(summary[0].task, None, "and for no single task");
+        // it ran after both tasks' code, not between them
+        let last_code = calls
+            .iter()
+            .rposition(|call| call.step.id == "code")
+            .expect("code ran");
+        let summary_at = calls
+            .iter()
+            .position(|call| call.step.id == "summary")
+            .expect("summary ran");
+        assert!(
+            summary_at > last_code,
+            "summary ran after the last task's code"
+        );
     }
 
     #[test]
