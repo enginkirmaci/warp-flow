@@ -93,6 +93,26 @@ withdraws the door and asks a blocking engine to stop.
   on it is a failed attempt with a repair that names the repository the queue
   measured, because an empty branch usually means the `code` step committed
   into another checkout.
+- **One step is one folder.** Two steps that would run in the same directory
+  never run together: a non-`per_task` step measures the repository root, and
+  two sessions in one checkout would fight over the index. Only `per_task` steps
+  for different tasks overlap, because their worktrees are disjoint.
+- **A merge step is a barrier.** It waits for everything in flight and starts
+  nothing while it runs, because `merge()` refuses a checkout with uncommitted
+  work and every step writes `run.md` into it. Do not relax the dirty check to
+  make the queue faster; the barrier is what makes it correct.
+- **One harness per dispatched step.** A door client's event stream is a single
+  queue, so one client cannot serve two sessions — `await_idle` drops frames
+  that belong to another session. The engine asks a `HarnessFactory` for one per
+  step; the app's opens a fresh door connection each time.
+- **The scheduler thread is the only writer of the issue folder.** A worker does
+  the session or the gate command and reports back. `run.md`, `questions/`,
+  `repairs/` and the commits are applied on the one thread, which is what keeps
+  `run.md` single-writer and the folder numbering collision-free. `run.md`'s
+  `running:` is a comma-separated list because several steps may be in flight.
+- A step after the task lanes (`bump`, `summary`) is not per task: it waits for
+  a per-task step, and a per-task dependency resolves for the graph as "every
+  task has it".
 
 ## Tests
 
