@@ -1,6 +1,6 @@
 # 02: Re-run only the gates that measure a task when the merge lands
 
-**Status:** ready-for-agent
+**Status:** resolved
 **Category:** enhancement
 **Blocked by:** None
 
