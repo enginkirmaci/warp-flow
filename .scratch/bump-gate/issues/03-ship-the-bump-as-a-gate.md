@@ -1,6 +1,6 @@
 # 03: Make the repository's own template bump through the gate script
 
-**Status:** ready-for-agent
+**Status:** resolved
 **Category:** enhancement
 **Blocked by:** 01
 
