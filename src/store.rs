@@ -42,6 +42,33 @@ pub struct Settings {
     /// The list pane's dragged width, when the owner moved it. `None` is the
     /// design's 432; the shell clamps whatever is stored.
     pub list_width: Option<f32>,
+    /// The door's catalog as it last answered: the harnesses, their models and
+    /// each model's effort variants. The workflow editor offers these as
+    /// choices, and caching them means the editor still works with the door
+    /// closed — a stale list is better than an empty one.
+    pub catalog: Vec<CatalogEntry>,
+}
+
+/// One harness in the cached catalog.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CatalogEntry {
+    /// The harness's id, such as `dsh`.
+    pub id: String,
+    /// The harness's label, for a person.
+    pub label: String,
+    /// The models this harness publishes.
+    pub models: Vec<CatalogModelEntry>,
+}
+
+/// One model in the cached catalog.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CatalogModelEntry {
+    /// The model's key, which is what a step names.
+    pub key: String,
+    /// The reasoning efforts this model offers.
+    pub variants: Vec<String>,
 }
 
 impl Settings {

@@ -847,17 +847,6 @@ impl<H: Harness + Send + 'static> Runner<H> {
         })
     }
 
-    /// The first ready task `step` has not run for, if there is one.
-    fn eligible_task<'a>(&self, step: &Step, issue: &'a Issue) -> Option<&'a Task> {
-        issue.ready_tasks().into_iter().find(|task| {
-            !self
-                .completed
-                .get(&step.id)
-                .is_some_and(|numbers| numbers.contains(&task.number))
-                && self.deps_met(step, Some(task.number))
-        })
-    }
-
     /// The graph-done set: steps with no outstanding work at all.
     ///
     /// A per-task step is done when every task is either resolved (no work

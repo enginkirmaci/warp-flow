@@ -484,6 +484,89 @@ impl Default for DoorTimeouts {
     }
 }
 
+/// One harness the door publishes, with the models it offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogHarness {
+    /// The harness's id, such as `dsh`.
+    pub id: String,
+    /// The harness's label, for a person.
+    pub label: String,
+    /// The models this harness publishes, each with its effort variants.
+    pub models: Vec<CatalogModel>,
+}
+
+/// One model in the door's catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogModel {
+    /// The model's key, which is what a step names.
+    pub key: String,
+    /// The reasoning efforts this model offers, in the door's order.
+    pub variants: Vec<String>,
+}
+
+/// Read the door's live catalog: every enabled harness and its models.
+///
+/// The workflow editor offers these as choices, so a step's `harness`, `model`
+/// and `effort` are picked from what the door actually publishes rather than
+/// typed from memory. A door that is not running is an error the caller shows
+/// as a note; the editor still works, with the fields left free.
+pub fn read_catalog() -> Result<Vec<CatalogHarness>> {
+    let client = DoorClient::local()?;
+    let metadata = client.request("harness", json!({"method": "metadata", "params": {}}))?;
+    let published = metadata
+        .get("harnesses")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            Error::Harness("`harness metadata` answered without a `harnesses` array".to_owned())
+        })?;
+    let models = client.request("models", json!({"refresh": false}))?;
+    let catalog = models
+        .get("catalog")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut harnesses = Vec::new();
+    for entry in published {
+        if entry.get("enabled") != Some(&Value::Bool(true)) {
+            continue;
+        }
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let label = entry
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or(id)
+            .to_owned();
+        let models = catalog
+            .iter()
+            .filter(|model| model.get("harness").and_then(Value::as_str) == Some(id))
+            .filter_map(|model| {
+                let key = model.get("key").and_then(Value::as_str)?.to_owned();
+                let variants = model
+                    .get("variants")
+                    .and_then(Value::as_array)
+                    .map(|variants| {
+                        variants
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(CatalogModel { key, variants })
+            })
+            .collect();
+        harnesses.push(CatalogHarness {
+            id: id.to_owned(),
+            label,
+            models,
+        });
+    }
+    Ok(harnesses)
+}
+
 /// The [`Harness`] the app uses: one door session per workflow step.
 #[derive(Debug)]
 pub struct DoorHarness {

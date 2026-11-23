@@ -287,6 +287,20 @@ fn the_repository_template_is_what_the_repos_tab_edits(cx: &mut TestAppContext) 
     assert_eq!(graph.revision, 4);
     assert!(cx.debug_bounds("flow-workflow-inspector").is_some());
 
+    // the template's own steps are the list's rows: the screen that edits a
+    // repository's workflow must show that workflow, not an empty list
+    for index in 0..graph.steps.len() {
+        assert!(
+            cx.debug_bounds(selector(&format!("flow-workflow-step-{index}")))
+                .is_some(),
+            "step {index} is a row in the list"
+        );
+    }
+    // and the rows are grouped into waves: analyze alone, then code, then check
+    assert!(cx.debug_bounds("flow-workflow-wave-0").is_some());
+    assert!(cx.debug_bounds("flow-workflow-wave-1").is_some());
+    assert!(cx.debug_bounds("flow-workflow-wave-2").is_some());
+
     // an edit, then a save: a save appends a revision to the repository's file,
     // not to an issue copy
     handle
@@ -308,6 +322,84 @@ fn the_repository_template_is_what_the_repos_tab_edits(cx: &mut TestAppContext) 
         !warp_flow_core::layout::pinned_workflow(&issue).exists(),
         "the editor never writes an issue folder"
     );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The editor builds a graph: a step at the front waits for nothing, one at the
+/// end waits for the current leaves, and a disabled step stays in the file.
+#[gpui_kit::gpui::test]
+fn the_editor_adds_at_both_ends_and_disables_a_step(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("graph");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let (repo, _issue) = seed_repo(&home, Some(WORKFLOW));
+    std::fs::write(warp_flow_core::layout::workflow_file(&repo), WORKFLOW)
+        .expect("the repository template");
+
+    let host = Arc::new(Host::new());
+    let handle = cx.open_window(size(px(1200.), px(860.)), |_window, cx| {
+        let screen = cx.new(|cx| WorkflowScreen::new(Arc::clone(&host), cx));
+        screen.update(cx, |screen, cx| {
+            screen.show_repository(repo.clone(), cx);
+        });
+        ScreenHost(screen)
+    });
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    // a step at the front waits for nothing
+    handle
+        .update(cx, |host, _, cx| {
+            host.0
+                .update(cx, |screen, cx| screen.add_step_for_probe("front", cx));
+        })
+        .expect("the window is open");
+    let graph = handle
+        .read_with(cx, |host, cx| host.0.read(cx).graph_for_probe().cloned())
+        .expect("the window is open")
+        .expect("a graph");
+    assert_eq!(graph.steps[0].id, "step-4", "the new step is first");
+    assert!(
+        graph.steps[0].depends_on.is_empty(),
+        "a step at the front waits for nothing"
+    );
+
+    // a step at the end waits for the current leaves
+    handle
+        .update(cx, |host, _, cx| {
+            host.0
+                .update(cx, |screen, cx| screen.add_step_for_probe("end", cx));
+        })
+        .expect("the window is open");
+    let graph = handle
+        .read_with(cx, |host, cx| host.0.read(cx).graph_for_probe().cloned())
+        .expect("the window is open")
+        .expect("a graph");
+    let last = graph.steps.last().expect("a last step");
+    assert_eq!(last.id, "step-5");
+    assert_eq!(
+        last.depends_on,
+        vec!["step-4".to_owned(), "check".to_owned()],
+        "the end joins every current leaf, and the step at the front is one"
+    );
+
+    // disabling a step keeps it in the graph and marks it off
+    handle
+        .update(cx, |host, _, cx| {
+            host.0.update(cx, |screen, cx| {
+                screen.select_for_probe(1, cx);
+                screen.toggle_enabled_for_probe(cx);
+            });
+        })
+        .expect("the window is open");
+    let graph = handle
+        .read_with(cx, |host, cx| host.0.read(cx).graph_for_probe().cloned())
+        .expect("the window is open")
+        .expect("a graph");
+    assert!(!graph.steps[1].enabled, "the step is off");
+    assert_eq!(graph.steps.len(), 5, "and still in the graph");
 
     let _ = std::fs::remove_dir_all(&home);
 }

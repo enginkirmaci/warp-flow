@@ -39,6 +39,17 @@ use crate::theme;
 
 use super::{ScreenRun, placeholder};
 
+/// Where a new step goes, which decides what it waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Place {
+    /// Before everything: it waits for nothing.
+    Front,
+    /// After the selection: it waits for that step.
+    After,
+    /// After everything: it waits for the current leaves.
+    End,
+}
+
 /// The schema every workflow file this editor writes carries.
 const SCHEMA: u32 = 2;
 
@@ -95,6 +106,8 @@ struct StepFacts {
     produces: Option<String>,
     depends_on: Vec<String>,
     per_task: bool,
+    /// Whether the step runs. A disabled step stays in the list, dimmed.
+    enabled: bool,
 }
 
 /// One step's editable fields, in the editor. The entities are reused for
@@ -107,6 +120,9 @@ struct Fields {
     command: Entity<InputState>,
     produces: Entity<InputState>,
     depends_on: Entity<InputState>,
+    harness: Entity<InputState>,
+    model: Entity<InputState>,
+    effort: Entity<InputState>,
 }
 
 /// The workflow editor: the 320 step list and the selected step's editor.
@@ -137,6 +153,10 @@ pub struct WorkflowScreen {
     revisions: Vec<Revision>,
     focus: FocusHandle,
     list_scroll: ScrollHandle,
+    /// The door's catalog as last read, for the harness, model and effort
+    /// choices. Empty until the first read lands, and empty again when the door
+    /// has never answered — the fields stay free text either way.
+    catalog: Vec<store::CatalogEntry>,
 }
 
 impl WorkflowScreen {
@@ -157,7 +177,51 @@ impl WorkflowScreen {
             revisions: Vec::new(),
             focus: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
+            catalog: store::Settings::load().catalog,
         }
+    }
+
+    /// Re-read the door's catalog on the background executor and keep it.
+    ///
+    /// The editor offers the harnesses, models and efforts the door publishes,
+    /// so a step's choice is picked from what exists rather than typed from
+    /// memory. A door that is not running leaves the cached list in place: a
+    /// stale choice is better than an empty one, and the fields stay free text.
+    fn refresh_catalog(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let catalog = cx
+                .background_executor()
+                .spawn(async { warp_flow_core::door::read_catalog() })
+                .await;
+            let Ok(catalog) = catalog else {
+                return;
+            };
+            let entries: Vec<store::CatalogEntry> = catalog
+                .into_iter()
+                .map(|harness| store::CatalogEntry {
+                    id: harness.id,
+                    label: harness.label,
+                    models: harness
+                        .models
+                        .into_iter()
+                        .map(|model| store::CatalogModelEntry {
+                            key: model.key,
+                            variants: model.variants,
+                        })
+                        .collect(),
+                })
+                .collect();
+            this.update(cx, |this, cx| {
+                this.catalog = entries.clone();
+                cx.notify();
+            })
+            .ok();
+            // remember it, so the next launch starts with a list
+            let mut settings = store::Settings::load();
+            settings.catalog = entries;
+            settings.save();
+        })
+        .detach();
     }
 
     /// Show `run`: take the scan's graph as the working copy, or as the
@@ -181,17 +245,21 @@ impl WorkflowScreen {
     /// cut from. A save appends a revision here, and every run started after it
     /// reads that revision; a run already driving keeps the copy it pinned.
     pub fn show_repository(&mut self, repo: PathBuf, cx: &mut Context<Self>) {
-        // an unsaved edit survives the window's two-second poll
-        if !self.dirty && self.repo.as_ref() == Some(&repo) && self.run.is_none() {
-            return;
-        }
-        if self.run.is_none() && self.repo.as_ref() == Some(&repo) {
+        // An unsaved edit survives the window's two-second poll, and so does a
+        // repository already on screen: reloading would throw the edit away.
+        // The one case that must reload is a screen that has never read this
+        // repository, or one whose file changed under it — and the file is
+        // re-read on every open, so a template created after the first visit
+        // appears without switching repositories.
+        let same = self.run.is_none() && self.repo.as_ref() == Some(&repo);
+        if same && self.dirty {
             return;
         }
         self.run = None;
         self.read_only = false;
         self.repo = Some(repo);
         self.load_graph(cx);
+        self.refresh_catalog(cx);
     }
 
     /// Seed the working copy from the scan (no filesystem read: the scan already
@@ -300,18 +368,22 @@ impl WorkflowScreen {
         self.graph.as_ref()?.steps.get(self.selected)
     }
 
-    /// The list's rows: the graph's steps, or — when the run names a revision
-    /// the folder no longer carries — the log's steps.
+    /// The list's rows: the graph's steps, with the run's state beside them
+    /// when there is a run.
+    ///
+    /// The graph is the source in both modes. `Repos › Workflow` has no run at
+    /// all, and it is the screen that edits the template — reading the rows
+    /// from the run made the list empty there, so a repository's own steps were
+    /// invisible in the one place they are edited.
     fn facts(&self) -> Vec<StepFacts> {
-        let Some(run) = self.run.as_ref() else {
-            return Vec::new();
-        };
         let state_of = |id: &str| {
-            run.run
-                .steps
-                .iter()
-                .find(|step| step.id == id)
-                .map(|step| step.state)
+            self.run.as_ref().and_then(|run| {
+                run.run
+                    .steps
+                    .iter()
+                    .find(|step| step.id == id)
+                    .map(|step| step.state)
+            })
         };
         if let Some(graph) = &self.graph {
             return graph
@@ -327,9 +399,15 @@ impl WorkflowScreen {
                     produces: step.produces.clone(),
                     depends_on: step.depends_on.clone(),
                     per_task: step.per_task,
+                    enabled: step.enabled,
                 })
                 .collect();
         }
+        // No graph at all: the run names a revision the folder no longer
+        // carries, so the log's steps are all there is to draw.
+        let Some(run) = self.run.as_ref() else {
+            return Vec::new();
+        };
         run.run
             .steps
             .iter()
@@ -343,8 +421,46 @@ impl WorkflowScreen {
                 produces: None,
                 depends_on: Vec::new(),
                 per_task: step.per_task,
+                enabled: true,
             })
             .collect()
+    }
+
+    /// The list's rows grouped into waves: `(wave number, row indices)`.
+    ///
+    /// A wave is the set of steps that become ready together — same depth from
+    /// the graph's roots, no dependency between them. The editor draws one band
+    /// per wave, which is what makes a fork and a join visible. Disabled steps
+    /// are in the waves they would occupy, so switching one off does not move
+    /// the rows around it.
+    fn waves(&self, facts: &[StepFacts]) -> Vec<(usize, Vec<usize>)> {
+        let Some(graph) = &self.graph else {
+            // No graph: the log's steps have no dependencies to group by, so
+            // they are one wave in the order the log lists them.
+            return if facts.is_empty() {
+                Vec::new()
+            } else {
+                vec![(0, (0..facts.len()).collect())]
+            };
+        };
+        let mut depth: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for step in &graph.steps {
+            depth_of(
+                graph,
+                step,
+                &mut depth,
+                &mut std::collections::BTreeSet::new(),
+            );
+        }
+        let mut waves: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (index, step) in graph.steps.iter().enumerate() {
+            let level = depth.get(step.id.as_str()).copied().unwrap_or(0);
+            match waves.last_mut() {
+                Some((wave, indices)) if *wave == level => indices.push(index),
+                _ => waves.push((level, vec![index])),
+            }
+        }
+        waves
     }
 
     /// Edit the selected step and mark the graph dirty.
@@ -396,12 +512,33 @@ impl WorkflowScreen {
             "an artifact in the run folder",
         );
         let depends_on = make(window, cx, step.depends_on.join(", "), "another step's id");
+        let harness = make(
+            window,
+            cx,
+            step.harness.clone().unwrap_or_default(),
+            "a harness the door publishes; empty is the engine's choice",
+        );
+        let model = make(
+            window,
+            cx,
+            step.model.clone().unwrap_or_default(),
+            "a model of that harness; empty is its first",
+        );
+        let effort = make(
+            window,
+            cx,
+            step.effort.clone().unwrap_or_default(),
+            "one of that model's variants",
+        );
         let watched: Vec<(Entity<InputState>, Field)> = vec![
             (id.clone(), Field::Id),
             (skill.clone(), Field::Skill),
             (command.clone(), Field::Command),
             (produces.clone(), Field::Produces),
             (depends_on.clone(), Field::DependsOn),
+            (harness.clone(), Field::Harness),
+            (model.clone(), Field::Model),
+            (effort.clone(), Field::Effort),
         ];
         for (input, which) in watched {
             let watched = input.clone();
@@ -415,6 +552,9 @@ impl WorkflowScreen {
                     Field::Id => step.id = text,
                     Field::Skill => step.skill = (!text.is_empty()).then_some(text),
                     Field::Command => step.command = (!text.is_empty()).then_some(text),
+                    Field::Harness => step.harness = (!text.is_empty()).then_some(text),
+                    Field::Model => step.model = (!text.is_empty()).then_some(text),
+                    Field::Effort => step.effort = (!text.is_empty()).then_some(text),
                     Field::Produces => step.produces = (!text.is_empty()).then_some(text),
                     Field::DependsOn => {
                         step.depends_on = text
@@ -434,6 +574,9 @@ impl WorkflowScreen {
             command,
             produces,
             depends_on,
+            harness,
+            model,
+            effort,
         };
         self.fields = Some(fields.clone());
         Some(fields)
@@ -453,6 +596,15 @@ impl WorkflowScreen {
             (
                 fields.command.clone(),
                 step.command.clone().unwrap_or_default(),
+            ),
+            (
+                fields.harness.clone(),
+                step.harness.clone().unwrap_or_default(),
+            ),
+            (fields.model.clone(), step.model.clone().unwrap_or_default()),
+            (
+                fields.effort.clone(),
+                step.effort.clone().unwrap_or_default(),
             ),
             (
                 fields.produces.clone(),
@@ -488,11 +640,38 @@ impl WorkflowScreen {
     }
 
     /// Add a step after the selection.
-    fn add_step(&mut self, cx: &mut Context<Self>) {
+    /// Add a step at the front, after the selection, or at the end.
+    ///
+    /// A step's place is its dependencies (ADR-0014), so where it goes decides
+    /// what it waits for: at the front it waits for nothing, after the
+    /// selection it waits for that step, and at the end it waits for the
+    /// current leaves — the steps nothing else depends on.
+    fn add_step(&mut self, place: Place, cx: &mut Context<Self>) {
         let Some(graph) = self.graph.as_mut() else {
             return;
         };
         let number = graph.steps.len() + 1;
+        let depends_on = match place {
+            Place::Front => Vec::new(),
+            Place::After => graph
+                .steps
+                .get(self.selected)
+                .map(|step| vec![step.id.clone()])
+                .unwrap_or_default(),
+            Place::End => {
+                let depended_on: std::collections::BTreeSet<&str> = graph
+                    .steps
+                    .iter()
+                    .flat_map(|step| step.depends_on.iter().map(String::as_str))
+                    .collect();
+                graph
+                    .steps
+                    .iter()
+                    .filter(|step| !depended_on.contains(step.id.as_str()))
+                    .map(|step| step.id.clone())
+                    .collect()
+            }
+        };
         let step = Step {
             id: format!("step-{number}"),
             kind: StepKind::Harness,
@@ -504,14 +683,19 @@ impl WorkflowScreen {
             command: None,
             cwd: None,
             timeout_secs: None,
-            depends_on: Vec::new(),
+            depends_on,
             produces: None,
             per_task: false,
             mode: None,
             push: false,
         };
-        graph.steps.insert(self.selected.saturating_add(1), step);
-        self.selected = (self.selected + 1).min(graph.steps.len().saturating_sub(1));
+        let at = match place {
+            Place::Front => 0,
+            Place::After => self.selected.saturating_add(1),
+            Place::End => graph.steps.len(),
+        };
+        graph.steps.insert(at, step);
+        self.selected = at.min(graph.steps.len().saturating_sub(1));
         self.fields = None;
         self.dirty = true;
         self.error = None;
@@ -656,12 +840,25 @@ impl WorkflowScreen {
                     .child(version),
             );
         } else {
-            head = head.child(action_link(
-                "flow-workflow-add",
-                "Add step",
-                Some("Append a harness step after the selection; Save writes it."),
-                cx.listener(|this, _, _, cx| this.add_step(cx)),
-            ));
+            head = head
+                .child(action_link(
+                    "flow-workflow-add-front",
+                    "At the start",
+                    Some("Add a step that waits for nothing."),
+                    cx.listener(|this, _, _, cx| this.add_step(Place::Front, cx)),
+                ))
+                .child(action_link(
+                    "flow-workflow-add",
+                    "After",
+                    Some("Add a step that waits for the selected one."),
+                    cx.listener(|this, _, _, cx| this.add_step(Place::After, cx)),
+                ))
+                .child(action_link(
+                    "flow-workflow-add-end",
+                    "At the end",
+                    Some("Add a step that waits for the current leaves."),
+                    cx.listener(|this, _, _, cx| this.add_step(Place::End, cx)),
+                ));
         }
 
         let mut rows = div()
@@ -682,8 +879,15 @@ impl WorkflowScreen {
                 "A workflow needs one harness step to run anything.",
             ));
         }
-        for (index, facts) in facts.iter().enumerate() {
-            rows = rows.child(self.render_step_row(index, facts, revision, cx));
+        // The list is drawn in waves: the steps that become ready together sit
+        // under one band, so a fork and a join are visible as such. A step's
+        // place is its dependencies (ADR-0014), and the band is where that
+        // shows.
+        for (wave, indices) in self.waves(facts) {
+            rows = rows.child(wave_band(wave, indices.len()));
+            for index in indices {
+                rows = rows.child(self.render_step_row(index, &facts[index], revision, cx));
+            }
         }
         div()
             .id("flow-workflow-column")
@@ -715,7 +919,15 @@ impl WorkflowScreen {
         let mut row = div()
             .id(SharedString::from(selector.clone()))
             .debug_selector(move || selector.clone())
-            .a11y_option(format!("Step {}, {}", facts.id, facts.meta), selected)
+            .a11y_option(
+                format!(
+                    "Step {}, {}{}",
+                    facts.id,
+                    facts.meta,
+                    if facts.enabled { "" } else { ", disabled" }
+                ),
+                selected,
+            )
             .relative()
             .flex_shrink_0()
             .flex()
@@ -762,7 +974,11 @@ impl WorkflowScreen {
                         .truncate()
                         .text_size(px(theme::font_name()))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::text())
+                        .text_color(if facts.enabled {
+                            theme::text()
+                        } else {
+                            theme::text_muted()
+                        })
                         .child(facts.id.clone()),
                 )
                 .child(
@@ -778,7 +994,7 @@ impl WorkflowScreen {
                 .state
                 .map(|state| state_pill(state, &facts.id))
                 .unwrap_or_else(|| quiet_word("missing"))
-        } else {
+        } else if facts.enabled {
             div()
                 .flex_shrink_0()
                 .font_family(theme::code_font())
@@ -786,6 +1002,8 @@ impl WorkflowScreen {
                 .text_color(theme::text_muted())
                 .child(format!("@{revision}"))
                 .into_any_element()
+        } else {
+            quiet_word("off")
         })
         .into_any_element()
     }
@@ -935,6 +1153,29 @@ impl WorkflowScreen {
             );
         }
         body = body.child(self.kind_row(&step, cx));
+        // A disabled step stays in the graph and never runs; its dependents
+        // inherit its own dependencies, so switching it off closes the pipeline
+        // over it instead of breaking it.
+        body = body.child(
+            kit::switch_row(
+                "flow-step-enabled",
+                "Enabled",
+                "flow-step-enabled",
+                step.enabled,
+                false,
+                {
+                    let sheet = cx.entity();
+                    move |checked: &bool, _window, cx| {
+                        let checked = *checked;
+                        sheet.update(cx, |this, cx| {
+                            this.edit_step(cx, |step| step.enabled = checked);
+                            cx.notify();
+                        });
+                    }
+                },
+            )
+            .into_any_element(),
+        );
         let mut rows: Vec<(&'static str, &'static str, Option<Entity<InputState>>)> =
             vec![("Id", "id", fields.as_ref().map(|fields| fields.id.clone()))];
         if step.kind == StepKind::Harness {
@@ -942,6 +1183,21 @@ impl WorkflowScreen {
                 "Skill",
                 "skill",
                 fields.as_ref().map(|fields| fields.skill.clone()),
+            ));
+            rows.push((
+                "Harness",
+                "harness",
+                fields.as_ref().map(|fields| fields.harness.clone()),
+            ));
+            rows.push((
+                "Model",
+                "model",
+                fields.as_ref().map(|fields| fields.model.clone()),
+            ));
+            rows.push((
+                "Effort",
+                "effort",
+                fields.as_ref().map(|fields| fields.effort.clone()),
             ));
         }
         if step.kind == StepKind::Gate {
@@ -963,6 +1219,11 @@ impl WorkflowScreen {
         ));
         for (label, key, input) in rows {
             body = body.child(self.field_row(label, key, input, window, cx));
+            // The catalog-backed fields offer what the door publishes, so a
+            // choice is picked from what exists rather than typed from memory.
+            if let Some(choices) = self.choices_for(key, &step) {
+                body = body.child(self.choice_row(key, choices, cx));
+            }
         }
         if let Some(error) = &self.error {
             body = body.child(
@@ -1276,6 +1537,9 @@ impl WorkflowScreen {
             ("Runs", value_word(runs)),
             ("Depends on", mono_or_dash(depends.as_deref())),
         ];
+        if !step.enabled {
+            rows.insert(0, ("Enabled", value_word("no")));
+        }
         if step.kind == StepKind::Harness {
             rows.insert(1, ("Skill", mono_or_dash(step.skill.as_deref())));
         }
@@ -1413,6 +1677,109 @@ impl WorkflowScreen {
         row.into_any_element()
     }
 
+    /// The choices the catalog offers for one field, or `None` when the field
+    /// is free text or the catalog has nothing to say.
+    ///
+    /// `harness` lists every enabled harness; `model` lists the models of the
+    /// harness the step names (or every model when it names none); `effort`
+    /// lists the variants of the model the step names.
+    fn choices_for(&self, key: &str, step: &Step) -> Option<Vec<String>> {
+        if self.catalog.is_empty() {
+            return None;
+        }
+        let choices: Vec<String> = match key {
+            "harness" => self
+                .catalog
+                .iter()
+                .map(|harness| harness.id.clone())
+                .collect(),
+            "model" => self
+                .catalog
+                .iter()
+                .filter(|harness| {
+                    step.harness
+                        .as_deref()
+                        .is_none_or(|wanted| wanted == harness.id)
+                })
+                .flat_map(|harness| harness.models.iter().map(|model| model.key.clone()))
+                .collect(),
+            "effort" => {
+                let model = step.model.as_deref()?;
+                self.catalog
+                    .iter()
+                    .flat_map(|harness| harness.models.iter())
+                    .find(|entry| entry.key == model)
+                    .map(|entry| entry.variants.clone())
+                    .unwrap_or_default()
+            }
+            _ => return None,
+        };
+        (!choices.is_empty()).then_some(choices)
+    }
+
+    /// One row of choices under a field: a chip per value, the current one
+    /// marked.
+    fn choice_row(&self, key: &str, choices: Vec<String>, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.step().and_then(|step| match key {
+            "harness" => step.harness.clone(),
+            "model" => step.model.clone(),
+            "effort" => step.effort.clone(),
+            _ => None,
+        });
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.))
+            .pb(px(6.))
+            .pl(px(theme::scaled(LABEL_WIDTH) + 12.));
+        for choice in choices {
+            let selected = current.as_deref() == Some(choice.as_str());
+            let selector = format!("flow-choice-{key}-{choice}");
+            let value = choice.clone();
+            let field = key.to_owned();
+            row = row.child(
+                div()
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector.clone())
+                    .role(gpui::Role::Button)
+                    .aria_label(choice.clone())
+                    .cursor_pointer()
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(if selected {
+                        theme::accent()
+                    } else {
+                        theme::hairline()
+                    })
+                    .text_size(px(theme::font_micro()))
+                    .font_family(theme::code_font())
+                    .text_color(if selected {
+                        theme::text()
+                    } else {
+                        theme::text_muted()
+                    })
+                    .hover(|style| style.bg(theme::raised()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let value = value.clone();
+                        let field = field.clone();
+                        this.edit_step(cx, |step| match field.as_str() {
+                            "harness" => step.harness = Some(value),
+                            "model" => step.model = Some(value),
+                            "effort" => step.effort = Some(value),
+                            _ => {}
+                        });
+                        this.refill_fields(window, cx);
+                        cx.notify();
+                    }))
+                    .child(choice),
+            );
+        }
+        row.into_any_element()
+    }
+
     /// The Revisions card: the loaded revision, then every one a save appended.
     /// Nothing rewrites a row.
     fn render_revisions(&self) -> AnyElement {
@@ -1530,6 +1897,32 @@ impl WorkflowScreen {
         self.save(cx);
     }
 
+    /// Add a step at `place`, as the head's three links do.
+    #[doc(hidden)]
+    pub fn add_step_for_probe(&mut self, place: &str, cx: &mut Context<Self>) {
+        let place = match place {
+            "front" => Place::Front,
+            "end" => Place::End,
+            _ => Place::After,
+        };
+        self.add_step(place, cx);
+    }
+
+    /// Select a step by index, as clicking its row does.
+    #[doc(hidden)]
+    pub fn select_for_probe(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.selected = index;
+        self.fields = None;
+        cx.notify();
+    }
+
+    /// Toggle the selected step's `enabled`, as the switch does.
+    #[doc(hidden)]
+    pub fn toggle_enabled_for_probe(&mut self, cx: &mut Context<Self>) {
+        self.edit_step(cx, |step| step.enabled = !step.enabled);
+        cx.notify();
+    }
+
     /// The revisions the card lists, newest last, for a probe.
     #[doc(hidden)]
     pub fn revisions_for_probe(&self) -> Vec<(u32, usize, &'static str)> {
@@ -1579,6 +1972,9 @@ enum Field {
     Command,
     Produces,
     DependsOn,
+    Harness,
+    Model,
+    Effort,
 }
 
 /// The word a step kind shows.
@@ -1600,6 +1996,58 @@ fn kind_glyph(kind: StepKind) -> &'static str {
         StepKind::Question => "icons/icon-help.svg",
         StepKind::Merge => "icons/icon-merge.svg",
     }
+}
+
+/// The depth of `step`: one past the deepest of its dependencies.
+///
+/// This is what groups the list into waves. `validate` refuses a cycle, so the
+/// `visiting` guard only keeps a malformed graph from recursing forever while
+/// the editor is mid-edit.
+fn depth_of<'a>(
+    graph: &'a Workflow,
+    step: &'a Step,
+    depth: &mut std::collections::BTreeMap<&'a str, usize>,
+    visiting: &mut std::collections::BTreeSet<&'a str>,
+) -> usize {
+    if let Some(known) = depth.get(step.id.as_str()) {
+        return *known;
+    }
+    if !visiting.insert(step.id.as_str()) {
+        return 0;
+    }
+    let mut level = 0;
+    for dependency in &step.depends_on {
+        if let Some(dependency) = graph.step(dependency) {
+            level = level.max(depth_of(graph, dependency, depth, visiting) + 1);
+        }
+    }
+    visiting.remove(step.id.as_str());
+    depth.insert(step.id.as_str(), level);
+    level
+}
+
+/// One wave's band: the number and how many steps are in it.
+fn wave_band(wave: usize, count: usize) -> AnyElement {
+    let selector = format!("flow-workflow-wave-{wave}");
+    div()
+        .debug_selector(move || selector.clone())
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .h(px(30.))
+        .px(px(14.))
+        .bg(theme::surface())
+        .text_size(px(theme::font_micro()))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme::text_muted())
+        .child(format!("Wave {}", wave + 1))
+        .child(div().flex_1())
+        .child(div().font_weight(FontWeight::MEDIUM).child(if count == 1 {
+            "1 step".to_owned()
+        } else {
+            format!("{count} in parallel")
+        }))
+        .into_any_element()
 }
 
 /// A step's list meta: `harness · once per task · after code`.

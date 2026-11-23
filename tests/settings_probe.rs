@@ -85,6 +85,7 @@ fn the_settings_rows_and_the_motion_switch(cx: &mut TestAppContext) {
         reduce_motion: false,
         favorites: Vec::new(),
         list_width: None,
+        catalog: Vec::new(),
     };
     settings.save();
     assert!(!warpui_kit_core::motion::reduced());
