@@ -19,7 +19,7 @@ use std::process::ExitCode;
 
 use warp_flow_core::artifact::Document;
 use warp_flow_core::control::KeepGoing;
-use warp_flow_core::door::DoorHarness;
+use warp_flow_core::door::DoorHarnessFactory;
 use warp_flow_core::graph::StepKind;
 use warp_flow_core::prepare::{Prepared, prepare};
 use warp_flow_core::run::{DEFAULT_MAX_ATTEMPTS, LogSink, RunStatus};
@@ -86,10 +86,15 @@ fn command_run(args: &[String]) -> Result<u8, String> {
     // reads the revision it started on
     prepared.pin_workflow().map_err(|error| error.to_string())?;
 
-    let harness = DoorHarness::local().map_err(|error| error.to_string())?;
-    let mut config = prepared.config(harness, Box::new(StderrLog), Box::new(KeepGoing));
+    // one door connection per dispatched step: a run may have several steps in
+    // flight, and one client's event stream cannot serve two sessions
+    let factory = DoorHarnessFactory::local();
+    let mut config =
+        prepared.config_with_factory(factory, Box::new(StderrLog), Box::new(KeepGoing));
     config.max_attempts = max_attempts;
-    let mut runner = prepared.runner(config).map_err(|error| error.to_string())?;
+    let mut runner = prepared
+        .runner_with_factory(config)
+        .map_err(|error| error.to_string())?;
 
     let status = runner.run().map_err(|error| error.to_string())?;
     println!("{status}");

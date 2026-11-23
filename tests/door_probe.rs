@@ -189,6 +189,7 @@ struct ProbeGate {
 }
 
 /// The fake harness: its one step blocks until the probe releases it.
+#[derive(Clone)]
 struct ProbeHarness {
     gate: Arc<ProbeGate>,
 }

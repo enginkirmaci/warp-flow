@@ -734,9 +734,11 @@ fn scan_run(
         .unwrap_or_else(|| "needs-triage".to_owned());
     let rows = table_rows(run_body);
     let attempts = rows.len();
+    // `running:` names every step in flight, comma separated; a run with one
+    // step in flight reads the same as it always did.
     let step = run_doc
         .as_ref()
-        .and_then(|doc| doc.value("step"))
+        .and_then(|doc| doc.value("running"))
         .map(str::to_owned)
         .or_else(|| rows.last().map(|row| row.step.clone()))
         .unwrap_or_else(|| "—".to_owned());
@@ -1255,7 +1257,7 @@ fn lane_view(
     };
     if state == StepState::Idle
         && run_status == "running"
-        && run_step == step.id
+        && running_has(run_step, &step.id)
         && next_ready_task(tasks) == Some(task.number)
     {
         state = StepState::Running;
@@ -1295,10 +1297,22 @@ fn step_state(
     if open {
         return StepState::Waiting;
     }
-    if task.is_none() && run_status == "running" && run_step == step.id {
+    if task.is_none() && run_status == "running" && running_has(run_step, &step.id) {
         return StepState::Running;
     }
     StepState::Idle
+}
+
+/// Whether `running` names `step`.
+///
+/// `run.md`'s `running:` is a comma-separated list, because a run may have
+/// several steps in flight at once. A step is running when its id is one of
+/// them; the `@task` suffix a per-task entry may carry is not part of the id.
+fn running_has(running: &str, step: &str) -> bool {
+    running
+        .split(',')
+        .map(str::trim)
+        .any(|entry| entry.split('@').next() == Some(step))
 }
 
 /// A `per_task` band's state: the worst lane wins, and all done is done.

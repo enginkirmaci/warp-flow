@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::Serialize;
 use warp_flow_core::artifact::Document;
 use warp_flow_core::control::{SharedControl, Signal};
-use warp_flow_core::door::DoorHarness;
+use warp_flow_core::door::DoorHarnessFactory;
 use warp_flow_core::prepare::{Prepared, prepare};
 use warp_flow_core::run::{LogSink, RunStatus, Runner, timestamp};
 
@@ -165,15 +165,18 @@ struct EngineDriver {
 
 impl Driver for EngineDriver {
     fn run(&mut self) -> warp_flow_core::Result<RunStatus> {
-        let harness = DoorHarness::local()?;
-        let config = self.context.prepared.config(
-            harness,
+        // one door connection per dispatched step: a run may have several
+        // steps in flight, and one client's event stream cannot serve two
+        // sessions
+        let factory = DoorHarnessFactory::local();
+        let config = self.context.prepared.config_with_factory(
+            factory,
             Box::new(self.context.log.clone()),
             Box::new(self.context.control.clone()),
         );
         let mut runner = match self.context.mode {
-            DriveMode::Fresh => Runner::new(config)?,
-            DriveMode::Resume => Runner::resume(config)?,
+            DriveMode::Fresh => Runner::with_factory(config)?,
+            DriveMode::Resume => Runner::resume_with_factory(config)?,
         };
         runner.run()
     }

@@ -24,7 +24,7 @@ use crate::artifact::{Document, FrontMatter, Issue, Status, Task};
 use crate::control::{Control, KeepGoing, Signal};
 use crate::gate::{Gate, GateOutcome};
 use crate::graph::{Step, StepKind, Workflow};
-use crate::harness::{Harness, StepOutcome, StepRequest};
+use crate::harness::{Harness, HarnessFactory, SharedHarness, StepOutcome, StepRequest};
 use crate::merge::{MergeOutcome, MergeRequest};
 use crate::worktree::{Repo, TaskWorktree};
 use crate::{Error, Result, skill};
@@ -128,8 +128,12 @@ pub struct RunnerConfig<H> {
     pub issue: PathBuf,
     /// The workflow graph for this run.
     pub workflow: Workflow,
-    /// The harness that performs harness steps.
-    pub harness: H,
+    /// Builds one harness per dispatched step.
+    ///
+    /// [`RunnerConfig::new`] wraps a single harness in a shared factory;
+    /// [`RunnerConfig::with_factory`] takes one that opens a fresh connection
+    /// per step, which is what the app needs.
+    pub factory: Option<Arc<dyn HarnessFactory<Harness = H> + Send + Sync>>,
     /// How many attempts one step gets before the run blocks.
     pub max_attempts: u32,
     /// The directory harness steps work in.
@@ -149,16 +153,38 @@ pub struct RunnerConfig<H> {
     pub log: Box<dyn LogSink>,
 }
 
-impl<H> RunnerConfig<H> {
+impl<H: Harness> RunnerConfig<H> {
     /// A config with the default attempt budget, the issue folder as the work
     /// directory, and a sink that drops the log.
-    pub fn new(issue: impl Into<PathBuf>, workflow: Workflow, harness: H) -> Self {
+    pub fn new(issue: impl Into<PathBuf>, workflow: Workflow, harness: H) -> Self
+    where
+        H: Clone + Send + Sync + 'static,
+    {
         let issue = issue.into();
         Self {
             workdir: issue.clone(),
             issue,
             workflow,
-            harness,
+            factory: Some(Arc::new(SharedHarness(harness))),
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            repo: None,
+            control: Box::new(KeepGoing),
+            log: Box::new(NullLog),
+        }
+    }
+
+    /// A config whose harnesses come from `factory`, one per dispatched step.
+    pub fn with_factory(
+        issue: impl Into<PathBuf>,
+        workflow: Workflow,
+        factory: impl HarnessFactory<Harness = H> + Send + Sync + 'static,
+    ) -> Self {
+        let issue = issue.into();
+        Self {
+            workdir: issue.clone(),
+            issue,
+            workflow,
+            factory: Some(Arc::new(factory)),
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             repo: None,
             control: Box::new(KeepGoing),
@@ -167,11 +193,72 @@ impl<H> RunnerConfig<H> {
     }
 }
 
-/// Drives a workflow over one issue folder, one step at a time.
+/// One step handed to a worker: everything the harness call needs, and nothing
+/// that touches the issue folder.
+///
+/// The worker does the session and reports back; every write to the issue
+/// folder stays on the scheduler thread. That is what keeps `run.md` a
+/// single-writer document and `questions/` numbering collision-free while
+/// several steps are in flight.
+struct StepJob {
+    /// The step to run.
+    step: Step,
+    /// The task it runs for, when the step is per task.
+    task: Option<Task>,
+    /// Which attempt this is, from 1.
+    attempt: u32,
+    /// The directory the step works in.
+    workdir: PathBuf,
+    /// What the worker does: a harness session, or a gate command.
+    work: StepWork,
+}
+
+/// The work one dispatched step does, decided on the scheduler thread so the
+/// worker needs no access to the runner.
+enum StepWork {
+    /// A harness session, with the prompt it reads.
+    Harness { prompt: String },
+    /// A gate command, with its `cwd` already resolved against the workdir.
+    Gate { gate: crate::gate::Gate },
+}
+
+impl StepWork {
+    /// The outcome word a failure of this work records.
+    fn failure_outcome(&self) -> &'static str {
+        match self {
+            Self::Harness { .. } => "blocked",
+            Self::Gate { .. } => "failed",
+        }
+    }
+}
+
+/// What a worker reports back for one job.
+struct StepReport {
+    /// The job this answers.
+    step: String,
+    /// The task, when the step is per task.
+    task: Option<u32>,
+    /// Which attempt it was.
+    attempt: u32,
+    /// The outcome word a failure records: a gate fails, a session blocks.
+    failure_outcome: &'static str,
+    /// The outcome, or the error that stopped the session.
+    result: Result<StepOutcome>,
+}
+
+/// Drives a workflow over one issue folder.
+///
+/// Steps whose dependencies are met are dispatched together, up to the
+/// workflow's `max_parallel`, with two rules that are not choices: two steps
+/// that would run in the same folder never run at once, and a merge step is a
+/// barrier — it waits for everything in flight and starts nothing while it
+/// runs, because the merge queue refuses a checkout with uncommitted work.
 pub struct Runner<H> {
     issue: PathBuf,
     workflow: Workflow,
-    harness: H,
+    /// Builds one harness per dispatched step: a run with several steps in
+    /// flight needs one door connection each.
+    harness_factory: Arc<dyn HarnessFactory<Harness = H> + Send + Sync>,
     max_attempts: u32,
     workdir: PathBuf,
     repo: Option<Repo>,
@@ -185,6 +272,10 @@ pub struct Runner<H> {
     done: BTreeSet<String>,
     /// Per-task steps that finished, by step id and task number.
     completed: BTreeMap<String, BTreeSet<u32>>,
+    /// Attempts spent, by step id and task number (`None` for a step that runs
+    /// once). A dispatched step reads its next attempt from here, so a failure
+    /// that earns a retry does not start again at 1.
+    attempts: BTreeMap<(String, Option<u32>), u32>,
     /// Ready-to-write rows of `run.md`'s log table, oldest first.
     rows: Vec<String>,
     /// The step the engine is on, written into `run.md`'s `step:` at each step
@@ -201,13 +292,25 @@ pub struct Runner<H> {
     resumed: bool,
 }
 
-impl<H: Harness> Runner<H> {
+impl<H: Harness + Send + 'static> Runner<H> {
     /// Validate the graph and the gate wiring, and check the issue folder parses.
-    pub fn new(config: RunnerConfig<H>) -> Result<Self> {
+    ///
+    /// A config built with [`RunnerConfig::new`] carries one harness, which is
+    /// shared by every step it dispatches; a config built with
+    /// [`RunnerConfig::with_factory`] builds a fresh one per step.
+    pub fn new(config: RunnerConfig<H>) -> Result<Self>
+    where
+        H: Clone + Sync,
+    {
+        Self::build(config)
+    }
+
+    /// The one constructor: validate, then assemble.
+    fn build(config: RunnerConfig<H>) -> Result<Self> {
         let RunnerConfig {
             issue,
             workflow,
-            harness,
+            factory,
             max_attempts,
             workdir,
             repo,
@@ -239,7 +342,7 @@ impl<H: Harness> Runner<H> {
         Ok(Self {
             issue,
             workflow,
-            harness,
+            harness_factory: factory.expect("a config carries a harness or a factory"),
             max_attempts,
             workdir,
             repo,
@@ -249,12 +352,28 @@ impl<H: Harness> Runner<H> {
             worktrees: BTreeMap::new(),
             done: BTreeSet::new(),
             completed: BTreeMap::new(),
+            attempts: BTreeMap::new(),
             rows: Vec::new(),
             current_step: None,
             started: timestamp(SystemTime::now()),
             note: None,
             resumed: false,
         })
+    }
+
+    /// Build a runner whose harnesses come from `factory`, one per step.
+    ///
+    /// This is the app's path: a door harness cannot be cloned, and a run with
+    /// several steps in flight needs one connection each.
+    pub fn with_factory(config: RunnerConfig<H>) -> Result<Self> {
+        Self::build(config)
+    }
+
+    /// Continue the run `run.md` records, with harnesses from a factory.
+    pub fn resume_with_factory(config: RunnerConfig<H>) -> Result<Self> {
+        let mut runner = Self::build(config)?;
+        runner.load_run()?;
+        Ok(runner)
     }
 
     /// Open the issue folder and continue the run `run.md` records.
@@ -264,7 +383,7 @@ impl<H: Harness> Runner<H> {
     /// clears that again. A missing `run.md` is simply a fresh run. The
     /// existing rows are kept and new rows are appended to them.
     pub fn resume(config: RunnerConfig<H>) -> Result<Self> {
-        let mut runner = Self::new(config)?;
+        let mut runner = Self::build(config)?;
         runner.load_run()?;
         Ok(runner)
     }
@@ -275,8 +394,10 @@ impl<H: Harness> Runner<H> {
     }
 
     /// The harness, for tests that inspect what was called.
-    pub fn harness(&self) -> &H {
-        &self.harness
+    pub fn harness(&self) -> H {
+        self.harness_factory
+            .build()
+            .expect("a shared harness builds")
     }
 
     /// Drive the workflow until it finishes, pauses on a question or blocks.
@@ -295,25 +416,44 @@ impl<H: Harness> Runner<H> {
     fn drive(&mut self) -> Result<RunStatus> {
         loop {
             let mut issue = Issue::open(&self.issue)?;
-            let candidates = self.candidate_ids();
             let mut ran = false;
 
+            // One pass over the ready steps. A step that needs the scheduler
+            // itself — a question, a merge — runs inline and may end the run; a
+            // harness or gate step is dispatched, and its report is applied
+            // before the next pass.
+            let candidates = self.candidate_ids();
+            let mut jobs: Vec<StepJob> = Vec::new();
+            let mut busy: BTreeSet<PathBuf> = BTreeSet::new();
+            // A per-task step is one candidate but many jobs: one per ready
+            // task it has not run for. That is what lets two tasks' work be in
+            // flight at once.
+            let mut work: Vec<(Step, Option<Task>)> = Vec::new();
             for id in candidates {
                 let Some(step) = self.workflow.step(&id).cloned() else {
                     continue;
                 };
-                let task = if step.per_task {
-                    match self.eligible_task(&step, &issue) {
-                        Some(task) => Some(task.clone()),
-                        None => continue,
+                if step.per_task {
+                    let tasks: Vec<Task> = issue
+                        .ready_tasks()
+                        .into_iter()
+                        .filter(|task| {
+                            !self
+                                .completed
+                                .get(&step.id)
+                                .is_some_and(|numbers| numbers.contains(&task.number))
+                                && self.deps_met(&step, Some(task.number))
+                        })
+                        .cloned()
+                        .collect();
+                    for task in tasks {
+                        work.push((step.clone(), Some(task)));
                     }
-                } else {
-                    if !self.deps_met(&step, None) {
-                        continue;
-                    }
-                    None
-                };
-
+                } else if self.deps_met(&step, None) {
+                    work.push((step, None));
+                }
+            }
+            for (step, task) in work {
                 // The one control read of this boundary: before the step runs,
                 // never inside it. A pause therefore stops between two steps and
                 // leaves `run.md` saying what happened, not what was requested.
@@ -321,36 +461,86 @@ impl<H: Harness> Runner<H> {
                     return Ok(status);
                 }
 
-                match self.run_step(&step, task.as_ref())? {
-                    StepRun::Done => {}
-                    StepRun::Waiting => {
-                        self.status = RunStatus::Waiting;
-                        self.write_run()?;
-                        self.log_line("run waiting on a question");
-                        return Ok(RunStatus::Waiting);
+                // A merge step is a barrier: it runs alone, and nothing starts
+                // while it does. The merge queue refuses a dirty checkout, and
+                // every step writes `run.md` into it.
+                if step.kind == StepKind::Merge || step.kind == StepKind::Question {
+                    if !jobs.is_empty() {
+                        break;
                     }
-                    StepRun::Blocked => {
-                        self.status = RunStatus::Blocked;
-                        self.write_run()?;
-                        self.log_line("run blocked");
-                        return Ok(RunStatus::Blocked);
+                    match self.run_step(&step, task.as_ref())? {
+                        StepRun::Done => {}
+                        StepRun::Waiting => {
+                            self.status = RunStatus::Waiting;
+                            self.write_run()?;
+                            self.log_line("run waiting on a question");
+                            return Ok(RunStatus::Waiting);
+                        }
+                        StepRun::Blocked => {
+                            self.status = RunStatus::Blocked;
+                            self.write_run()?;
+                            self.log_line("run blocked");
+                            return Ok(RunStatus::Blocked);
+                        }
                     }
+                    ran = true;
+                    self.mark_done(&step, task.as_ref());
+                    issue = Issue::open(&self.issue)?;
+                    continue;
                 }
 
-                ran = true;
-                match &task {
-                    Some(task) => {
-                        self.completed
-                            .entry(step.id.clone())
-                            .or_default()
-                            .insert(task.number);
+                // Two steps that would run in the same folder never run
+                // together: a non-per-task step measures the repository root,
+                // and two sessions in one checkout would fight over the index.
+                let workdir = self.step_workdir(&step, task.as_ref())?;
+                if busy.contains(&workdir) || jobs.len() >= self.max_parallel() {
+                    continue;
+                }
+                busy.insert(workdir.clone());
+                let key = (step.id.clone(), task.as_ref().map(|task| task.number));
+                let attempt = self.attempts.get(&key).copied().unwrap_or(0) + 1;
+                let work = if step.kind == StepKind::Gate {
+                    // A gate step carries its own command (ADR-0015); its `cwd`
+                    // is relative to the tree the step measures, so it is
+                    // resolved here, where that tree is known.
+                    let mut gate = step.gate()?;
+                    if gate.cwd.is_relative() {
+                        gate.cwd = workdir.join(&gate.cwd);
                     }
-                    None => {
-                        self.done.insert(step.id.clone());
+                    StepWork::Gate { gate }
+                } else {
+                    StepWork::Harness {
+                        prompt: self.prompt(&step, task.as_ref())?,
+                    }
+                };
+                jobs.push(StepJob {
+                    step,
+                    task,
+                    attempt,
+                    workdir,
+                    work,
+                });
+            }
+
+            if !jobs.is_empty() {
+                ran = true;
+                // Name the steps that are about to run before they start, so
+                // `run.md` says what the engine is doing while a session works
+                // — a step can run for minutes, and the record otherwise only
+                // changes when it finishes.
+                self.current_step = Some(
+                    jobs.iter()
+                        .map(|job| job.step.id.clone())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+                self.write_run()?;
+                let reports = self.dispatch(jobs)?;
+                for report in reports {
+                    if let Some(status) = self.apply_report(report)? {
+                        return Ok(status);
                     }
                 }
-                // A harness session may resolve a task or add one; the folder is
-                // the state, so re-read it before the next candidate.
                 issue = Issue::open(&self.issue)?;
             }
 
@@ -374,6 +564,146 @@ impl<H: Harness> Runner<H> {
                 self.write_run()?;
                 self.log_line(&format!("run blocked: {reason}"));
                 return Ok(RunStatus::Blocked);
+            }
+        }
+    }
+
+    /// How many steps this run may have in flight at once.
+    fn max_parallel(&self) -> usize {
+        self.workflow.max_parallel.max(1) as usize
+    }
+
+    /// Mark `step` complete for `task`, or for the graph when it has none.
+    fn mark_done(&mut self, step: &Step, task: Option<&Task>) {
+        match task {
+            Some(task) => {
+                self.completed
+                    .entry(step.id.clone())
+                    .or_default()
+                    .insert(task.number);
+            }
+            None => {
+                self.done.insert(step.id.clone());
+            }
+        }
+    }
+
+    /// Run `jobs` at once, each on its own thread with its own harness, and
+    /// return their reports in the order the jobs were dispatched.
+    ///
+    /// The worker does the session and nothing else: it writes no issue-folder
+    /// file, so the scheduler stays the only writer. A harness that cannot be
+    /// built or a session that fails comes back as a report, not as an error
+    /// that would abandon the other steps in flight.
+    fn dispatch(&mut self, jobs: Vec<StepJob>) -> Result<Vec<StepReport>> {
+        let factory = self.harness_factory.clone();
+        let mut handles = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let factory = Arc::clone(&factory);
+            let issue = self.issue.clone();
+            let handle = std::thread::Builder::new()
+                .name(format!("warp-flow-step-{}", job.step.id))
+                .spawn(move || {
+                    let failure_outcome = job.work.failure_outcome();
+                    let result = match job.work {
+                        StepWork::Gate { gate } => gate.run().map(|outcome| match outcome {
+                            GateOutcome::Passed { .. } => StepOutcome::Done {
+                                wrote: Vec::new(),
+                                text: "passed".to_owned(),
+                            },
+                            GateOutcome::Failed { code, tail, .. } => StepOutcome::Blocked {
+                                reason: format!(
+                                    "gate `{}` exited with code {code}\n{tail}",
+                                    gate.name
+                                ),
+                            },
+                            GateOutcome::TimedOut { took } => StepOutcome::Blocked {
+                                reason: format!("gate `{}` timed out after {took:?}", gate.name),
+                            },
+                        }),
+                        StepWork::Harness { prompt } => match factory.build() {
+                            Ok(mut harness) => harness.run(&StepRequest {
+                                step: job.step.clone(),
+                                issue,
+                                workdir: job.workdir.clone(),
+                                prompt,
+                                task: job.task.as_ref().map(|task| task.number),
+                                attempt: job.attempt,
+                            }),
+                            Err(error) => Err(error),
+                        },
+                    };
+                    StepReport {
+                        step: job.step.id.clone(),
+                        task: job.task.as_ref().map(|task| task.number),
+                        attempt: job.attempt,
+                        failure_outcome,
+                        result,
+                    }
+                })
+                .map_err(|error| Error::Run(format!("cannot start a step worker: {error}")))?;
+            handles.push(handle);
+        }
+        let mut reports = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let report = handle
+                .join()
+                .map_err(|_| Error::Run("a step worker panicked".to_owned()))?;
+            reports.push(report);
+        }
+        Ok(reports)
+    }
+
+    /// Apply one worker's report on the scheduler thread.
+    ///
+    /// `Some(status)` means the run stops here: a failure that spent its
+    /// attempt budget blocks the run, and everything still in flight has
+    /// already been joined by [`Runner::dispatch`], so nothing is left running.
+    fn apply_report(&mut self, report: StepReport) -> Result<Option<RunStatus>> {
+        let Some(step) = self.workflow.step(&report.step).cloned() else {
+            return Ok(None);
+        };
+        let task = report.task.and_then(|number| {
+            Issue::open(&self.issue)
+                .ok()
+                .and_then(|issue| issue.task(number).cloned())
+        });
+        let failure = match report.result {
+            Ok(StepOutcome::Done { .. }) => None,
+            Ok(StepOutcome::Blocked { reason }) => Some(Failure {
+                outcome: report.failure_outcome,
+                summary: reason,
+                detail: None,
+            }),
+            Err(error) => Some(Failure {
+                outcome: report.failure_outcome,
+                summary: error.to_string(),
+                detail: None,
+            }),
+        };
+        let key = (step.id.clone(), report.task);
+        self.attempts.insert(key, report.attempt);
+        match failure {
+            None => {
+                let outcome = if step.kind == StepKind::Gate {
+                    "passed"
+                } else {
+                    "done"
+                };
+                self.record_row(&step, task.as_ref(), report.attempt, outcome)?;
+                let label = step_label(&step, task.as_ref());
+                self.log_line(&format!("{label} attempt {}: {outcome}", report.attempt));
+                self.mark_done(&step, task.as_ref());
+                Ok(None)
+            }
+            Some(failure) => {
+                if self.register_failure(&step, task.as_ref(), report.attempt, &failure)? {
+                    self.status = RunStatus::Blocked;
+                    self.write_run()?;
+                    self.log_line("run blocked");
+                    return Ok(Some(RunStatus::Blocked));
+                }
+                Ok(None)
             }
         }
     }
@@ -711,7 +1041,8 @@ impl<H: Harness> Runner<H> {
             task: task.map(|task| task.number),
             attempt,
         };
-        match self.harness.run(&request)? {
+        let mut harness = self.harness_factory.build()?;
+        match harness.run(&request)? {
             StepOutcome::Done { .. } => Ok(None),
             StepOutcome::Blocked { reason } => Ok(Some(Failure {
                 outcome: "blocked",
@@ -1115,8 +1446,12 @@ impl<H: Harness> Runner<H> {
         front.set("workflow", self.workflow.name.clone());
         front.set("revision", self.workflow.revision.to_string());
         front.set("status", self.status.as_str());
+        // `running:` names every step in flight, comma separated. It replaced
+        // `step:` when a run could have more than one: a single field could
+        // only ever name one of them, and a screen reading it would show a
+        // parallel run as if it were serial.
         if let Some(step) = &self.current_step {
-            front.set("step", step.clone());
+            front.set("running", step.clone());
         }
         front.set("started", self.started.clone());
         front.set("updated", timestamp(SystemTime::now()));
@@ -1349,6 +1684,7 @@ mod tests {
 
     /// A harness that reads `run.md` when the engine calls it, so a test can
     /// see what the record said while the step was running.
+    #[derive(Clone)]
     struct ReadingHarness {
         issue: PathBuf,
         seen: Arc<Mutex<Vec<String>>>,
@@ -1358,7 +1694,7 @@ mod tests {
         fn run(&mut self, _request: &StepRequest) -> Result<StepOutcome> {
             let document = Document::read(self.issue.join("run.md"))?;
             let status = document.front.get("status").unwrap_or("none");
-            let step = document.front.get("step").unwrap_or("none");
+            let step = document.front.get("running").unwrap_or("none");
             self.seen
                 .lock()
                 .expect("seen lock")
@@ -1412,7 +1748,7 @@ depends_on = ["analyze"]
             "each session is called while `run.md` names its step"
         );
         assert_eq!(
-            run_md(&issue).front.get("step"),
+            run_md(&issue).front.get("running"),
             Some("split"),
             "the finished record keeps the last step it ran"
         );
@@ -1996,14 +2332,21 @@ depends_on = ["test"]
 
     /// A test harness that acts like a real coding session: it writes its work
     /// into the workdir and commits it, so the branch has something to merge.
-    #[derive(Default)]
+    #[derive(Default, Clone)]
     struct CommittingHarness {
-        calls: Vec<StepRequest>,
+        calls: Arc<Mutex<Vec<StepRequest>>>,
+    }
+
+    impl CommittingHarness {
+        /// Every request this harness has received, in order.
+        fn calls(&self) -> Vec<StepRequest> {
+            self.calls.lock().expect("calls lock").clone()
+        }
     }
 
     impl Harness for CommittingHarness {
         fn run(&mut self, request: &StepRequest) -> Result<StepOutcome> {
-            self.calls.push(request.clone());
+            self.calls.lock().expect("calls lock").push(request.clone());
             if request.step.per_task {
                 fs::write(request.workdir.join("feature.txt"), "done\n").expect("feature file");
                 run_git(&request.workdir, &["add", "feature.txt"]);
@@ -2038,7 +2381,7 @@ depends_on = ["test"]
         assert_eq!(worktrees.len(), 1, "one worktree for the one task");
         assert!(root.join("feature.txt").is_file(), "the branch landed");
 
-        let calls = &runner.harness().calls;
+        let calls = runner.harness().calls();
         assert_eq!(calls.len(), 2);
         assert!(
             calls[1].workdir.starts_with(root.join(".worktrees")),
@@ -2273,6 +2616,179 @@ depends_on = ["first"]
     /// resume a run.
     fn two_gate_resume(issue: &Path, control: Box<dyn Control>) -> Runner<FakeHarness> {
         Runner::resume(two_gate_config(issue, control)).expect("runner")
+    }
+
+    /// A harness that holds every session until `release` is set, so a test can
+    /// see how many steps the engine actually has in flight.
+    #[derive(Clone, Default)]
+    struct OverlapHarness {
+        /// How many sessions are running right now.
+        live: Arc<Mutex<usize>>,
+        /// The most that were ever running at once.
+        peak: Arc<Mutex<usize>>,
+        /// Set once every expected session has started.
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        /// How many sessions to wait for before releasing.
+        expected: usize,
+    }
+
+    impl Harness for OverlapHarness {
+        fn run(&mut self, _request: &StepRequest) -> Result<StepOutcome> {
+            {
+                let mut live = self.live.lock().expect("live lock");
+                *live += 1;
+                let mut peak = self.peak.lock().expect("peak lock");
+                *peak = (*peak).max(*live);
+            }
+            let (lock, ready) = &*self.release;
+            let mut released = lock.lock().expect("release lock");
+            while !*released {
+                released = ready
+                    .wait_timeout(released, Duration::from_millis(50))
+                    .expect("release wait")
+                    .0;
+                let live = *self.live.lock().expect("live lock");
+                if live >= self.expected {
+                    *released = true;
+                }
+            }
+            drop(released);
+            *self.live.lock().expect("live lock") -= 1;
+            Ok(StepOutcome::Done {
+                wrote: Vec::new(),
+                text: "done".to_owned(),
+            })
+        }
+    }
+
+    /// A repository with one issue folder and two tasks, for the overlap tests.
+    ///
+    /// `issue_in` already seeds task 01, so this adds 02 and commits both.
+    fn two_task_repo(dir: &TempDir) -> (PathBuf, PathBuf) {
+        let root = repository(dir);
+        let issue = issue_in(&root);
+        fs::write(
+            issue.join("issues/02-second.md"),
+            task_text(2, "Second task", "ready-for-agent"),
+        )
+        .expect("task file");
+        run_git(&root, &["add", "-A"]);
+        run_git(&root, &["commit", "--quiet", "-m", "second task"]);
+        (root, issue)
+    }
+
+    #[test]
+    fn per_task_steps_for_different_tasks_run_at_the_same_time() {
+        // Two tasks, one per-task step, a budget of two: both sessions are open
+        // at once, each in its own worktree. The harness holds each one until
+        // the other has started, so a serial engine would deadlock instead of
+        // passing.
+        let dir = TempDir::new();
+        let (root, issue) = two_task_repo(&dir);
+        let workflow = workflow(
+            r#"
+schema = 2
+name = "implement"
+revision = 1
+max_parallel = 2
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+per_task = true
+"#,
+        );
+        let harness = OverlapHarness {
+            expected: 2,
+            ..OverlapHarness::default()
+        };
+        let peak = Arc::clone(&harness.peak);
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.workdir = root.clone();
+        config.repo = Some(Repo::open(&root).expect("repo opens"));
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+        assert_eq!(
+            *peak.lock().expect("peak lock"),
+            2,
+            "both tasks' steps were in flight at once"
+        );
+    }
+
+    #[test]
+    fn a_budget_of_one_keeps_the_steps_serial() {
+        let dir = TempDir::new();
+        let (root, issue) = two_task_repo(&dir);
+        let workflow = workflow(
+            r#"
+schema = 2
+name = "implement"
+revision = 1
+max_parallel = 1
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+per_task = true
+"#,
+        );
+        let harness = OverlapHarness {
+            expected: 1,
+            ..OverlapHarness::default()
+        };
+        let peak = Arc::clone(&harness.peak);
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.workdir = root.clone();
+        config.repo = Some(Repo::open(&root).expect("repo opens"));
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+        assert_eq!(*peak.lock().expect("peak lock"), 1, "one step at a time");
+    }
+
+    #[test]
+    fn two_steps_in_one_folder_never_overlap() {
+        // Two independent non-per-task steps measure the repository root, so
+        // the workdir rule keeps them serial even with a budget of two: two
+        // sessions in one checkout would fight over the index.
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let workflow = workflow(
+            r#"
+schema = 2
+name = "implement"
+revision = 1
+max_parallel = 2
+
+[[step]]
+id = "left"
+kind = "harness"
+skill = "code"
+
+[[step]]
+id = "right"
+kind = "harness"
+skill = "code"
+"#,
+        );
+        let harness = OverlapHarness {
+            expected: 1,
+            ..OverlapHarness::default()
+        };
+        let peak = Arc::clone(&harness.peak);
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.workdir = dir.path().to_path_buf();
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+        assert_eq!(
+            *peak.lock().expect("peak lock"),
+            1,
+            "one folder means one session at a time"
+        );
     }
 
     #[test]

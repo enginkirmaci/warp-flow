@@ -147,8 +147,34 @@ impl Prepared {
         harness: H,
         log: Box<dyn LogSink>,
         control: Box<dyn Control>,
-    ) -> RunnerConfig<H> {
+    ) -> RunnerConfig<H>
+    where
+        H: Harness + Clone + Send + Sync + 'static,
+    {
         let mut config = RunnerConfig::new(self.issue.clone(), self.workflow.clone(), harness);
+        config.workdir = self.repo.root.clone();
+        config.repo = Some(self.repo.clone());
+        config.control = control;
+        config.log = log;
+        config
+    }
+
+    /// Build the runner config for a harness factory.
+    ///
+    /// A run may have several steps in flight at once, and one harness cannot
+    /// serve two of them, so the app hands the engine a factory that opens a
+    /// fresh door connection per step.
+    pub fn config_with_factory<F>(
+        &self,
+        factory: F,
+        log: Box<dyn LogSink>,
+        control: Box<dyn Control>,
+    ) -> RunnerConfig<F::Harness>
+    where
+        F: crate::harness::HarnessFactory + Send + Sync + 'static,
+    {
+        let mut config =
+            RunnerConfig::with_factory(self.issue.clone(), self.workflow.clone(), factory);
         config.workdir = self.repo.root.clone();
         config.repo = Some(self.repo.clone());
         config.control = control;
@@ -158,11 +184,26 @@ impl Prepared {
 
     /// Open the runner for `config`: a fresh run when the issue has no
     /// `run.md`, a resumed one when it does.
-    pub fn runner<H: Harness>(&self, config: RunnerConfig<H>) -> Result<Runner<H>> {
+    pub fn runner<H: Harness + Clone + Send + Sync + 'static>(
+        &self,
+        config: RunnerConfig<H>,
+    ) -> Result<Runner<H>> {
         if self.resume() {
             Runner::resume(config)
         } else {
             Runner::new(config)
+        }
+    }
+
+    /// Open the runner for a config whose harnesses come from a factory.
+    pub fn runner_with_factory<H: Harness + Send + 'static>(
+        &self,
+        config: RunnerConfig<H>,
+    ) -> Result<Runner<H>> {
+        if self.resume() {
+            Runner::resume_with_factory(config)
+        } else {
+            Runner::with_factory(config)
         }
     }
 

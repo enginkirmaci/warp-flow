@@ -491,6 +491,62 @@ pub struct DoorHarness {
     timeouts: DoorTimeouts,
 }
 
+/// Builds one [`DoorHarness`] per dispatched step, each on its own connection.
+///
+/// A run may have several steps in flight at once, and one door client cannot
+/// serve two sessions: its event stream is a single queue, so two sessions on
+/// one connection would each consume the other's frames. The factory therefore
+/// opens a fresh connection per step, which is what the door's request/answer
+/// framing is built for.
+#[derive(Debug, Clone)]
+pub struct DoorHarnessFactory {
+    endpoint: DoorEndpoint,
+    timeouts: DoorTimeouts,
+}
+
+/// Where a [`DoorHarnessFactory`] connects: the published endpoint, or a fixed
+/// one a probe hands it.
+#[derive(Debug, Clone)]
+enum DoorEndpoint {
+    /// Read `~/.warp/agent`'s port and token at each connect.
+    Local,
+    /// A fixed port and token.
+    Fixed { port: u16, token: String },
+}
+
+impl DoorHarnessFactory {
+    /// Connect to the endpoint warp-agent publishes under `~/.warp/agent`.
+    pub fn local() -> Self {
+        Self {
+            endpoint: DoorEndpoint::Local,
+            timeouts: DoorTimeouts::default(),
+        }
+    }
+
+    /// Connect to a door at `127.0.0.1:port` with default timeouts.
+    pub fn connect(port: u16, token: &str) -> Self {
+        Self {
+            endpoint: DoorEndpoint::Fixed {
+                port,
+                token: token.to_owned(),
+            },
+            timeouts: DoorTimeouts::default(),
+        }
+    }
+}
+
+impl crate::harness::HarnessFactory for DoorHarnessFactory {
+    type Harness = DoorHarness;
+
+    fn build(&self) -> Result<DoorHarness> {
+        let client = match &self.endpoint {
+            DoorEndpoint::Local => DoorClient::local()?,
+            DoorEndpoint::Fixed { port, token } => DoorClient::connect(*port, token)?,
+        };
+        Ok(DoorHarness::with_timeouts(client, self.timeouts))
+    }
+}
+
 impl DoorHarness {
     /// Connect to the endpoint warp-agent publishes under `~/.warp/agent`.
     pub fn local() -> Result<Self> {

@@ -52,6 +52,56 @@ pub trait Harness {
     fn run(&mut self, req: &StepRequest) -> Result<StepOutcome>;
 }
 
+/// Builds one [`Harness`] per concurrent step.
+///
+/// A run may have several steps in flight at once, and one harness cannot serve
+/// two of them: the door's event stream is a single queue, so two sessions on
+/// one connection would each consume the other's frames. The engine therefore
+/// asks for a fresh harness per step it dispatches, and a harness that is safe
+/// to share can return a clone of itself.
+pub trait HarnessFactory {
+    /// The harness this factory builds.
+    type Harness: Harness;
+
+    /// Build one harness for one step.
+    fn build(&self) -> Result<Self::Harness>;
+}
+
+/// A factory that hands out clones of one harness.
+///
+/// This is what a test double wants: [`FakeHarness`] is cheap to clone and its
+/// scripted responses are shared, so a run that dispatches two steps at once
+/// still sees one script.
+#[derive(Debug, Clone)]
+pub struct SharedHarness<H>(pub H);
+
+impl<H: Harness + Clone> HarnessFactory for SharedHarness<H> {
+    type Harness = H;
+
+    fn build(&self) -> Result<Self::Harness> {
+        Ok(self.0.clone())
+    }
+}
+
+/// A factory that hands out one harness, once.
+///
+/// A harness that cannot be cloned — the door's, whose event stream is a single
+/// queue — is built by its own factory instead; this exists so a caller that
+/// has exactly one such harness can still hand it to the engine.
+pub struct OnceHarness<H>(pub std::sync::Mutex<Option<H>>);
+
+impl<H: Harness> HarnessFactory for OnceHarness<H> {
+    type Harness = H;
+
+    fn build(&self) -> Result<Self::Harness> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| Error::Harness("this harness was already used".to_owned()))
+    }
+}
+
 /// One scripted response for [`FakeHarness`].
 #[derive(Debug, Clone)]
 pub enum Scripted {
@@ -72,9 +122,17 @@ pub enum Scripted {
 /// A harness that replays scripted responses, in call order, per step id.
 ///
 /// This is the engine's test double: it records every request and writes the
-/// scripted files to disk exactly as a real session would.
-#[derive(Debug, Default)]
+/// scripted files to disk exactly as a real session would. Its state sits behind
+/// a lock and a clone shares it, so a run that dispatches several steps at once
+/// still consumes one script and records one call list.
+#[derive(Debug, Default, Clone)]
 pub struct FakeHarness {
+    inner: std::sync::Arc<std::sync::Mutex<FakeState>>,
+}
+
+/// The script and the call log [`FakeHarness`] shares between its clones.
+#[derive(Debug, Default)]
+struct FakeState {
     scripts: BTreeMap<String, VecDeque<Scripted>>,
     calls: Vec<StepRequest>,
 }
@@ -87,31 +145,42 @@ impl FakeHarness {
 
     /// Queue one response for `step`; responses are consumed in call order.
     pub fn script(&mut self, step: impl Into<String>, response: Scripted) {
-        self.scripts
+        self.lock()
+            .scripts
             .entry(step.into())
             .or_default()
             .push_back(response);
     }
 
     /// Every request the harness has received, in order.
-    pub fn calls(&self) -> &[StepRequest] {
-        &self.calls
+    pub fn calls(&self) -> Vec<StepRequest> {
+        self.lock().calls.clone()
+    }
+
+    /// The shared state, with a poisoned lock treated as a failed test.
+    fn lock(&self) -> std::sync::MutexGuard<'_, FakeState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
 impl Harness for FakeHarness {
     fn run(&mut self, req: &StepRequest) -> Result<StepOutcome> {
-        self.calls.push(req.clone());
-        let response = self
-            .scripts
-            .get_mut(&req.step.id)
-            .and_then(VecDeque::pop_front)
-            .ok_or_else(|| {
-                Error::Harness(format!(
-                    "FakeHarness has no response left for step `{}`",
-                    req.step.id
-                ))
-            })?;
+        let response = {
+            let mut state = self.lock();
+            state.calls.push(req.clone());
+            state
+                .scripts
+                .get_mut(&req.step.id)
+                .and_then(VecDeque::pop_front)
+                .ok_or_else(|| {
+                    Error::Harness(format!(
+                        "FakeHarness has no response left for step `{}`",
+                        req.step.id
+                    ))
+                })?
+        };
         match response {
             Scripted::Blocked { reason } => Ok(StepOutcome::Blocked { reason }),
             Scripted::Done { files, text } => {

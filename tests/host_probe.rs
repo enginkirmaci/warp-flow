@@ -172,6 +172,7 @@ struct ProbeGate {
 }
 
 /// The fake harness: its one step blocks until the probe releases it.
+#[derive(Clone)]
 struct ProbeHarness {
     gate: Arc<ProbeGate>,
 }
@@ -212,8 +213,8 @@ impl Driver for ProbeDriver {
             Box::new(self.context.control.clone()),
         );
         let mut runner = match self.context.mode {
-            DriveMode::Fresh => Runner::new(config)?,
-            DriveMode::Resume => Runner::resume(config)?,
+            DriveMode::Fresh => Runner::with_factory(config)?,
+            DriveMode::Resume => Runner::resume_with_factory(config)?,
         };
         runner.run()
     }
