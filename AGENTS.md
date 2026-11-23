@@ -92,6 +92,11 @@ withdraws the door and asks a blocking engine to stop.
   front matter* — `verdict: ready` or `verdict: changes` — never the session's
   prose and never its transcript. The judgement is a declared file with a
   stated shape, which is why it may be read where prose may not.
+- **A gate may act.** A gate command may act, not only check: the bump moves
+  the version and commits it on `main`, and its exit code is still all the
+  engine reads. An acting gate is not idempotent, so the merge queue re-runs
+  only the `per_task` gate steps above it (ADR-0019); a non-`per_task` gate
+  above a merge runs once per run, which is why `bump` is not per task.
 - The engine writes the issue folder, `run.md` and `questions/`, and commits
   that folder — only that folder, only on `main`, with hooks and signing off —
   at three points: `flow: issue <slug>` at run start, `flow: record <slug>`
