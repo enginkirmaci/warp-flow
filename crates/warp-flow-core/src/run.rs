@@ -18,6 +18,14 @@
 //! and starts nothing while it runs, because the merge queue refuses a checkout
 //! with uncommitted work.
 //!
+//! A rework edge is the one loop the graph allows (ADR-0016). A step that
+//! declares `rework_to` is judged by the artifact it produces, after it reports
+//! `done`: `verdict: changes` sends the work back to the step it waits for,
+//! `ready` — or no verdict at all — lets the run walk on, and anything else is
+//! a failed attempt whose repair names the file. Every round is a `sent-back`
+//! row in `run.md`, so the round number is the record's and a resumed run
+//! continues the budget instead of starting it over.
+//!
 //! When the config names a repository, a `per_task` step runs in that task's
 //! worktree and a `merge` step runs the merge queue. The merge step is the only
 //! place the engine writes `**Status:** resolved`; a task is otherwise finished
@@ -769,6 +777,10 @@ impl<H: Harness + Send + 'static> Runner<H> {
     /// `Some(status)` means the run stops here: a failure that spent its
     /// attempt budget blocks the run, and everything still in flight has
     /// already been joined by [`Runner::dispatch`], so nothing is left running.
+    ///
+    /// A step that declares a rework edge is judged by its artifact before its
+    /// report is applied (ADR-0016): `done` alone does not mean the work is
+    /// ready, because the session may have sent it back to an earlier step.
     fn apply_report(&mut self, report: StepReport) -> Result<Option<RunStatus>> {
         let Some(step) = self.workflow.step(&report.step).cloned() else {
             return Ok(None);
@@ -778,8 +790,23 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 .ok()
                 .and_then(|issue| issue.task(number).cloned())
         });
+        // The verdict is read only where a step can rework: it is the one place
+        // a session's own judgement moves the run, and it moves it through a
+        // declared file, never through the report's prose.
+        let mut changes = false;
+        let mut refused = None;
+        if matches!(report.result, Ok(StepOutcome::Done { .. })) && step.rework_to.is_some() {
+            match self.verdict(&step, task.as_ref()) {
+                Verdict::Ready => {}
+                Verdict::Changes => changes = true,
+                Verdict::Refused(failure) => refused = Some(failure),
+            }
+        }
+        if changes {
+            return self.take_rework_edge(&step, task.as_ref(), report.attempt);
+        }
         let failure = match report.result {
-            Ok(StepOutcome::Done { .. }) => None,
+            Ok(StepOutcome::Done { .. }) => refused,
             Ok(StepOutcome::Blocked { reason }) => Some(Failure {
                 outcome: report.failure_outcome,
                 summary: reason,
@@ -807,7 +834,13 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 Ok(None)
             }
             Some(failure) => {
-                if self.register_failure(&step, task.as_ref(), report.attempt, &failure)? {
+                if self.register_failure(
+                    &step,
+                    task.as_ref(),
+                    report.attempt,
+                    &failure,
+                    Retry::WhileBudget,
+                )? {
                     self.status = RunStatus::Blocked;
                     self.write_run()?;
                     self.log_line("run blocked");
@@ -816,6 +849,71 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 Ok(None)
             }
         }
+    }
+
+    /// Take a step's rework edge: record the round and un-complete the target.
+    ///
+    /// The scheduler thread writes the row, like every other write to the issue
+    /// folder, and the rows are the durable round number: the `sent-back` rows
+    /// for this step and task are the rounds taken so far, so a resumed run
+    /// continues the budget instead of starting it over.
+    ///
+    /// Taking the edge is not a spent attempt. The row carries the attempt the
+    /// step just ran as and `attempts` is left untouched, which is what keeps
+    /// the step's own budget whole. A step that has sent the work back more
+    /// often than its `rework_max` allows fails here instead, and `run.md`
+    /// records a `blocked` row rather than one more `sent-back`.
+    fn take_rework_edge(
+        &mut self,
+        step: &Step,
+        task: Option<&Task>,
+        attempt: u32,
+    ) -> Result<Option<RunStatus>> {
+        let target = self
+            .workflow
+            .rework_target(step)
+            .map(|target| target.id.clone())
+            .ok_or_else(|| {
+                Error::Run(format!(
+                    "step `{}` sent the work back, but `rework_to` names no step in the graph",
+                    step.id
+                ))
+            })?;
+        let budget = Workflow::rework_budget(step);
+        let rounds = self.sent_back_rounds(&step.id, task) + 1;
+        if rounds > budget {
+            let failure = Failure {
+                outcome: "blocked",
+                summary: format!(
+                    "step `{}` sent the work back {rounds} times and no round was ready; \
+                     its rework budget is {budget}",
+                    step.id
+                ),
+                detail: Some(format!(
+                    "`rework_to = \"{target}\"`, `rework_max = {budget}`"
+                )),
+            };
+            self.attempts
+                .insert((step.id.clone(), task.map(|task| task.number)), attempt);
+            // `Retry::Never` is what makes this the step's last attempt: the
+            // loop has run its course, whatever the attempt budget still says.
+            self.register_failure(step, task, attempt, &failure, Retry::Never)?;
+            self.status = RunStatus::Blocked;
+            self.write_run()?;
+            self.log_line("run blocked");
+            return Ok(Some(RunStatus::Blocked));
+        }
+
+        self.record_row(step, task, attempt, "sent-back")?;
+        let span = self.rework_span(&step.id, &target);
+        self.uncomplete_span(&span, task.map(|task| task.number));
+        let line = format!(
+            "{} attempt {attempt}: changes; sent the work back to `{target}` (round {rounds} \
+             of {budget})",
+            step_label(step, task)
+        );
+        self.log_line(&line);
+        Ok(None)
     }
 
     /// Read the control seam at a step boundary.
@@ -882,6 +980,11 @@ impl<H: Harness + Send + 'static> Runner<H> {
     /// contributes nothing to the sets. A `skipped` row is a disabled step that
     /// never ran: it is neither a success nor a failure, so it leaves the step
     /// exactly where the graph has it — out of the work list for being disabled.
+    ///
+    /// A `sent-back` row is neither a success nor a failure. What it did to the
+    /// run is the target's un-completion, which no other row records, so it is
+    /// replayed here from the graph's rework edge: a resumed run walks back up
+    /// to the target instead of judging work from before the return.
     fn load_run(&mut self) -> Result<()> {
         let path = self.issue.join("run.md");
         let text = match fs::read_to_string(&path) {
@@ -911,22 +1014,41 @@ impl<H: Harness + Send + 'static> Runner<H> {
             let Some(step) = self.workflow.step(&row.step) else {
                 continue;
             };
+            let per_task = step.per_task;
+            let target = self
+                .workflow
+                .rework_target(step)
+                .map(|target| target.id.clone());
             let success = matches!(row.outcome.as_str(), "done" | "passed" | "merged");
-            if step.per_task {
+            if per_task {
                 let Some(number) = row.task else {
                     continue;
                 };
-                let numbers = self.completed.entry(row.step).or_default();
-                if success {
-                    numbers.insert(number);
-                } else {
-                    numbers.remove(&number);
+                {
+                    let numbers = self.completed.entry(row.step.clone()).or_default();
+                    if success {
+                        numbers.insert(number);
+                    } else {
+                        numbers.remove(&number);
+                    }
+                }
+                if row.outcome == "sent-back"
+                    && let Some(target) = &target
+                {
+                    let span = self.rework_span(&row.step, target);
+                    self.uncomplete_span(&span, Some(number));
                 }
             } else if row.task.is_none() {
                 if success {
-                    self.done.insert(row.step);
+                    self.done.insert(row.step.clone());
                 } else {
                     self.done.remove(&row.step);
+                }
+                if row.outcome == "sent-back"
+                    && let Some(target) = &target
+                {
+                    let span = self.rework_span(&row.step, target);
+                    self.uncomplete_span(&span, None);
                 }
             }
         }
@@ -1090,7 +1212,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
                     return Ok(StepRun::Done);
                 }
                 Some(failure) => {
-                    if self.register_failure(step, task, attempt, &failure)? {
+                    if self.register_failure(step, task, attempt, &failure, Retry::WhileBudget)? {
                         return Ok(StepRun::Blocked);
                     }
                     attempt += 1;
@@ -1100,27 +1222,38 @@ impl<H: Harness + Send + 'static> Runner<H> {
     }
 
     /// Record a failed attempt and its repair; say whether the budget is spent.
+    ///
+    /// `retry` is the one thing the attempt budget cannot see: a step whose
+    /// rework rounds are exhausted fails whatever its attempt budget still says.
     fn register_failure(
         &mut self,
         step: &Step,
         task: Option<&Task>,
         attempt: u32,
         failure: &Failure,
+        retry: Retry,
     ) -> Result<bool> {
         let label = step_label(step, task);
         self.record_row(step, task, attempt, failure.outcome)?;
         let repair = self.write_repair(step, task, attempt, failure)?;
-        if attempt >= self.max_attempts {
+        if retry == Retry::Never || attempt >= self.max_attempts {
             self.note = Some(format!(
                 "step `{}` failed after {attempt} attempt(s); last repair is {}",
                 step.id,
                 repair.display()
             ));
-            let line = format!(
-                "{label} attempt {attempt}: {}; attempt budget spent, repair {} written",
-                failure.summary,
-                repair.display()
-            );
+            let line = match retry {
+                Retry::WhileBudget => format!(
+                    "{label} attempt {attempt}: {}; attempt budget spent, repair {} written",
+                    failure.summary,
+                    repair.display()
+                ),
+                Retry::Never => format!(
+                    "{label} attempt {attempt}: {}; repair {} written, stopping the run",
+                    failure.summary,
+                    repair.display()
+                ),
+            };
             self.log_line(&line);
             Ok(true)
         } else {
@@ -1131,6 +1264,133 @@ impl<H: Harness + Send + 'static> Runner<H> {
             );
             self.log_line(&line);
             Ok(false)
+        }
+    }
+
+    /// The verdict a step wrote into the artifact it declares.
+    ///
+    /// This is the one place a session's own judgement moves a run, and it may
+    /// only do so through a declared file with a stated shape (ADR-0016): the
+    /// artifact's front matter is read here where the session's prose is not.
+    /// The name comes from the same helper the prompt used, so the file the
+    /// session was told to write and the file the engine reads cannot disagree.
+    ///
+    /// A missing or unreadable artifact, and a verdict that is neither `ready`
+    /// nor `changes`, are refusals rather than guesses: each becomes a failed
+    /// attempt whose repair names the file and what was wrong with it.
+    fn verdict(&self, step: &Step, task: Option<&Task>) -> Verdict {
+        let Some(name) = artifact_name(step, task) else {
+            return Verdict::Refused(Failure {
+                outcome: "blocked",
+                summary: format!(
+                    "step `{}` reworks an earlier step but declares no artifact to judge",
+                    step.id
+                ),
+                detail: None,
+            });
+        };
+        let path = self.issue.join(&name);
+        let document = match Document::read(&path) {
+            Ok(document) => document,
+            Err(error) => {
+                return Verdict::Refused(Failure {
+                    outcome: "blocked",
+                    summary: format!(
+                        "step `{}` declares `{name}` but wrote no readable artifact: {error}",
+                        step.id
+                    ),
+                    detail: None,
+                });
+            }
+        };
+        match document.front.get("verdict").map(str::trim) {
+            // A step that says nothing about its verdict has finished: only
+            // `changes` sends work back, so everything else advances the run as
+            // it always has.
+            None | Some("") | Some("ready") => Verdict::Ready,
+            Some("changes") => Verdict::Changes,
+            Some(other) => Verdict::Refused(Failure {
+                outcome: "blocked",
+                summary: format!(
+                    "step `{}` wrote `{name}` with `verdict: {other}`; expected `ready` or \
+                     `changes`",
+                    step.id
+                ),
+                detail: None,
+            }),
+        }
+    }
+
+    /// How many times this step has sent this task's work back so far.
+    ///
+    /// The rows are the durable round number: a resumed run reads them back and
+    /// continues the budget rather than starting it over.
+    fn sent_back_rounds(&self, step: &str, task: Option<&Task>) -> u32 {
+        let number = task.map(|task| task.number);
+        self.rows
+            .iter()
+            .filter_map(|line| LogRow::parse(line))
+            .filter(|row| row.step == step && row.task == number && row.outcome == "sent-back")
+            .count() as u32
+    }
+
+    /// Whether this step has sent this task's work back at least once.
+    fn has_sent_back(&self, step: &str, task: Option<&Task>) -> bool {
+        self.sent_back_rounds(step, task) > 0
+    }
+
+    /// Every step `id` waits for, transitively, `id` itself included.
+    fn upstream(&self, id: &str) -> BTreeSet<String> {
+        let mut reached = BTreeSet::new();
+        let mut pending = vec![id.to_owned()];
+        while let Some(id) = pending.pop() {
+            if !reached.insert(id.clone()) {
+                continue;
+            }
+            if let Some(step) = self.workflow.step(&id) {
+                pending.extend(step.depends_on.iter().cloned());
+            }
+        }
+        reached
+    }
+
+    /// The steps a rework edge un-completes: the target and everything between
+    /// it and the step taking the edge.
+    ///
+    /// A path from the target down to the step taking the edge is exactly the
+    /// work that has to be done again: the target rebuilds the work, every step
+    /// between them measures the rebuilt work, and the step taking the edge
+    /// judges it once more. What sits beside that path is left alone — it never
+    /// saw the work — and so is what sits below the step taking the edge, which
+    /// has not run yet.
+    fn rework_span(&self, sender: &str, target: &str) -> Vec<String> {
+        self.upstream(sender)
+            .into_iter()
+            .filter(|id| self.upstream(id).contains(target))
+            .collect()
+    }
+
+    /// Un-complete `span` for `task`, so the run walks up to the target again.
+    ///
+    /// A per-task step is cleared for one task only: the other tasks' work was
+    /// not sent back, and clearing them would rattle their lanes. A step that
+    /// runs once is cleared from the graph-done set instead, and `task` is the
+    /// task of the step that took the edge — `None` when that step runs once,
+    /// in which case its findings concern every task and every task's work is
+    /// cleared.
+    fn uncomplete_span(&mut self, span: &[String], task: Option<u32>) {
+        for id in span {
+            self.done.remove(id);
+            match task {
+                Some(number) => {
+                    if let Some(numbers) = self.completed.get_mut(id) {
+                        numbers.remove(&number);
+                    }
+                }
+                None => {
+                    self.completed.remove(id);
+                }
+            }
         }
     }
 
@@ -1332,7 +1592,13 @@ impl<H: Harness + Send + 'static> Runner<H> {
                         ),
                         detail: None,
                     };
-                    if self.register_failure(step, Some(task), attempt, &failure)? {
+                    if self.register_failure(
+                        step,
+                        Some(task),
+                        attempt,
+                        &failure,
+                        Retry::WhileBudget,
+                    )? {
                         return Ok(StepRun::Blocked);
                     }
                 }
@@ -1347,7 +1613,13 @@ impl<H: Harness + Send + 'static> Runner<H> {
                         summary,
                         detail: (!files.is_empty()).then(|| files.join("\n")),
                     };
-                    if self.register_failure(step, Some(task), attempt, &failure)? {
+                    if self.register_failure(
+                        step,
+                        Some(task),
+                        attempt,
+                        &failure,
+                        Retry::WhileBudget,
+                    )? {
                         return Ok(StepRun::Blocked);
                     }
                 }
@@ -1357,7 +1629,13 @@ impl<H: Harness + Send + 'static> Runner<H> {
                         summary: format!("gate `{gate}` failed on the rebased task branch"),
                         detail: (!tail.is_empty()).then_some(tail),
                     };
-                    if self.register_failure(step, Some(task), attempt, &failure)? {
+                    if self.register_failure(
+                        step,
+                        Some(task),
+                        attempt,
+                        &failure,
+                        Retry::WhileBudget,
+                    )? {
                         return Ok(StepRun::Blocked);
                     }
                 }
@@ -1493,7 +1771,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
             prompt.push_str(document.trim_end());
             prompt.push('\n');
         }
-        if let Some(produces) = &step.produces {
+        if let Some(produces) = artifact_name(step, task) {
             prompt.push_str(&format!(
                 "Write the result to `{produces}` in the issue folder.\n"
             ));
@@ -1505,6 +1783,26 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 task.title,
                 task.path.display()
             ));
+        }
+        // A step that is the target of a rework edge reads the findings of the
+        // step that sent its work back. The paragraph appears only after a
+        // return — naming a file no step had written would send the session
+        // looking for it — and the path is the one the returning step was told
+        // to write, per task and all.
+        for sender in &self.workflow.steps {
+            if sender.rework_to.as_deref() != Some(step.id.as_str()) {
+                continue;
+            }
+            if !self.has_sent_back(&sender.id, task) {
+                continue;
+            }
+            if let Some(findings) = artifact_name(sender, task) {
+                prompt.push_str(&format!(
+                    "\n`{}` sent this work back with findings. Read `{findings}` and address \
+                     every finding before you finish.\n",
+                    sender.id
+                ));
+            }
         }
         prompt.push_str("\nWrite your files and report what you did.\n");
         Ok(prompt)
@@ -1662,6 +1960,27 @@ struct Failure {
     detail: Option<String>,
 }
 
+/// Whether a failed attempt may have another one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    /// The step may run again while its attempt budget lasts.
+    WhileBudget,
+    /// No retry: the failure ends the step and stops the run, because the
+    /// step's own loop — its rework budget — has run its course.
+    Never,
+}
+
+/// What a step's artifact says about its work.
+enum Verdict {
+    /// The step finished: `verdict: ready`, a blank value, or no verdict line.
+    Ready,
+    /// The step sent its work back to the step it reworks: `verdict: changes`.
+    Changes,
+    /// The artifact is missing or says something the engine cannot act on. The
+    /// report becomes a failed attempt; the verdict is never guessed.
+    Refused(Failure),
+}
+
 /// One row of `run.md`'s log table, as resume reads it back.
 struct LogRow {
     /// The row as it was written, with its line ending, so it can be kept.
@@ -1733,6 +2052,39 @@ fn step_label(step: &Step, task: Option<&Task>) -> String {
     match task {
         Some(task) => format!("{}/{:02}", step.id, task.number),
         None => step.id.clone(),
+    }
+}
+
+/// The name of the artifact `step` writes, relative to the issue folder.
+///
+/// A step that runs once per task writes one artifact per task, so `review.md`
+/// becomes `review-01.md` and three tasks never overwrite one file. The prompt
+/// and the verdict read both go through this one helper, so the file a session
+/// is told to write and the file the engine reads cannot disagree.
+fn artifact_name(step: &Step, task: Option<&Task>) -> Option<String> {
+    let produces = step.produces.as_deref()?;
+    Some(match (step.per_task, task) {
+        (true, Some(task)) => with_task_number(produces, task.number),
+        _ => produces.to_owned(),
+    })
+}
+
+/// `review.md` → `review-01.md`, keeping any folder the path already names.
+fn with_task_number(produces: &str, number: u32) -> String {
+    let path = Path::new(produces);
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return produces.to_owned();
+    };
+    let named = match path.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) => format!("{stem}-{number:02}.{extension}"),
+        None => format!("{stem}-{number:02}"),
+    };
+    match path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        Some(parent) => parent.join(named).to_string_lossy().into_owned(),
+        None => named,
     }
 }
 
@@ -3771,5 +4123,588 @@ per_task = true
         );
         assert_eq!(document.front.get("status"), Some("blocked"));
         assert!(issue.join("repairs/01.md").is_file());
+    }
+
+    /// A `code` step and a `review` that may send it back.
+    ///
+    /// `budget` is `rework_max`; `None` leaves the file without one, so the
+    /// graph's default of one round applies. With `per_task`, both steps and
+    /// both artifacts are per task.
+    fn rework_workflow(budget: Option<u32>, per_task: bool) -> Workflow {
+        let budget = budget
+            .map(|max| format!("rework_max = {max}\n"))
+            .unwrap_or_default();
+        let per_task = if per_task { "per_task = true\n" } else { "" };
+        workflow(&format!(
+            r#"
+schema = 2
+name = "implement"
+revision = 1
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+produces = "code.md"
+{per_task}
+[[step]]
+id = "review"
+kind = "harness"
+skill = "review"
+produces = "review.md"
+depends_on = ["code"]
+rework_to = "code"
+{per_task}{budget}"#
+        ))
+    }
+
+    /// A review artifact with a verdict in its front matter.
+    fn verdict_document(verdict: &str) -> String {
+        format!("---\nverdict: {verdict}\n---\n\n# Review\n\nOne finding.\n")
+    }
+
+    /// A scripted `done` that writes no file.
+    fn done(text: &str) -> Scripted {
+        Scripted::Done {
+            files: Vec::new(),
+            text: text.to_owned(),
+        }
+    }
+
+    /// A scripted `done` that writes `contents` into the issue folder.
+    fn writes(issue: &Path, name: &str, contents: String) -> Scripted {
+        Scripted::Done {
+            files: vec![(issue.join(name), contents)],
+            text: "written".to_owned(),
+        }
+    }
+
+    /// A runner over a rework workflow with `max_attempts`, logging in memory.
+    fn rework_runner_with(
+        workflow: Workflow,
+        issue: &Path,
+        harness: FakeHarness,
+        max_attempts: u32,
+    ) -> Runner<FakeHarness> {
+        let mut config = RunnerConfig::new(issue, workflow, harness);
+        config.max_attempts = max_attempts;
+        config.log = Box::new(MemoryLog::new());
+        Runner::new(config).expect("runner")
+    }
+
+    /// A runner over a rework workflow with the default attempt budget.
+    fn rework_runner(
+        workflow: Workflow,
+        issue: &Path,
+        harness: FakeHarness,
+    ) -> Runner<FakeHarness> {
+        rework_runner_with(workflow, issue, harness, DEFAULT_MAX_ATTEMPTS)
+    }
+
+    /// The log rows for `ids`, as `step task attempt outcome`, in file order.
+    fn run_rows(issue: &Path, ids: &[&str]) -> Vec<String> {
+        run_md(issue)
+            .body
+            .lines()
+            .filter(|line| line.starts_with('|'))
+            .map(|line| line.split('|').map(str::trim).collect::<Vec<_>>())
+            .filter(|cells| cells.len() == 7 && ids.contains(&cells[1]))
+            .map(|cells| format!("{} {} {} {}", cells[1], cells[2], cells[3], cells[4]))
+            .collect()
+    }
+
+    #[test]
+    fn a_changes_verdict_sends_the_work_back_and_code_runs_again() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let mut harness = FakeHarness::new();
+        harness.script("code", done("coded"));
+        harness.script(
+            "review",
+            writes(&issue, "review.md", verdict_document("changes")),
+        );
+        harness.script("code", done("coded again"));
+        harness.script(
+            "review",
+            writes(&issue, "review.md", verdict_document("ready")),
+        );
+        let mut runner = rework_runner(rework_workflow(None, false), &issue, harness);
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+
+        assert_eq!(
+            run_rows(&issue, &["code", "review"]),
+            vec![
+                "code - 1 done",
+                "review - 1 sent-back",
+                "code - 2 done",
+                "review - 1 done"
+            ],
+            "`changes` is a row, not a done: the run walks back to code, and review's \
+             attempt number is not charged"
+        );
+    }
+
+    #[test]
+    fn a_rework_round_is_not_charged_to_the_reworking_steps_attempts() {
+        // Two returns, then a blocked attempt. Had the rounds spent `review`'s
+        // attempts, that block would be its third and last; it is attempt 1 of
+        // 3, so the run repairs it and retries.
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let mut harness = FakeHarness::new();
+        for _ in 0..3 {
+            harness.script("code", done("coded"));
+        }
+        for _ in 0..2 {
+            harness.script(
+                "review",
+                writes(&issue, "review.md", verdict_document("changes")),
+            );
+        }
+        harness.script(
+            "review",
+            Scripted::Blocked {
+                reason: "the branch does not build".to_owned(),
+            },
+        );
+        harness.script(
+            "review",
+            writes(&issue, "review.md", verdict_document("ready")),
+        );
+        let mut runner = rework_runner(rework_workflow(Some(2), false), &issue, harness);
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+
+        let repair = Document::read(issue.join("repairs/01.md")).expect("repair parses");
+        assert_eq!(repair.front.get("step"), Some("review"));
+        assert_eq!(
+            repair.front.get("attempt"),
+            Some("1"),
+            "two rounds later the step still has its whole attempt budget"
+        );
+        assert_eq!(repair.front.get("of"), Some("3"));
+        assert_eq!(
+            run_rows(&issue, &["code", "review"]),
+            vec![
+                "code - 1 done",
+                "review - 1 sent-back",
+                "code - 2 done",
+                "review - 1 sent-back",
+                "code - 3 done",
+                "review - 1 blocked",
+                "review - 2 done"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_third_changes_blocks_the_run_with_the_rework_budget() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let mut harness = FakeHarness::new();
+        for _ in 0..3 {
+            harness.script("code", done("coded"));
+        }
+        for _ in 0..3 {
+            harness.script(
+                "review",
+                writes(&issue, "review.md", verdict_document("changes")),
+            );
+        }
+        let log = MemoryLog::new();
+        let mut config = RunnerConfig::new(&issue, rework_workflow(Some(2), false), harness);
+        config.log = Box::new(log.clone());
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Blocked);
+
+        let document = run_md(&issue);
+        assert_eq!(document.front.get("status"), Some("blocked"));
+        assert_eq!(
+            run_rows(&issue, &["review"]),
+            vec![
+                "review - 1 sent-back",
+                "review - 1 sent-back",
+                "review - 1 blocked"
+            ],
+            "a round over budget is a failed attempt, not one more sent-back row"
+        );
+        let repair = fs::read_to_string(issue.join("repairs/01.md")).expect("repair written");
+        assert!(repair.contains("sent the work back 3 times"), "{repair}");
+        assert!(repair.contains("rework budget is 2"), "{repair}");
+        assert!(document.body.contains("Run stopped:"), "{}", document.body);
+        assert!(
+            log.lines().iter().any(|line| line.contains("run blocked")),
+            "{:?}",
+            log.lines()
+        );
+    }
+
+    #[test]
+    fn a_ready_verdict_advances_like_any_other_step() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let mut harness = FakeHarness::new();
+        harness.script("code", done("coded"));
+        harness.script(
+            "review",
+            writes(&issue, "review.md", verdict_document("ready")),
+        );
+        let mut runner = rework_runner(rework_workflow(None, false), &issue, harness);
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+        assert_eq!(
+            run_rows(&issue, &["code", "review"]),
+            vec!["code - 1 done", "review - 1 done"]
+        );
+    }
+
+    #[test]
+    fn a_rework_step_that_writes_no_artifact_blocks_naming_the_file() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let mut harness = FakeHarness::new();
+        harness.script("code", done("coded"));
+        harness.script("review", done("reviewed, honestly"));
+        let mut runner = rework_runner_with(rework_workflow(None, false), &issue, harness, 1);
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Blocked);
+
+        let repair = fs::read_to_string(issue.join("repairs/01.md")).expect("repair written");
+        assert!(repair.contains("review.md"), "{repair}");
+        assert!(
+            repair.contains("wrote no readable artifact"),
+            "the repair says what was wrong, not what the verdict might have been: {repair}"
+        );
+        assert_eq!(run_rows(&issue, &["review"]), vec!["review - 1 blocked"]);
+    }
+
+    #[test]
+    fn a_verdict_the_engine_cannot_read_blocks_instead_of_being_guessed() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let mut harness = FakeHarness::new();
+        harness.script("code", done("coded"));
+        harness.script(
+            "review",
+            writes(&issue, "review.md", verdict_document("looks mostly fine")),
+        );
+        let mut runner = rework_runner_with(rework_workflow(None, false), &issue, harness, 1);
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Blocked);
+
+        let repair = fs::read_to_string(issue.join("repairs/01.md")).expect("repair written");
+        assert!(repair.contains("`verdict: looks mostly fine`"), "{repair}");
+        assert!(repair.contains("expected `ready` or `changes`"), "{repair}");
+        assert_eq!(run_rows(&issue, &["review"]), vec!["review - 1 blocked"]);
+    }
+
+    #[test]
+    fn a_per_task_rework_writes_one_artifact_per_task() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        fs::write(
+            issue.join("issues/01-first.md"),
+            task_text(1, "First task", "ready-for-agent"),
+        )
+        .expect("task 1");
+        fs::write(
+            issue.join("issues/02-second.md"),
+            task_text(2, "Second task", "ready-for-agent"),
+        )
+        .expect("task 2");
+        let mut harness = FakeHarness::new();
+        for _ in 0..4 {
+            harness.script("code", done("coded"));
+        }
+        // In call order: each task is reviewed once, sent back, and reviewed
+        // again. The paths are relative, so the harness writes them into the
+        // issue folder the way a session would.
+        for (name, verdict) in [
+            ("review-01.md", "changes"),
+            ("review-01.md", "ready"),
+            ("review-02.md", "changes"),
+            ("review-02.md", "ready"),
+        ] {
+            harness.script(
+                "review",
+                Scripted::Done {
+                    files: vec![(PathBuf::from(name), verdict_document(verdict))],
+                    text: verdict.to_owned(),
+                },
+            );
+        }
+        let mut runner = rework_runner(rework_workflow(None, true), &issue, harness);
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+
+        assert!(issue.join("review-01.md").is_file());
+        assert!(issue.join("review-02.md").is_file());
+        assert!(
+            !issue.join("review.md").exists(),
+            "a per-task step's artifact is per task: two tasks must not share one file"
+        );
+        assert_eq!(
+            Document::read(issue.join("review-01.md"))
+                .expect("parses")
+                .front
+                .get("verdict"),
+            Some("ready")
+        );
+        assert_eq!(
+            run_rows(&issue, &["review"]),
+            vec![
+                "review 01 1 sent-back",
+                "review 01 1 done",
+                "review 02 1 sent-back",
+                "review 02 1 done"
+            ]
+        );
+
+        // Every task's target is told its own task's findings, and a prompt
+        // before the return names none.
+        let calls = runner.harness().calls();
+        for task in [1u32, 2] {
+            let mine: Vec<&StepRequest> = calls
+                .iter()
+                .filter(|call| call.step.id == "code" && call.task == Some(task))
+                .collect();
+            assert_eq!(mine.len(), 2, "code ran twice for task {task:02}");
+            assert!(
+                !mine[0].prompt.contains("sent this work back"),
+                "nothing had been sent back yet: {}",
+                mine[0].prompt
+            );
+            let findings = format!("review-{task:02}.md");
+            assert!(
+                mine[1].prompt.contains(&format!(
+                    "`review` sent this work back with findings. Read `{findings}`"
+                )),
+                "{}",
+                mine[1].prompt
+            );
+            let other = format!("review-{:02}.md", 3 - task);
+            assert!(
+                !mine[1].prompt.contains(&other),
+                "task {task:02}'s prompt named another task's findings: {}",
+                mine[1].prompt
+            );
+        }
+        for task in [1u32, 2] {
+            let artifact = format!("Write the result to `review-{task:02}.md`");
+            assert!(
+                calls.iter().any(|call| call.step.id == "review"
+                    && call.task == Some(task)
+                    && call.prompt.contains(&artifact)),
+                "the session is told the path the engine reads: {artifact}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_target_prompt_names_the_findings_only_after_a_return() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let mut harness = FakeHarness::new();
+        harness.script("code", done("coded"));
+        harness.script(
+            "review",
+            writes(&issue, "review.md", verdict_document("changes")),
+        );
+        harness.script("code", done("coded again"));
+        harness.script(
+            "review",
+            writes(&issue, "review.md", verdict_document("ready")),
+        );
+        let mut runner = rework_runner(rework_workflow(None, false), &issue, harness);
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+
+        let prompts: Vec<StepRequest> = runner
+            .harness()
+            .calls()
+            .into_iter()
+            .filter(|call| call.step.id == "code")
+            .collect();
+        assert_eq!(prompts.len(), 2);
+        assert!(
+            !prompts[0].prompt.contains("sent this work back"),
+            "a prompt before the return names no findings: {}",
+            prompts[0].prompt
+        );
+        assert!(
+            prompts[1].prompt.contains(
+                "`review` sent this work back with findings. Read `review.md` and address every \
+                 finding before you finish."
+            ),
+            "{}",
+            prompts[1].prompt
+        );
+    }
+
+    #[test]
+    fn a_resumed_run_continues_a_rework_mid_loop() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let workflow = rework_workflow(Some(2), false);
+
+        let mut harness = FakeHarness::new();
+        harness.script("code", done("coded"));
+        harness.script(
+            "review",
+            writes(&issue, "review.md", verdict_document("changes")),
+        );
+        let mut config = RunnerConfig::new(&issue, workflow.clone(), harness);
+        // Continue through code and review, then stop before code would run a
+        // second time: the record then holds one round, and no more.
+        config.control = Box::new(ScriptedControl::new([
+            Signal::Continue,
+            Signal::Continue,
+            Signal::Pause,
+        ]));
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::new(config).expect("runner");
+        assert_eq!(runner.run().expect("run"), RunStatus::Paused);
+        assert!(
+            run_md(&issue)
+                .body
+                .contains("| review | - | 1 | sent-back |"),
+            "{}",
+            run_md(&issue).body
+        );
+
+        // The resume walks back up to `code`, because the sent-back row says the
+        // work came back, and counts the round it already has: two more
+        // `changes` are round three, over the budget of two.
+        let mut harness = FakeHarness::new();
+        harness.script("code", done("coded again"));
+        harness.script(
+            "review",
+            writes(&issue, "review.md", verdict_document("changes")),
+        );
+        harness.script("code", done("coded once more"));
+        harness.script(
+            "review",
+            writes(&issue, "review.md", verdict_document("changes")),
+        );
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.log = Box::new(MemoryLog::new());
+        let mut resumed = Runner::resume(config).expect("resume");
+        assert_eq!(resumed.run().expect("resumed run"), RunStatus::Blocked);
+
+        assert_eq!(
+            resumed
+                .harness()
+                .calls()
+                .iter()
+                .map(|call| call.step.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["code", "review", "code", "review"],
+            "the resumed run starts at the target, not at the step that returned"
+        );
+        assert_eq!(
+            run_rows(&issue, &["review"]),
+            vec![
+                "review - 1 sent-back",
+                "review - 1 sent-back",
+                "review - 1 blocked"
+            ],
+            "the round number came from the rows, so the budget did not start over"
+        );
+        let repair = fs::read_to_string(issue.join("repairs/01.md")).expect("repair written");
+        assert!(repair.contains("sent the work back 3 times"), "{repair}");
+        assert!(repair.contains("rework budget is 2"), "{repair}");
+    }
+
+    #[test]
+    fn a_rework_step_without_a_verdict_advances() {
+        // A blank value and no verdict at all both mean the step finished; only
+        // `changes` sends the work back.
+        for artifact in [
+            "---\nverdict:\n---\n\n# Review\n",
+            "# Review\n\nNo front matter, no verdict.\n",
+        ] {
+            let dir = TempDir::new();
+            let issue = issue(&dir);
+            let mut harness = FakeHarness::new();
+            harness.script("code", done("coded"));
+            harness.script(
+                "review",
+                Scripted::Done {
+                    files: vec![(issue.join("review.md"), artifact.to_owned())],
+                    text: "reviewed".to_owned(),
+                },
+            );
+            let mut runner = rework_runner(rework_workflow(None, false), &issue, harness);
+            assert_eq!(runner.run().expect("run"), RunStatus::Done, "{artifact}");
+            assert_eq!(
+                run_rows(&issue, &["review"]),
+                vec!["review - 1 done"],
+                "{artifact}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rework_redoes_the_steps_between_the_target_and_the_return() {
+        // `review` sends back to `code`, and `test` sits between them: the gate
+        // measured work that no longer exists, so the run walks back to `code`
+        // and re-measures on the way down instead of judging the stale tree.
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let workflow = workflow(
+            r#"
+schema = 2
+name = "implement"
+revision = 1
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+
+[[step]]
+id = "test"
+kind = "gate"
+command = "true"
+cwd = "."
+timeout_secs = 5
+depends_on = ["code"]
+
+[[step]]
+id = "review"
+kind = "harness"
+skill = "review"
+produces = "review.md"
+depends_on = ["test"]
+rework_to = "code"
+"#,
+        );
+        let mut harness = FakeHarness::new();
+        harness.script("code", done("coded"));
+        harness.script(
+            "review",
+            writes(&issue, "review.md", verdict_document("changes")),
+        );
+        harness.script("code", done("coded again"));
+        harness.script(
+            "review",
+            writes(&issue, "review.md", verdict_document("ready")),
+        );
+        let mut runner = rework_runner(workflow, &issue, harness);
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+        assert_eq!(
+            run_rows(&issue, &["code", "test", "review"]),
+            vec![
+                "code - 1 done",
+                "test - 1 passed",
+                "review - 1 sent-back",
+                "code - 2 done",
+                "test - 2 passed",
+                "review - 1 done"
+            ],
+            "the gate between the target and the return measures the rebuilt work"
+        );
     }
 }

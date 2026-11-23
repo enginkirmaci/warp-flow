@@ -76,6 +76,12 @@ door's live catalog. `About` carries the
 installed family, the build and the license; `Settings` the reduce-motion
 switch, where the app keeps its files, the door's state and the version.
 
+A step can also send the work back to an earlier step it waits for: `rework_to`
+names that step, the `verdict` in the artifact's front matter — `ready` or
+`changes` — decides whether the run advances or walks back, and `rework_max` is
+the budget. A budget spent with no round saying `ready` fails the step and
+stops the run.
+
 The engine owns an issue folder while it drives a run: Artifacts refuses an
 edit then (one line says why), while the repository's Workflow template may
 save — it is read at step boundaries, and it validates before writing.

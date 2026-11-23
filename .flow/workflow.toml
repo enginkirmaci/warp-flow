@@ -14,6 +14,11 @@
 #
 # A gate is a step (ADR-0015): it carries its own command, folder and timeout,
 # so there is no second file to keep in step with this one.
+#
+# `review` may send the work back to `code` (ADR-0016): it writes a verdict in
+# its artifact's front matter, and `changes` makes the run walk back up to
+# `code` with `review`'s findings, at most `rework_max` times. When the budget
+# is spent the step fails and the run stops.
 schema = 2
 name = "implement"
 revision = 1
@@ -43,16 +48,25 @@ skill = "code"
 per_task = true
 depends_on = ["approve-plan"]
 
+# The review either clears the code or sends it back. Its artifact is per task
+# (`review-01.md`), because every task is reviewed on its own, and its
+# `verdict` front matter is the only thing the engine reads from it.
 [[step]]
 id = "review"
 kind = "harness"
 skill = "review"
 per_task = true
+produces = "review.md"
+rework_to = "code"
+rework_max = 3
 depends_on = ["code"]
 
-# The three checks are this repository's own CI: formatting, clippy with
-# warnings denied, then the tests. The cheapest fails a task before the
-# expensive one starts, which is why they are a chain rather than siblings.
+# The checks fork here and join at `bump`: formatting is one branch, the two
+# build-heavy checks are the other. They measure the same worktree, so they
+# still run one at a time (a step is one folder), but the graph says which
+# checks are independent of each other — and the join is what makes `bump`
+# wait for every one of them. Formatting goes first because it is the cheapest
+# way to fail.
 #
 # `warp-flow-core` is a path dependency, not a workspace member (the suite
 # requires app manifests without `[workspace]`), so each check names it in a
@@ -73,7 +87,7 @@ command = "cargo clippy --locked --all-targets -- -D warnings && cargo clippy --
 cwd = "."
 timeout_secs = 1800
 per_task = true
-depends_on = ["fmt"]
+depends_on = ["review"]
 
 [[step]]
 id = "test"
@@ -84,6 +98,10 @@ timeout_secs = 1800
 per_task = true
 depends_on = ["clippy"]
 
+# The join. `bump` is not per task, so waiting for one per-task step means
+# waiting for every task to have it — which is exactly what a step after the
+# task lanes should do.
+#
 # The version moves once, before the queue lands anything: the engine's own
 # commits pass `--no-verify`, so the pre-commit hook that bumps PATCH never runs
 # on them. One bump per run, never one per task — two task branches that each
@@ -92,7 +110,7 @@ depends_on = ["clippy"]
 id = "bump"
 kind = "harness"
 skill = "bump"
-depends_on = ["test"]
+depends_on = ["fmt", "test"]
 
 [[step]]
 id = "merge"

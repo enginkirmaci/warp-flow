@@ -124,6 +124,119 @@ skill = "code"
 depends_on = ["first"]
 "#;
 
+/// A straight pipeline: each step waits for the one before it, nothing forks.
+/// The list is a chain, and the whole of it must be drawn flat.
+const CHAIN: &str = r#"
+schema = 2
+name = "chain"
+revision = 1
+
+[[step]]
+id = "a"
+kind = "harness"
+skill = "code"
+
+[[step]]
+id = "b"
+kind = "harness"
+skill = "code"
+depends_on = ["a"]
+
+[[step]]
+id = "c"
+kind = "harness"
+skill = "code"
+depends_on = ["b"]
+
+[[step]]
+id = "d"
+kind = "harness"
+skill = "code"
+depends_on = ["c"]
+"#;
+
+/// A fork and a join: `root` starts two branches and `join` waits for both, so
+/// the branches indent and the join comes back out to the fork.
+const FORK_JOIN: &str = r#"
+schema = 2
+name = "fork-join"
+revision = 1
+
+[[step]]
+id = "root"
+kind = "harness"
+skill = "code"
+
+[[step]]
+id = "a1"
+kind = "harness"
+skill = "code"
+depends_on = ["root"]
+
+[[step]]
+id = "a2"
+kind = "harness"
+skill = "code"
+depends_on = ["a1"]
+
+[[step]]
+id = "b1"
+kind = "harness"
+skill = "code"
+depends_on = ["root"]
+
+[[step]]
+id = "b2"
+kind = "harness"
+skill = "code"
+depends_on = ["b1"]
+
+[[step]]
+id = "join"
+kind = "harness"
+skill = "code"
+depends_on = ["a2", "b2"]
+"#;
+
+/// The mixed shape: `review` forks into `fmt` and `test`, `fmt` chains into
+/// `clippy`, and `bump` joins all three. Every check indents once, and the
+/// join lands back on `review`.
+const MIXED: &str = r#"
+schema = 2
+name = "mixed"
+revision = 1
+
+[[step]]
+id = "review"
+kind = "harness"
+skill = "review"
+produces = "review.md"
+
+[[step]]
+id = "fmt"
+kind = "gate"
+command = "cargo fmt --all --check"
+depends_on = ["review"]
+
+[[step]]
+id = "clippy"
+kind = "gate"
+command = "cargo clippy --all-targets"
+depends_on = ["fmt"]
+
+[[step]]
+id = "test"
+kind = "gate"
+command = "cargo test"
+depends_on = ["review"]
+
+[[step]]
+id = "bump"
+kind = "harness"
+skill = "bump"
+depends_on = ["fmt", "clippy", "test"]
+"#;
+
 /// A committed throwaway repository with one issue folder.
 fn seed_repo(home: &Path, workflow: Option<&str>) -> (PathBuf, PathBuf) {
     let repo = home.join("repo");
@@ -259,6 +372,57 @@ fn open(cx: &mut TestAppContext, run: ScreenRun) -> gpui::WindowHandle<ScreenHos
         screen.update(cx, |screen, cx| screen.show(run.clone(), cx));
         ScreenHost(screen)
     })
+}
+
+/// Write `template` as the repository's workflow and open `Repos › Workflow`
+/// on it, the way the tab does.
+fn open_template(
+    cx: &mut TestAppContext,
+    repo: &Path,
+    template: &str,
+) -> gpui::WindowHandle<ScreenHost> {
+    std::fs::write(warp_flow_core::layout::workflow_file(repo), template)
+        .expect("the repository template");
+    let host = Arc::new(Host::new());
+    let repo = repo.to_path_buf();
+    cx.open_window(size(px(1200.), px(860.)), |_window, cx| {
+        let screen = cx.new(|cx| WorkflowScreen::new(Arc::clone(&host), cx));
+        screen.update(cx, |screen, cx| {
+            screen.show_repository(repo.clone(), cx);
+        });
+        ScreenHost(screen)
+    })
+}
+
+/// The working graph as the editor holds it.
+fn graph_of(handle: &gpui::WindowHandle<ScreenHost>, cx: &mut VisualTestContext) -> Workflow {
+    handle
+        .read_with(cx, |host, cx| host.0.read(cx).graph_for_probe().cloned())
+        .expect("the window is open")
+        .expect("a graph")
+}
+
+/// Select a step by index, as clicking its row does, and draw the result.
+fn select(handle: &gpui::WindowHandle<ScreenHost>, cx: &mut VisualTestContext, index: usize) {
+    handle
+        .update(cx, |host, _, cx| {
+            host.0
+                .update(cx, |screen, cx| screen.select_for_probe(index, cx));
+        })
+        .expect("the window is open");
+    settle(cx);
+}
+
+/// One row's meta line, as the list draws it.
+fn meta_of(
+    handle: &gpui::WindowHandle<ScreenHost>,
+    cx: &mut VisualTestContext,
+    index: usize,
+) -> String {
+    handle
+        .read_with(cx, |host, cx| host.0.read(cx).meta_for_probe(index))
+        .expect("the window is open")
+        .expect("a row")
 }
 
 #[gpui_kit::gpui::test]
@@ -414,13 +578,13 @@ fn the_repository_template_is_what_the_repos_tab_edits(cx: &mut TestAppContext) 
             "step {index} is a row in the list"
         );
     }
-    // and the rows are an indented tree: analyze is the root, code sits under
-    // it, and check under code
+    // and the rows are the template's own: analyze → code → check is a plain
+    // chain, so the tree is drawn flat — a link is not a branch
     let root = indent_of(cx, 0);
     let child = indent_of(cx, 1);
     assert!(
-        child > root,
-        "a child is indented under its parent: {root} vs {child}"
+        (child - root).abs() < 0.5,
+        "a chain is flat, so code sits at analyze's level: {root} vs {child}"
     );
 
     // an edit, then a save: a save appends a revision to the repository's file,
@@ -600,6 +764,141 @@ fn dependencies_are_chips_picked_from_the_graph(cx: &mut TestAppContext) {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A rework edge is edited on the step: the picker offers only the steps this
+/// one waits for, pressing one sets `rework_to`, pressing "none" clears it, the
+/// loop is named on the row without selecting it, and a merge step — which
+/// either lands or fails — offers nothing at all.
+#[gpui_kit::gpui::test]
+fn a_rework_edge_is_edited_on_the_step(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("rework-edge");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let (repo, _issue) = seed_repo(&home, None);
+
+    let handle = open_template(cx, &repo, SIBLINGS);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    // `left` waits for `first` and nothing else, so `first` is the only step it
+    // may send the work back to; `second` and `right` are not upstream of it
+    select(&handle, cx, 2);
+    assert!(cx.debug_bounds("flow-step-rework-to").is_some());
+    assert!(
+        cx.debug_bounds("flow-step-rework-to-first").is_some(),
+        "the step it waits for is the target it may pick"
+    );
+    assert!(
+        cx.debug_bounds("flow-step-rework-to-second").is_none(),
+        "a step it does not wait for is not a target"
+    );
+    assert!(
+        cx.debug_bounds("flow-step-rework-to-right").is_none(),
+        "a cousin is not a target either"
+    );
+    assert!(
+        cx.debug_bounds("flow-step-rework-to-clear").is_some(),
+        "the picker has a way to clear the edge"
+    );
+
+    // picking a target sets the edge, marks the graph dirty, and names it on
+    // the row so the loop is visible without selecting the step
+    click(cx, "flow-step-rework-to-first");
+    let graph = graph_of(&handle, cx);
+    assert_eq!(graph.steps[2].rework_to.as_deref(), Some("first"));
+    assert!(
+        cx.debug_bounds("flow-workflow-dirty").is_some(),
+        "editing the rework edge is an unsaved change"
+    );
+    let meta = meta_of(&handle, cx, 2);
+    assert!(meta.contains("returns to first"), "{meta}");
+
+    // clearing it takes the edge away again, and the row stops naming it
+    click(cx, "flow-step-rework-to-clear");
+    let graph = graph_of(&handle, cx);
+    assert_eq!(graph.steps[2].rework_to, None, "the edge is cleared");
+    let meta = meta_of(&handle, cx, 2);
+    assert!(!meta.contains("returns to"), "{meta}");
+
+    // a merge step has no rework: validation refuses a reworking merge, so the
+    // row stays on screen with nothing to press
+    click(cx, "flow-step-kind-merge");
+    assert!(
+        cx.debug_bounds("flow-step-rework-to").is_some(),
+        "the row is still on screen, switched off"
+    );
+    assert!(
+        cx.debug_bounds("flow-step-rework-to-first").is_none(),
+        "a merge either lands or fails, so it offers no target"
+    );
+    assert!(
+        cx.debug_bounds("flow-step-rework-to-clear").is_none(),
+        "and there is nothing to clear"
+    );
+    assert_eq!(
+        graph_of(&handle, cx).steps[2].kind,
+        StepKind::Merge,
+        "the step is a merge"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The rework budget belongs to the edge: it is off until a target is picked,
+/// it writes `rework_max`, and it goes away with the target because a budget
+/// with no target is a graph `validate` refuses.
+#[gpui_kit::gpui::test]
+fn a_rework_budget_follows_its_target(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("rework-budget");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let (repo, _issue) = seed_repo(&home, Some(WORKFLOW));
+
+    let handle = open_template(cx, &repo, WORKFLOW);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    // `check` waits for `code` and `analyze`: with no target there is no budget
+    // to type into, only the row saying so
+    select(&handle, cx, 2);
+    assert!(cx.debug_bounds("flow-step-rework-max").is_some());
+    assert!(
+        cx.debug_bounds("flow-field-rework-max").is_none(),
+        "the budget is off until the edge names a target"
+    );
+
+    // picking a target turns it on, and the field writes `rework_max`
+    click(cx, "flow-step-rework-to-code");
+    assert!(
+        cx.debug_bounds("flow-field-rework-max").is_some(),
+        "a target turns the budget on"
+    );
+    set_field(cx, "flow-field-rework-max", "3");
+    let graph = graph_of(&handle, cx);
+    assert_eq!(graph.steps[2].rework_max, Some(3));
+    assert!(
+        cx.debug_bounds("flow-workflow-dirty").is_some(),
+        "the budget is an unsaved change"
+    );
+
+    // clearing the target clears the budget with it: leaving a budget behind
+    // would be a graph the engine refuses
+    click(cx, "flow-step-rework-to-clear");
+    let graph = graph_of(&handle, cx);
+    assert_eq!(graph.steps[2].rework_to, None);
+    assert_eq!(
+        graph.steps[2].rework_max, None,
+        "the budget followed its target"
+    );
+    assert!(
+        cx.debug_bounds("flow-field-rework-max").is_none(),
+        "and the field is off again"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// A gate step's folder and timeout are editable, and the graph's parallelism
 /// is a field of its own.
 #[gpui_kit::gpui::test]
@@ -696,9 +995,13 @@ fn a_broken_template_is_not_overwritten(cx: &mut TestAppContext) {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// The step list is an indented tree: a step sits one level under the step it
-/// waits for first, its children follow it depth first, and a later dependency
-/// is a chip on the row rather than a band of its own.
+/// The step list is the graph drawn depth first: a step hangs under the
+/// dependency it names first, so a join is drawn where it belongs and its other
+/// dependencies are chips on its row. The diamond here is analyze → code →
+/// review with test joining review and analyze, so the second arm of the fork
+/// is itself the join: the arm is a link, not a branch, and the whole list is
+/// drawn flat. Where a branch really indents is
+/// `a_chain_is_drawn_flat_and_a_join_comes_back_out`'s job.
 #[gpui_kit::gpui::test]
 fn the_step_list_is_an_indented_tree(cx: &mut TestAppContext) {
     let _guard = hold_home();
@@ -722,27 +1025,26 @@ fn the_step_list_is_an_indented_tree(cx: &mut TestAppContext) {
 
     // the tree hangs each step under the dependency it names first:
     // analyze(0) → code(2) → review(3) → test(1), so the declaration order and
-    // the drawing order differ on purpose
+    // the drawing order differ on purpose. review is only code's link, so it
+    // stays at code's level; test joins both arms, so it comes back out to
+    // analyze. code is a link too: the fork's second arm is the join itself,
+    // and a join closes a branch rather than starting one.
     let root = indent_of(cx, 0);
     let child = indent_of(cx, 2);
-    let grandchild = indent_of(cx, 3);
+    let link = indent_of(cx, 3);
     let join = indent_of(cx, 1);
     assert!(
-        child > root,
-        "code is indented under analyze: {root} vs {child}"
+        (child - root).abs() < 0.5,
+        "code is a link in this shape, not a branch: {root} vs {child}"
     );
-    assert!(grandchild > child, "review is indented under code");
     assert!(
-        join > grandchild,
-        "the join waits for review first, so it hangs under it"
+        (link - child).abs() < 0.5,
+        "review only continues code's branch, so the chain stays flat: {child} vs {link}"
     );
-    let level = child - root;
     assert!(
-        (level - 14.).abs() < 1.5,
-        "one level is a small step, about 14px: {level}"
+        (join - root).abs() < 0.5,
+        "the join lands back on analyze, the step both branches share: {root} vs {join}"
     );
-    assert!((grandchild - child - level).abs() < 1.5);
-    assert!((join - grandchild - level).abs() < 1.5);
 
     // and the rows are drawn depth first, not in declaration order
     assert!(row_top(cx, 0) < row_top(cx, 2));
@@ -790,6 +1092,90 @@ fn the_step_list_is_an_indented_tree(cx: &mut TestAppContext) {
         "the mark sits at the row's edge"
     );
     assert_eq!(mark.origin.y, row.origin.y);
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The indent says where the graph branches, not how long its chain is: a
+/// straight pipeline is drawn flat, a fork's children indent one level, and a
+/// join comes back out to the step its branches share. The shipped chain went
+/// eleven levels deep and truncated every meta line, which is the bug.
+#[gpui_kit::gpui::test]
+fn a_chain_is_drawn_flat_and_a_join_comes_back_out(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("levels");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let (repo, _issue) = seed_repo(&home, None);
+    let app = cx;
+
+    // a -> b -> c -> d: a link is not a branch, so every step is at level 0
+    let window = open_template(app, &repo, CHAIN);
+    let chain = VisualTestContext::from_window(window.into(), &*app).into_mut();
+    settle(chain);
+    let base = indent_of(chain, 0);
+    for index in 1..4 {
+        let indent = indent_of(chain, index);
+        assert!(
+            (indent - base).abs() < 0.5,
+            "step {index} is a link in a chain, not a branch: {base} vs {indent}"
+        );
+    }
+
+    // root -> [a1 -> a2, b1 -> b2] -> join: the two branches indent once, each
+    // branch's second step stays flat, and the join lands back on the root
+    let window = open_template(&mut *app, &repo, FORK_JOIN);
+    let fork = VisualTestContext::from_window(window.into(), &*app).into_mut();
+    settle(fork);
+    let root = indent_of(fork, 0);
+    let a1 = indent_of(fork, 1);
+    let a2 = indent_of(fork, 2);
+    let b1 = indent_of(fork, 3);
+    let b2 = indent_of(fork, 4);
+    let join = indent_of(fork, 5);
+    let level = a1 - root;
+    assert!(
+        level > 8. && level < 48.,
+        "one level is a readable step, not a hairline and not half the column: {level}"
+    );
+    for (id, indent) in [("a1", a1), ("a2", a2), ("b1", b1), ("b2", b2)] {
+        assert!(
+            (indent - a1).abs() < 0.5,
+            "{id} is inside a branch, so it sits one level in: {a1} vs {indent}"
+        );
+    }
+    assert!(
+        (join - root).abs() < 0.5,
+        "the join lands back on the root its branches share: {root} vs {join}"
+    );
+
+    // review -> [fmt -> clippy, test] -> bump: each check indents once, the
+    // chain inside the first branch stays flat, and bump comes back to review
+    let window = open_template(&mut *app, &repo, MIXED);
+    let mixed = VisualTestContext::from_window(window.into(), &*app).into_mut();
+    settle(mixed);
+    let review = indent_of(mixed, 0);
+    let fmt = indent_of(mixed, 1);
+    let clippy = indent_of(mixed, 2);
+    let test = indent_of(mixed, 3);
+    let bump = indent_of(mixed, 4);
+    let level = fmt - review;
+    assert!(
+        level > 8. && level < 48.,
+        "one level is a readable step, not a hairline and not half the column: {level}"
+    );
+    assert!(
+        (test - fmt).abs() < 0.5,
+        "review's second check is its own branch, at the same level as fmt"
+    );
+    assert!(
+        (clippy - fmt).abs() < 0.5,
+        "fmt -> clippy is a link, so the chain inside the branch stays flat"
+    );
+    assert!(
+        (bump - review).abs() < 0.5,
+        "the join comes back out to review: {review} vs {bump}"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -997,17 +1383,107 @@ fn the_default_document_has_every_step_disabled(cx: &mut TestAppContext) {
         .validate()
         .expect("the default document is a graph the engine accepts");
 
-    // the list draws the whole tree, and it is still a tree while every step is
-    // off: the shape belongs to the graph, not to today's run
+    // the list draws the whole graph, and it is still the graph while every
+    // step is off: the shape belongs to the graph, not to today's run
     assert!(
         cx.debug_bounds("flow-workflow-step-10").is_some(),
         "eleven rows"
     );
     assert!(cx.debug_bounds("flow-workflow-step-11").is_none());
+    // the shipped document is one chain — every step waits for the one before
+    // it — so the whole list is drawn flat. This is the bug the level rule
+    // fixes: the old depth rule staircased it one level per step.
+    let flat = indent_of(cx, 0);
+    for index in 1..graph.steps.len() {
+        let indent = indent_of(cx, index);
+        assert!(
+            (indent - flat).abs() < 0.5,
+            "step {index} is a link in the shipped chain, not a branch: {flat} vs {indent}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The template this repository ships for itself is a fork that joins, and the
+/// list has to draw it as one: both branches are indented, and the join is
+/// drawn after *both* of them — not after the first one to finish.
+#[gpui_kit::gpui::test]
+fn the_shipped_template_draws_its_fork_and_its_join(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("shipped-shape");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let (repo, _issue) = seed_repo(&home, None);
+    let text =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(".flow/workflow.toml"))
+            .expect("the repository's own template");
+    let window = open_template(cx, &repo, &text);
+    let view = VisualTestContext::from_window(window.into(), &*cx).into_mut();
+    settle(view);
+
+    // The file's own order, which is also the row index.
+    let ids = [
+        "analyze",
+        "split",
+        "approve-plan",
+        "code",
+        "review",
+        "fmt",
+        "clippy",
+        "test",
+        "bump",
+        "merge",
+        "summary",
+    ];
+    let index = |id: &str| ids.iter().position(|known| *known == id).expect(id);
+
+    // A row is drawn below everything it waits for. `bump` waits for `fmt` AND
+    // `test`, so it must sit below both — that is what a join means.
+    for (later, earlier) in [
+        ("bump", "fmt"),
+        ("bump", "test"),
+        ("merge", "bump"),
+        ("summary", "merge"),
+        ("clippy", "fmt"),
+        ("test", "clippy"),
+    ] {
+        let below = row_top(view, index(later));
+        let above = row_top(view, index(earlier));
+        assert!(
+            below > above,
+            "`{later}` waits for `{earlier}`, so it is drawn below it: {above} vs {below}"
+        );
+    }
+
+    // The two branches are indented; the fork's own steps and the join are not.
+    let root = indent_of(view, index("analyze"));
+    for id in ["analyze", "split", "approve-plan", "code", "review"] {
+        let indent = indent_of(view, index(id));
+        assert!(
+            (indent - root).abs() < 0.5,
+            "`{id}` is on the trunk, so it is not indented: {root} vs {indent}"
+        );
+    }
+    let branch = indent_of(view, index("fmt")) - root;
     assert!(
-        indent_of(cx, 1) > indent_of(cx, 0),
-        "split sits under analyze even while it is off"
+        branch > 8. && branch < 48.,
+        "one level is a readable step: {branch}"
     );
+    for id in ["fmt", "clippy", "test"] {
+        let indent = indent_of(view, index(id));
+        assert!(
+            (indent - root - branch).abs() < 1.5,
+            "`{id}` is inside a branch, so it sits one level in: {root} vs {indent}"
+        );
+    }
+    for id in ["bump", "merge", "summary"] {
+        let indent = indent_of(view, index(id));
+        assert!(
+            (indent - root).abs() < 0.5,
+            "`{id}` is after the join, so it comes back out: {root} vs {indent}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&home);
 }

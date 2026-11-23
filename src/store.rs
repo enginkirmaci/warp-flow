@@ -1414,6 +1414,10 @@ pub fn outcome_state(outcome: &str) -> StepState {
         "waiting" => StepState::Waiting,
         "failed" | "timed-out" | "blocked" | "conflicted" | "gate-failed" | "dirty"
         | "rejected" => StepState::Failed,
+        // A rework edge (ADR-0016): the step did its work and sent it back, so
+        // it is neither done nor failed — it waits for the round to come back
+        // to it. The row's note still says the word.
+        "sent-back" => StepState::Idle,
         _ => StepState::Idle,
     }
 }
@@ -1918,6 +1922,8 @@ produces = "spec.md"
             timeout_secs: None,
             depends_on: Vec::new(),
             produces: None,
+            rework_to: None,
+            rework_max: None,
             per_task: false,
             mode: None,
             push: false,

@@ -82,7 +82,12 @@ withdraws the door and asks a blocking engine to stop.
 - A step is a harness session; the engine decides from artifacts and gate exit
   codes, never from a model's opinion of itself. The prompt is the skill
   document plus the step's inputs; a step's time budget is a silence window
-  that progress resets, not a cap on the whole turn.
+  that progress resets, not a cap on the whole turn. The one place a step's
+  judgement moves a run is a **rework edge** (ADR-0016): a step that declares
+  `rework_to` writes its `produces` artifact and the engine reads *that file's
+  front matter* — `verdict: ready` or `verdict: changes` — never the session's
+  prose and never its transcript. The judgement is a declared file with a
+  stated shape, which is why it may be read where prose may not.
 - The engine writes the issue folder, `run.md` and `questions/`, and commits
   that folder — only that folder, only on `main`, with hooks and signing off —
   at three points: `flow: issue <slug>` at run start, `flow: record <slug>`

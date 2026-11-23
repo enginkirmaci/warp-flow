@@ -34,6 +34,9 @@ const DEFAULT_CWD: &str = ".";
 /// The timeout a gate step gets when it does not name one.
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
 
+/// How many times a rework edge may be taken when the file does not say.
+pub const DEFAULT_REWORK_MAX: u32 = 1;
+
 /// What a step does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -103,6 +106,20 @@ pub struct Step {
     /// The artifact the step writes, relative to the issue folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub produces: Option<String>,
+    /// The step this one sends the work back to when it asks for changes.
+    ///
+    /// A rework edge is not a dependency. It never moves a step in the graph
+    /// (ADR-0014) and [`Workflow::check_acyclic`] never walks it, which is what
+    /// lets a workflow describe a bounded loop and stay acyclic. What travels
+    /// back is this step's own `produces`: the target reads it as its findings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rework_to: Option<String>,
+    /// How many times `rework_to` may be taken before this step fails.
+    ///
+    /// Unset means [`DEFAULT_REWORK_MAX`]: a step that names a target but no
+    /// budget still sends the work back once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rework_max: Option<u32>,
     /// Whether the step runs once per ready task rather than once per run.
     #[serde(default)]
     pub per_task: bool,
@@ -389,6 +406,55 @@ impl Workflow {
 
         self.check_acyclic()?;
 
+        // A rework edge is not a dependency, so `check_acyclic` cannot see it.
+        // Everything it could get wrong is caught here instead.
+        for step in &self.steps {
+            let Some(target) = &step.rework_to else {
+                if step.rework_max.is_some() {
+                    return Err(Error::Workflow(format!(
+                        "step `{}` sets a rework budget but no `rework_to`",
+                        step.id
+                    )));
+                }
+                continue;
+            };
+            if target == &step.id {
+                return Err(Error::Workflow(format!(
+                    "step `{}` sends work back to itself",
+                    step.id
+                )));
+            }
+            let Some(target_step) = self.step(target) else {
+                return Err(Error::Workflow(format!(
+                    "step `{}` reworks to `{target}`, which is not in the graph",
+                    step.id
+                )));
+            };
+            if step.kind == StepKind::Merge {
+                return Err(Error::Workflow(format!(
+                    "merge step `{}` reworks to `{target}`; a merge either lands or fails",
+                    step.id
+                )));
+            }
+            if step.rework_max == Some(0) {
+                return Err(Error::Workflow(format!(
+                    "step `{}` may rework 0 times; a rework edge needs a budget of at least 1",
+                    step.id
+                )));
+            }
+            // Going back only means something when the target is upstream:
+            // the run un-completes it and its dependents run again.
+            let mut ancestors = BTreeSet::new();
+            self.ancestors_into(step, &mut ancestors);
+            if !ancestors.contains(target_step.id.as_str()) {
+                return Err(Error::Workflow(format!(
+                    "step `{}` reworks to `{target}`, which is not a step it waits for; \
+                     a rework edge points back up the graph",
+                    step.id
+                )));
+            }
+        }
+
         // CONTENT: what an enabled step must carry to do its work. A disabled
         // step is skipped, because it will not run.
         for step in self.enabled_steps() {
@@ -418,6 +484,13 @@ impl Workflow {
                 return Err(Error::Workflow(format!(
                     "step `{}` names an effort but no model; an effort is one of a model's \
                      variants",
+                    step.id
+                )));
+            }
+            if step.rework_to.is_some() && step.produces.is_none() {
+                return Err(Error::Workflow(format!(
+                    "step `{}` reworks another step but writes no artifact; the findings \
+                     travel in the file it produces",
                     step.id
                 )));
             }
@@ -489,6 +562,20 @@ impl Workflow {
                     && reached.contains(candidate.id.as_str())
             })
             .collect()
+    }
+
+    /// The step `step` sends the work back to, when it has a rework edge.
+    ///
+    /// The target is always a step `step` waits for
+    /// ([`Workflow::validate`] refuses anything else), so taking the edge means
+    /// un-completing an ancestor and letting the run walk up to it again.
+    pub fn rework_target(&self, step: &Step) -> Option<&Step> {
+        step.rework_to.as_deref().and_then(|id| self.step(id))
+    }
+
+    /// How many times `step` may take its rework edge before it fails.
+    pub fn rework_budget(step: &Step) -> u32 {
+        step.rework_max.unwrap_or(DEFAULT_REWORK_MAX)
     }
 
     /// Collect every step `step` depends on, transitively, into `reached`.
@@ -694,6 +781,8 @@ mod tests {
             timeout_secs: None,
             depends_on: depends_on.iter().map(|dep| (*dep).to_owned()).collect(),
             produces: None,
+            rework_to: None,
+            rework_max: None,
             per_task: false,
             mode: None,
             push: false,
@@ -1285,5 +1374,113 @@ depends-on = ["b"]
         assert_eq!(ids(&workflow.ready(&done)), vec!["plan".to_owned()]);
         done.insert("plan".to_owned());
         assert!(workflow.ready(&done).is_empty());
+    }
+
+    /// A chain `analyze -> code -> review` where `review` may send work back.
+    fn rework_graph() -> Workflow {
+        let mut analyze = step("analyze", StepKind::Harness, &[]);
+        analyze.produces = Some("spec.md".to_owned());
+        let mut code = step("code", StepKind::Harness, &["analyze"]);
+        code.produces = Some("code.md".to_owned());
+        let mut review = step("review", StepKind::Harness, &["code"]);
+        review.produces = Some("review.md".to_owned());
+        review.rework_to = Some("code".to_owned());
+        review.rework_max = Some(3);
+        workflow(vec![analyze, code, review])
+    }
+
+    #[test]
+    fn a_rework_edge_keeps_the_graph_acyclic() {
+        let graph = rework_graph();
+        graph.validate().expect("a rework edge is not a dependency");
+        // The walk the validator makes still sees a chain, not a loop.
+        let review = graph.step("review").expect("review");
+        assert_eq!(
+            graph.rework_target(review).map(|step| step.id.as_str()),
+            Some("code")
+        );
+    }
+
+    #[test]
+    fn a_rework_edge_must_point_upstream() {
+        let mut graph = rework_graph();
+        // `analyze` does not wait for `review`, so there is nothing to go back to.
+        graph.steps[2].rework_to = Some("analyze".to_owned());
+        graph.steps[0].enabled = true;
+        // analyze *is* upstream of review, so this one is allowed...
+        graph.validate().expect("analyze is upstream of review");
+        // ...but a step it never waited for is not.
+        let mut sibling = step("sibling", StepKind::Harness, &[]);
+        sibling.produces = Some("sibling.md".to_owned());
+        graph.steps.push(sibling);
+        graph.steps[2].rework_to = Some("sibling".to_owned());
+        let error = graph.validate().expect_err("not upstream");
+        assert!(
+            error.to_string().contains("is not a step it waits for"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_rework_edge_must_name_a_real_step() {
+        let mut graph = rework_graph();
+        graph.steps[2].rework_to = Some("nowhere".to_owned());
+        let error = graph.validate().expect_err("unknown target");
+        assert!(
+            error.to_string().contains("which is not in the graph"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_rework_edge_must_write_an_artifact() {
+        let mut graph = rework_graph();
+        graph.steps[2].produces = None;
+        let error = graph.validate().expect_err("no produces");
+        assert!(error.to_string().contains("writes no artifact"), "{error}");
+    }
+
+    #[test]
+    fn a_rework_budget_without_a_target_is_refused() {
+        let mut graph = rework_graph();
+        graph.steps[2].rework_to = None;
+        let error = graph.validate().expect_err("budget without a target");
+        assert!(error.to_string().contains("but no `rework_to`"), "{error}");
+    }
+
+    #[test]
+    fn a_rework_budget_of_zero_is_refused() {
+        let mut graph = rework_graph();
+        graph.steps[2].rework_max = Some(0);
+        let error = graph.validate().expect_err("zero budget");
+        assert!(error.to_string().contains("may rework 0 times"), "{error}");
+    }
+
+    #[test]
+    fn a_merge_step_cannot_rework() {
+        let mut merge = step("merge", StepKind::Merge, &["analyze"]);
+        merge.per_task = true;
+        merge.rework_to = Some("analyze".to_owned());
+        let graph = workflow(vec![
+            {
+                let mut analyze = step("analyze", StepKind::Harness, &[]);
+                analyze.produces = Some("spec.md".to_owned());
+                analyze
+            },
+            merge,
+        ]);
+        let error = graph.validate().expect_err("merge cannot rework");
+        assert!(
+            error.to_string().contains("either lands or fails"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_rework_budget_falls_back_to_one() {
+        let mut graph = rework_graph();
+        graph.steps[2].rework_max = None;
+        graph.validate().expect("a missing budget is allowed");
+        assert_eq!(Workflow::rework_budget(&graph.steps[2]), 1);
     }
 }

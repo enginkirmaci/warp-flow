@@ -7,6 +7,9 @@ directory; `main` is not yours to touch.
 
 - The task file named in the prompt, starting with `Done when`.
 - `spec.md`, especially the acceptance criteria that cover this task.
+- The findings file, when the prompt names one: another step's review of this
+  task, handed to you because it sent the work back. Read it before the code and
+  work through every finding; the round is done when none is unanswered.
 - The repository's `AGENTS.md` and the guides it points at, and the tests
   beside every file you are about to change.
 
@@ -29,6 +32,8 @@ directory; `main` is not yours to touch.
   branch.
 - Never weaken, skip or delete an existing test to make a change pass. If a
   test genuinely must change, say why in the commit body and in your report.
+- A finding is answered by a change or by a written reason in your report, never
+  by silence. If one is wrong, say what the code does and why it does not hold.
 - Never edit a gate step, `.flow/workflow.toml`, `spec.md` or the task files.
 - If the task cannot be done as specified, stop and report exactly what blocks
   it. Do not invent scope to fill the gap.
@@ -36,4 +41,5 @@ directory; `main` is not yours to touch.
 ## Output
 
 The commits, and a short report: files changed, tests added, what a reviewer
-should look at first.
+should look at first. When the prompt named a findings file, the report answers
+every finding: what changed for it, or why it does not hold.

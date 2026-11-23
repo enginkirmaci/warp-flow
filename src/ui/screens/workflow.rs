@@ -60,7 +60,7 @@ const LIST_WIDTH: f32 = 320.;
 const STEP_ROW_HEIGHT: f32 = 58.;
 
 /// One level of the list's tree: what a row adds to its left padding per depth.
-const INDENT_STEP: f32 = 14.;
+const INDENT_STEP: f32 = 22.;
 
 /// A row's own left padding, before the tree's indent.
 const ROW_PADDING: f32 = 13.;
@@ -120,8 +120,8 @@ struct StepFacts {
 }
 
 /// One step's editable fields, in the editor. The entities are reused for
-/// whichever step is selected, so a graph of thirty steps still owns five
-/// fields.
+/// whichever step is selected, so a graph of thirty steps still owns a handful
+/// of fields.
 #[derive(Clone)]
 struct Fields {
     id: Entity<InputState>,
@@ -133,6 +133,10 @@ struct Fields {
     harness: Entity<InputState>,
     model: Entity<InputState>,
     effort: Entity<InputState>,
+    /// How many times the step may send the work back: the rework budget. The
+    /// picker beside it is stateless (it reads the selection), so only the
+    /// budget is an input that has to be carried between selections.
+    rework_max: Entity<InputState>,
 }
 
 /// The workflow editor: the 320 step list and the selected step's editor.
@@ -534,6 +538,14 @@ impl WorkflowScreen {
             step.effort.clone().unwrap_or_default(),
             "one of that model's variants",
         );
+        let rework_max = make(
+            window,
+            cx,
+            step.rework_max
+                .map(|max| max.to_string())
+                .unwrap_or_default(),
+            "how many times the step may send the work back; empty is 1",
+        );
         let watched: Vec<(Entity<InputState>, Field)> = vec![
             (id.clone(), Field::Id),
             (skill.clone(), Field::Skill),
@@ -544,6 +556,7 @@ impl WorkflowScreen {
             (harness.clone(), Field::Harness),
             (model.clone(), Field::Model),
             (effort.clone(), Field::Effort),
+            (rework_max.clone(), Field::ReworkMax),
         ];
         for (input, which) in watched {
             let watched = input.clone();
@@ -565,6 +578,11 @@ impl WorkflowScreen {
                     Field::Model => step.model = (!text.is_empty()).then_some(text),
                     Field::Effort => step.effort = (!text.is_empty()).then_some(text),
                     Field::Produces => step.produces = (!text.is_empty()).then_some(text),
+                    // `validate` refuses a budget of 0, and an empty field is
+                    // "unset", which means one.
+                    Field::ReworkMax => {
+                        step.rework_max = text.parse::<u32>().ok().filter(|max| *max > 0)
+                    }
                 });
             })
             .detach();
@@ -579,6 +597,7 @@ impl WorkflowScreen {
             harness,
             model,
             effort,
+            rework_max,
         };
         self.fields = Some(fields.clone());
         Some(fields)
@@ -619,6 +638,12 @@ impl WorkflowScreen {
                 fields.produces.clone(),
                 step.produces.clone().unwrap_or_default(),
             ),
+            (
+                fields.rework_max.clone(),
+                step.rework_max
+                    .map(|max| max.to_string())
+                    .unwrap_or_default(),
+            ),
         ];
         for (input, value) in values {
             input.update(cx, |state, cx| {
@@ -643,6 +668,11 @@ impl WorkflowScreen {
                 step.per_task = true;
                 step.skill = None;
                 step.command = None;
+                // A merge either lands or fails: `validate` refuses a reworking
+                // merge, and the rework row is off for one, so the edge goes
+                // with the rest of the step's fixed shape.
+                step.rework_to = None;
+                step.rework_max = None;
             }
         });
     }
@@ -693,6 +723,8 @@ impl WorkflowScreen {
             timeout_secs: None,
             depends_on,
             produces: None,
+            rework_to: None,
+            rework_max: None,
             per_task: false,
             mode: None,
             push: false,
@@ -901,12 +933,11 @@ impl WorkflowScreen {
                 "A workflow needs one harness step to run anything.",
             ));
         }
-        // The list is an indented tree: each step sits one level under the step
-        // it waits for first, and its children follow it depth first, so a fork
-        // reads as the rows beneath one step and a join as a step carrying
-        // chips beside its meta.
-        for (index, depth) in tree_order(facts) {
-            rows = rows.child(self.render_step_row(index, depth, &facts[index], revision, cx));
+        // The list is an indented tree read depth first, but the indent is the
+        // graph's branching, not the walk's depth: a chain is flat, a fork's
+        // children sit one level in, and a join comes back out to its fork.
+        for (index, level) in tree_order(facts) {
+            rows = rows.child(self.render_step_row(index, level, &facts[index], revision, cx));
         }
         div()
             .id("flow-workflow-column")
@@ -925,10 +956,15 @@ impl WorkflowScreen {
             .into_any_element()
     }
 
+    /// One row: the step's glyph, its name and meta, and the tree's indent.
+    ///
+    /// `level` is what [`step_levels`] measured, not the walk's depth, so the
+    /// left padding says where the graph branches; the row's height and the
+    /// selection mark (pinned to the row's own edge) never move with it.
     fn render_step_row(
         &self,
         index: usize,
-        depth: usize,
+        level: usize,
         facts: &StepFacts,
         revision: u32,
         cx: &mut Context<Self>,
@@ -962,9 +998,9 @@ impl WorkflowScreen {
             .items_center()
             .gap(px(10.))
             .h(px(theme::scaled(STEP_ROW_HEIGHT)))
-            // The tree's depth is the row's left padding, so the height and the
+            // The step's level is the row's left padding, so the height and the
             // selection mark (pinned to the row's own edge) never move with it.
-            .pl(px(ROW_PADDING + depth as f32 * INDENT_STEP))
+            .pl(px(ROW_PADDING + level as f32 * INDENT_STEP))
             .pr(px(12.))
             .cursor_pointer()
             .when(selected, |row| row.bg(theme::raised()))
@@ -987,7 +1023,7 @@ impl WorkflowScreen {
                     .bg(theme::accent()),
             );
         }
-        // The depth is readable as one selector per row: its x is the row's
+        // The level is readable as one selector per row: its x is the row's
         // content edge, which moves exactly one `INDENT_STEP` per level.
         row = row.child(
             div()
@@ -1311,6 +1347,17 @@ impl WorkflowScreen {
         // from the graph's own steps rather than typed: a mistyped id is a
         // graph the engine refuses, and the fix is a name a person cannot see.
         body = body.child(self.dependency_row(&step, cx));
+        // A rework edge is the one loop the graph allows (ADR-0016): it is not
+        // a dependency, so it lives beside them and never in the list's shape.
+        // Its target is a step this one waits for, and the budget says how many
+        // times the run may walk back before the step fails.
+        body = body.child(self.rework_to_row(&step, cx));
+        body = body.child(self.rework_max_row(
+            &step,
+            fields.as_ref().map(|fields| fields.rework_max.clone()),
+            window,
+            cx,
+        ));
         if let Some(error) = &self.error {
             body = body.child(
                 div()
@@ -1724,9 +1771,15 @@ impl WorkflowScreen {
                 // `segmented` hands the key back to a plain app closure, so the
                 // screen is reached through its entity
                 let sheet = cx.entity();
-                move |key: SharedString, _window, cx| {
+                move |key: SharedString, window, cx| {
                     let key = key.to_string();
-                    sheet.update(cx, |this, cx| this.set_kind(&key, cx));
+                    sheet.update(cx, |this, cx| {
+                        this.set_kind(&key, cx);
+                        // a merge step's fixed shape drops the rework edge, so
+                        // the budget field has to forget the value it held
+                        this.refill_fields(window, cx);
+                        cx.notify();
+                    });
                 }
             }))
             .into_any_element()
@@ -2044,6 +2097,138 @@ impl WorkflowScreen {
         row.child(chips).into_any_element()
     }
 
+    /// The step's rework edge: the earlier step it sends the work back to.
+    ///
+    /// A rework edge is not a dependency (ADR-0016): it never moves a step in
+    /// the list, so it is picked beside the dependency chips rather than drawn
+    /// as one. The run walks back only to a step this one already waits for —
+    /// `validate` refuses anything else — so the picker offers the transitive
+    /// ancestors, plus a way to clear the edge. A merge step has no rework:
+    /// a merge either lands or fails, and `validate` refuses a reworking one.
+    fn rework_to_row(&self, step: &Step, cx: &mut Context<Self>) -> AnyElement {
+        let row = rework_row("flow-step-rework-to", "Rework to", true)
+            .debug_selector(|| "flow-step-rework-to".into());
+        let mut chips = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.))
+            .flex_1()
+            .min_w_0();
+        if step.kind == StepKind::Merge {
+            chips = chips.child(quiet_word("A merge either lands or fails."));
+            return row.child(chips).into_any_element();
+        }
+        let targets = self.rework_targets(step);
+        if targets.is_empty() {
+            chips = chips.child(quiet_word(
+                "It waits for nothing yet, so there is nowhere to go back to.",
+            ));
+            return row.child(chips).into_any_element();
+        }
+        let cleared = step.rework_to.is_none();
+        chips = chips.child(rework_chip(
+            "flow-step-rework-to-clear".to_owned(),
+            "none".to_owned(),
+            "Does not send the work back".to_owned(),
+            cleared,
+            cx.listener(|this, _, window, cx| this.set_rework_to(None, window, cx)),
+        ));
+        for id in targets {
+            let selected = step.rework_to.as_deref() == Some(id.as_str());
+            let selector = format!("flow-step-rework-to-{id}");
+            let accessible = if selected {
+                format!("Returns the work to {id}; press to stop returning it")
+            } else {
+                format!("Returns the work to {id}; press to send the work back to it")
+            };
+            let value = id.clone();
+            chips = chips.child(rework_chip(
+                selector,
+                id,
+                accessible,
+                selected,
+                cx.listener(move |this, _, window, cx| {
+                    this.set_rework_to(Some(value.clone()), window, cx);
+                }),
+            ));
+        }
+        row.child(chips).into_any_element()
+    }
+
+    /// The rework budget: how many times the step may send the work back.
+    ///
+    /// It belongs to the edge, so it is off until the edge names a target: a
+    /// budget with no target is a graph `validate` refuses. Unset means one
+    /// ([`warp_flow_core::graph::DEFAULT_REWORK_MAX`]).
+    fn rework_max_row(
+        &self,
+        step: &Step,
+        input: Option<Entity<InputState>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let row = rework_row("flow-step-rework-max", "Rework budget", false)
+            .debug_selector(|| "flow-step-rework-max".into());
+        if step.kind == StepKind::Merge {
+            return row
+                .child(quiet_word("A merge either lands or fails."))
+                .into_any_element();
+        }
+        let input = input.filter(|_| step.rework_to.is_some());
+        let Some(input) = input else {
+            return row
+                .child(quiet_word("Pick a target first."))
+                .into_any_element();
+        };
+        row.child(div().flex_1().min_w_0().child(field::custom(
+            "flow-field-rework-max",
+            &input,
+            window,
+            cx,
+            |input| input.aria_label("Rework budget"),
+        )))
+        .into_any_element()
+    }
+
+    /// The steps the selected step waits for, transitively: the only targets
+    /// its rework edge may name. The graph's own order is kept, so the chips do
+    /// not move when one is pressed.
+    fn rework_targets(&self, step: &Step) -> Vec<String> {
+        let Some(graph) = self.graph.as_ref() else {
+            return Vec::new();
+        };
+        let mut reached = std::collections::BTreeSet::new();
+        collect_ancestors(graph, &step.depends_on, &mut reached);
+        graph
+            .steps
+            .iter()
+            .filter(|candidate| reached.contains(candidate.id.as_str()))
+            .map(|candidate| candidate.id.clone())
+            .collect()
+    }
+
+    /// Point the selected step's rework edge at `target`, or clear it.
+    ///
+    /// Clearing drops the budget with it: a budget and no target is a graph
+    /// `validate` refuses, and a person who takes the loop away means the whole
+    /// of it, not the target alone.
+    fn set_rework_to(
+        &mut self,
+        target: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.edit_step(cx, |step| {
+            step.rework_to = target;
+            if step.rework_to.is_none() {
+                step.rework_max = None;
+            }
+        });
+        self.refill_fields(window, cx);
+        cx.notify();
+    }
+
     /// The Revisions card: the loaded revision, then every one a save appended.
     /// Nothing rewrites a row.
     fn render_revisions(&self) -> AnyElement {
@@ -2202,6 +2387,13 @@ impl WorkflowScreen {
         self.selected
     }
 
+    /// One row's meta line, in the list's declaration order, for a probe that
+    /// checks what a row says without selecting it.
+    #[doc(hidden)]
+    pub fn meta_for_probe(&self, index: usize) -> Option<String> {
+        self.facts().get(index).map(|facts| facts.meta.clone())
+    }
+
     /// Whether this reading is the run's read-only tab.
     #[doc(hidden)]
     pub fn read_only_for_probe(&self) -> bool {
@@ -2240,6 +2432,7 @@ enum Field {
     Harness,
     Model,
     Effort,
+    ReworkMax,
 }
 
 /// The word a step kind shows.
@@ -2263,7 +2456,7 @@ fn kind_glyph(kind: StepKind) -> &'static str {
     }
 }
 
-/// The list's rows in the order the indented tree draws them: `(row, depth)`.
+/// The list's rows in the order the indented tree draws them: `(row, level)`.
 ///
 /// A step's parent is the first dependency the graph knows — `depends_on[0]`,
 /// not the deepest one — so the list is the graph's shape: roots in declaration
@@ -2271,6 +2464,12 @@ fn kind_glyph(kind: StepKind) -> &'static str {
 /// later dependency still appearing exactly once. The tree is the graph's, not
 /// today's run: a disabled step is still a node, so switching one off never
 /// moves the rows around it.
+///
+/// The indent is not the tree's depth. Depth staircases a straight pipeline one
+/// level per step — an eleven-step chain was eleven levels wide and truncated
+/// every meta line — so the indent says where the graph *branches* instead
+/// ([`step_levels`]): a chain is drawn flat, a fork indents, and a join comes
+/// back out.
 ///
 /// `seen` is the cycle guard: `validate` refuses a cycle, but the list is drawn
 /// while a person is midway through an edit. A step the walk cannot reach is
@@ -2281,53 +2480,185 @@ fn tree_order(facts: &[StepFacts]) -> Vec<(usize, usize)> {
         .enumerate()
         .map(|(index, fact)| (fact.id.as_str(), index))
         .collect();
-    // A dependency is a parent only when the graph knows the id: one a person
-    // is still typing is not a row to hang under yet.
-    let parent: Vec<Option<usize>> = facts
-        .iter()
-        .enumerate()
-        .map(|(index, fact)| {
-            fact.depends_on
-                .first()
-                .and_then(|id| index_of.get(id.as_str()).copied())
-                .filter(|parent| *parent != index)
-        })
-        .collect();
-    let mut children: Vec<Vec<usize>> = vec![Vec::new(); facts.len()];
-    for (index, parent) in parent.iter().enumerate() {
-        if let Some(parent) = parent {
-            children[*parent].push(index);
-        }
-    }
+    let dependencies = known_dependencies(facts, &index_of);
+    let levels = step_levels(&dependencies);
     let mut rows = Vec::with_capacity(facts.len());
-    let mut seen = vec![false; facts.len()];
-    for (index, parent) in parent.iter().enumerate() {
-        if parent.is_none() {
-            walk_tree(index, 0, &children, &mut seen, &mut rows);
-        }
+    let mut drawn = vec![false; facts.len()];
+    // Topological, not depth first: a row must come after every row it waits
+    // for, so a join is drawn once its branches are both done and not when the
+    // first of them finishes. Declaration order breaks ties, which keeps the
+    // list steady while a person edits.
+    while rows.len() < facts.len() {
+        let next = (0..facts.len()).find(|index| {
+            !drawn[*index]
+                && dependencies[*index]
+                    .iter()
+                    .all(|dependency| *dependency == *index || drawn[*dependency])
+        });
+        let Some(index) = next else {
+            break;
+        };
+        drawn[index] = true;
+        rows.push((index, levels[index]));
     }
-    // Whatever the roots did not reach is a cycle the editor is halfway through
-    // making. It has no depth to trust, so it is drawn at the end, at the root.
-    for index in 0..facts.len() {
-        walk_tree(index, 0, &children, &mut seen, &mut rows);
+    // A cycle the editor is halfway through making has no order to trust. It is
+    // drawn last, in declaration order, instead of vanishing.
+    for (index, level) in levels.iter().enumerate() {
+        if !drawn[index] {
+            rows.push((index, *level));
+        }
     }
     rows
 }
 
-/// One step and its subtree, depth first; `seen` stops a cycle from recursing.
-fn walk_tree(
-    index: usize,
-    depth: usize,
-    children: &[Vec<usize>],
-    seen: &mut [bool],
-    rows: &mut Vec<(usize, usize)>,
-) {
-    if std::mem::replace(&mut seen[index], true) {
-        return;
+/// Each step's dependencies, as row indices the list actually draws.
+///
+/// An id the graph does not know is one a person is still typing, and a step
+/// naming the same dependency twice waits for it once.
+fn known_dependencies(
+    facts: &[StepFacts],
+    index_of: &std::collections::BTreeMap<&str, usize>,
+) -> Vec<Vec<usize>> {
+    let mut dependencies: Vec<Vec<usize>> = vec![Vec::new(); facts.len()];
+    for (index, fact) in facts.iter().enumerate() {
+        for id in &fact.depends_on {
+            let Some(&dependency) = index_of.get(id.as_str()) else {
+                continue;
+            };
+            if dependency == index || dependencies[index].contains(&dependency) {
+                continue;
+            }
+            dependencies[index].push(dependency);
+        }
     }
-    rows.push((index, depth));
-    for child in &children[index] {
-        walk_tree(*child, depth + 1, children, seen, rows);
+    dependencies
+}
+
+/// How far each step is indented in the list: the branches, not the chain.
+///
+/// The accepted rule is "a branch indents, a link does not, and a join comes
+/// back out":
+///
+/// - a step with no dependencies is level 0;
+/// - a step with exactly one dependency takes that dependency's level, and one
+///   more only when the dependency has more than one child — a step a fork
+///   starts is a branch, a step in a plain chain is the chain continuing;
+/// - a step with more than one dependency is a join, and its level is the level
+///   of the deepest step its dependencies have in common (a dependency counts
+///   as its own ancestor), so the join lands back at the fork and the branch
+///   closes.
+///
+/// A child here is a step that names the step *and takes it as its only*
+/// dependency: the step that carries the branch on. A join also names its
+/// parents, but it names them to close the branches they opened, not to start
+/// one — counting it would indent the chain a later join happens to name. The
+/// mixed shape is what pins this down: `review` forks into `fmt` and `test`,
+/// `fmt` chains into `clippy`, and `bump` joins all three. Under a literal "a
+/// child is a step naming it" the join would make `fmt` a fork of `clippy`, and
+/// `clippy` — a link in `fmt`'s branch — would indent again; with the branch
+/// child counted, `fmt`, `clippy` and `test` all sit one level in and `bump`
+/// comes back out.
+///
+/// The levels are computed in dependency order by [`level_of`], which memoises
+/// and recurses; the graph is acyclic (`validate` guarantees it), and the walk
+/// is guarded anyway because the list is drawn mid-edit.
+fn step_levels(dependencies: &[Vec<usize>]) -> Vec<usize> {
+    let count = dependencies.len();
+    // A fork is a step that more than one branch leaves, so only a step that
+    // waits for this one and nothing else is counted: the link that carries
+    // the branch on. A join is the branch closing, not a new one.
+    let mut children = vec![0usize; count];
+    for edges in dependencies {
+        if let [only] = edges.as_slice() {
+            children[*only] += 1;
+        }
+    }
+    let mut levels: Vec<Option<usize>> = vec![None; count];
+    let mut visiting = vec![false; count];
+    for index in 0..count {
+        level_of(index, dependencies, &children, &mut levels, &mut visiting);
+    }
+    levels.into_iter().map(|level| level.unwrap_or(0)).collect()
+}
+
+/// One step's level, with every level it depends on resolved first.
+fn level_of(
+    index: usize,
+    dependencies: &[Vec<usize>],
+    children: &[usize],
+    levels: &mut [Option<usize>],
+    visiting: &mut [bool],
+) -> usize {
+    if let Some(level) = levels[index] {
+        return level;
+    }
+    // `validate` refuses a cycle; a step already on the walk's stack has no
+    // level to trust, so a graph mid-edit counts it as a root.
+    if std::mem::replace(&mut visiting[index], true) {
+        return 0;
+    }
+    let level = match dependencies[index].as_slice() {
+        [] => 0,
+        [only] => {
+            let parent = level_of(*only, dependencies, children, levels, visiting);
+            if children[*only] > 1 {
+                parent + 1
+            } else {
+                parent
+            }
+        }
+        join => join_level(join, dependencies, children, levels, visiting),
+    };
+    visiting[index] = false;
+    levels[index] = Some(level);
+    level
+}
+
+/// A join's level: the deepest step every one of its dependencies reaches.
+///
+/// A dependency is its own ancestor, so a join of two steps on one chain lands
+/// where that chain is, and a join of two branches lands at the fork that
+/// started them. An empty intersection has no common step to land on and is
+/// drawn at the root.
+fn join_level(
+    dependencies: &[usize],
+    edges: &[Vec<usize>],
+    children: &[usize],
+    levels: &mut [Option<usize>],
+    visiting: &mut [bool],
+) -> usize {
+    let mut common: Option<std::collections::BTreeSet<usize>> = None;
+    for dependency in dependencies {
+        let mut ancestors = std::collections::BTreeSet::new();
+        let mut seen = std::collections::BTreeSet::new();
+        seen.insert(*dependency);
+        ancestors.insert(*dependency);
+        collect_step_ancestors(*dependency, edges, &mut ancestors, &mut seen);
+        common = Some(match common {
+            None => ancestors,
+            Some(common) => common.intersection(&ancestors).copied().collect(),
+        });
+    }
+    common
+        .into_iter()
+        .flatten()
+        .map(|ancestor| level_of(ancestor, edges, children, levels, visiting))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Collect `index`'s dependencies, and everything those wait for, into `out`.
+fn collect_step_ancestors(
+    index: usize,
+    edges: &[Vec<usize>],
+    out: &mut std::collections::BTreeSet<usize>,
+    seen: &mut std::collections::BTreeSet<usize>,
+) {
+    for dependency in &edges[index] {
+        if seen.insert(*dependency) {
+            out.insert(*dependency);
+            collect_step_ancestors(*dependency, edges, out, seen);
+        }
     }
 }
 
@@ -2367,10 +2698,98 @@ fn join_chip(index: usize, dependency: &str) -> AnyElement {
         .into_any_element()
 }
 
+/// One rework row's label column: the field's 112-wide label, so the picker
+/// lines up with every other field.
+fn rework_row(id: &'static str, label: &'static str, chips: bool) -> gpui::Stateful<gpui::Div> {
+    let mut label_column = div()
+        .flex_shrink_0()
+        .w(px(theme::scaled(LABEL_WIDTH)))
+        .text_size(px(theme::font_meta()))
+        .text_color(theme::text_dim())
+        .child(label);
+    let mut row = div()
+        .id(SharedString::from(id))
+        .role(gpui::Role::Group)
+        .aria_label(label)
+        .flex()
+        .gap(px(12.))
+        .min_h(px(theme::scaled(FIELD_ROW_HEIGHT)))
+        .py(px(6.));
+    if chips {
+        // A row of chips grows to a second line, so its label starts at the
+        // row's top; the budget's single field centres instead.
+        row = row.items_start();
+        label_column = label_column.pt(px(3.));
+    } else {
+        row = row.items_center();
+    }
+    row.child(label_column)
+}
+
+/// One rework chip: a target a step may return the work to, or the clear.
+///
+/// It is the dependency row's chip in the same size and face, and its
+/// accessible name says what a press would do rather than which step it is.
+fn rework_chip(
+    selector: String,
+    label: String,
+    accessible: String,
+    selected: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    div()
+        .id(SharedString::from(selector.clone()))
+        .debug_selector(move || selector.clone())
+        .a11y_toggle(accessible, selected)
+        .cursor_pointer()
+        .px(px(8.))
+        .py(px(3.))
+        .rounded(px(5.))
+        .border_1()
+        .border_color(if selected {
+            theme::accent()
+        } else {
+            theme::hairline()
+        })
+        .text_size(px(theme::font_micro()))
+        .font_family(theme::code_font())
+        .text_color(if selected {
+            theme::text()
+        } else {
+            theme::text_muted()
+        })
+        .hover(|style| style.bg(theme::raised()))
+        .on_click(on_click)
+        .child(label)
+        .into_any_element()
+}
+
+/// Every step `ids` names, and everything those wait for, by id.
+///
+/// `reached` is also the cycle guard: `validate` refuses a cycle, but the
+/// inspector is drawn while a person is midway through an edit.
+fn collect_ancestors<'a>(
+    graph: &'a Workflow,
+    ids: &[String],
+    reached: &mut std::collections::BTreeSet<&'a str>,
+) {
+    for id in ids {
+        let Some(dependency) = graph.step(id) else {
+            continue;
+        };
+        if reached.insert(dependency.id.as_str()) {
+            collect_ancestors(graph, &dependency.depends_on, reached);
+        }
+    }
+}
+
 /// A step's list meta: `harness · once per task · after code`.
 ///
 /// The dependency it names is the step's parent in the tree; any others are
-/// chips beside the meta, because the row has no width for a list of names.
+/// chips beside the meta, because the row has no width for a list of names. A
+/// rework edge is named right after the kind, where a row's truncation cannot
+/// hide it: the loop is the one thing about a step the tree's shape does not
+/// already say.
 fn step_meta(step: &Step) -> String {
     let cadence = if step.per_task {
         "once per task"
@@ -2381,7 +2800,11 @@ fn step_meta(step: &Step) -> String {
         Some(first) => format!("after {first}"),
         None => "first".to_owned(),
     };
-    format!("{} · {cadence} · {after}", kind_word(step.kind))
+    let rework = match &step.rework_to {
+        Some(target) => format!("returns to {target} · "),
+        None => String::new(),
+    };
+    format!("{} · {rework}{cadence} · {after}", kind_word(step.kind))
 }
 
 /// A log step's list meta, when the file that named it is gone.
@@ -2417,6 +2840,8 @@ fn new_step(id: &str, kind: StepKind, depends_on: &[&str]) -> Step {
         timeout_secs: None,
         depends_on: depends_on.iter().map(|id| (*id).to_owned()).collect(),
         produces: None,
+        rework_to: None,
+        rework_max: None,
         per_task: false,
         mode: None,
         push: false,

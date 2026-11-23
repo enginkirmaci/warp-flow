@@ -36,3 +36,7 @@ decision it makes is written down before the next step reads it.
 | **question** | Something the run needs a person to answer before it continues: an approval, one choice, several choices, or free text. It is written into the issue folder, and the run pauses until the answer is written back. |
 | **approval** | A question whose answer is yes or no — merge or not, plan or not. |
 | **repair** | A bounded reaction to a failed attempt — fix the code, the artifact or the graph, then try again. |
+| **rework** | A step sending the work back to an earlier step it waits for, because that step's result needs another pass. A rework is not a dependency: the edge is a declared field on the step that takes it, and the graph stays acyclic. |
+| **verdict** | The word a reworking step writes in its artifact's front matter — `ready` or `changes` — and the only thing the engine reads to decide whether the run advances or goes back. The engine knows those two words and no others. |
+| **round** | One pass through a rework edge: the step that sent the work back, the step it named, and the steps between them running again before the reworking step runs once more. The run's own log is where the rounds are counted. |
+| **findings** | What a reworking step writes for the step it sends the work back to: the file that names what is wrong and what to do, and the one the next round is worked from. |

@@ -1184,6 +1184,8 @@ mod session_tests {
                 timeout_secs: None,
                 depends_on: Vec::new(),
                 produces: None,
+                rework_to: None,
+                rework_max: None,
                 per_task: task.is_some(),
                 mode: None,
                 push: false,
