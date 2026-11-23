@@ -66,7 +66,6 @@ fn the_repositorys_own_template_reads_downwards() {
         ids,
         [
             "analyze",
-            "split",
             "approve-plan",
             "code",
             "review",
@@ -75,7 +74,9 @@ fn the_repositorys_own_template_reads_downwards() {
             "test",
             "bump",
             "merge",
-            "summary"
+            "resolve-conflict",
+            "summary",
+            "cleanup"
         ],
         "the file is the pipeline, in the order a run walks it"
     );
@@ -140,6 +141,62 @@ fn the_repositorys_own_template_ships_the_bump_as_a_gate() {
             .iter()
             .any(|dependency| dependency == "bump"),
         "the merge queue waits for the bump: {merge_waits_for:?}"
+    );
+}
+
+#[test]
+fn the_repositorys_own_template_names_its_conflict_step() {
+    // A conflicted merge hands the branch to the named step and retries after
+    // it (ADR-0020). The step is declared after the merge and names it, so the
+    // graph shows the return, and it is the only step the merge may name.
+    let graph = template();
+    let merge = graph.step("merge").expect("merge is in the template");
+    assert_eq!(merge.on_conflict.as_deref(), Some("resolve-conflict"));
+
+    let resolve = graph
+        .step("resolve-conflict")
+        .expect("the conflict step is in the template");
+    assert_eq!(resolve.kind, StepKind::Harness);
+    assert!(resolve.per_task, "a conflict belongs to one task's branch");
+    assert_eq!(resolve.skill.as_deref(), Some("merge-conflict"));
+    assert_eq!(
+        resolve.depends_on.as_deref(),
+        Some(&["merge".to_owned()][..]),
+        "the conflict step is declared under the merge it serves"
+    );
+    let ids: Vec<&str> = graph.steps.iter().map(|step| step.id.as_str()).collect();
+    let merge_at = ids.iter().position(|id| *id == "merge").expect("merge");
+    let resolve_at = ids
+        .iter()
+        .position(|id| *id == "resolve-conflict")
+        .expect("resolve-conflict");
+    assert!(
+        resolve_at > merge_at,
+        "the conflict step is declared after its merge"
+    );
+}
+
+#[test]
+fn the_repositorys_own_template_cleans_up_after_the_merge() {
+    // The run closes with two siblings (ADR-0021): the summary writes the
+    // report and the cleanup removes the merged tasks' worktrees and branches.
+    // Both name `merge`, so neither waits for the other.
+    let graph = template();
+    let cleanup = graph
+        .step("cleanup")
+        .expect("the cleanup step is in the template");
+    assert_eq!(cleanup.kind, StepKind::Cleanup);
+    assert!(!cleanup.per_task, "one cleanup belongs to the run");
+    assert_eq!(
+        cleanup.depends_on.as_deref(),
+        Some(&["merge".to_owned()][..])
+    );
+
+    let summary = graph.step("summary").expect("summary is in the template");
+    assert_eq!(
+        summary.depends_on.as_deref(),
+        Some(&["merge".to_owned()][..]),
+        "the summary names the merge too: the two are siblings"
     );
 }
 

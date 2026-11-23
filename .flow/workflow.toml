@@ -3,9 +3,11 @@
 #
 # A run copies this file into its issue folder at start, so editing it here
 # never changes a run that already started. The graph is the one the flow
-# design names: analyze the request, split it into tasks, let a person approve
-# the plan, then drive each ready task through code, review and the gates
-# before the merge queue lands it.
+# design names: analyze the request and write the plan — the spec and the task
+# files (ADR-0022) — let a person approve it, then drive each ready task
+# through code, review and the gates before the merge queue lands it. A
+# conflicted merge hands the branch to its conflict step (ADR-0020), and the
+# run closes with a cleanup beside the summary (ADR-0021).
 #
 # The file is read downwards (ADR-0018): a step that says nothing about its
 # dependencies waits for every step declared before it, so a pipeline needs no
@@ -21,21 +23,31 @@
 # `code` with `review`'s findings, at most `rework_max` times. When the budget
 # is spent the step fails and the run stops.
 #
+# A merge may name the step that resolves its conflict (ADR-0020): the named
+# step is a per-task harness step declared after the merge, it runs inside the
+# merge's turn when the rebase conflicts, and the merge retries after it.
+#
+# The run ends with two siblings (ADR-0021): `summary` writes the closing report
+# and `cleanup` removes every merged task's worktree and branch. Both name
+# `merge`, so neither waits for the other; the cleanup never touches the
+# checkout, so it may run beside the summary.
+#
 # What a harness step runs on is picked per step (ADR-0017): `harness`, `model`
 # and `effort` are resolved against warp-agent's catalog when the step's turn
 # comes, and a name nothing publishes blocks the step instead of being swapped
 # for another. Every remaining harness step runs on dsh with
 # `opencode-go/deepseek-v4.1-flash`; the effort is the one thing that differs,
 # because it is the only knob that should: the steps that decide and write get
-# `max`, and the ones that read and report get `high`. `bump` is no longer a
-# harness step: it is the gate below, a command that moves the version.
+# `max`, and the ones that read and report get `high`. `bump` is a gate, and the
+# cleanup is not a session at all: both are declared below.
 schema = 2
 name = "implement"
 revision = 1
 max_parallel = 2
 
-# The request is read once, at the start, and the whole plan comes out of this
-# step: the hardest thinking in the run, so the highest effort.
+# The request is read once, at the start, and the whole plan — the spec and the
+# task files — comes out of this step: the hardest thinking in the run, so the
+# highest effort (ADR-0022).
 [[step]]
 id = "analyze"
 kind = "harness"
@@ -44,16 +56,6 @@ produces = "spec.md"
 harness = "dsh"
 model = "opencode-go/deepseek-v4.1-flash"
 effort = "max"
-
-# Splitting is bookkeeping over a spec that already exists: it reads the spec
-# and writes the task list, so `high` is enough.
-[[step]]
-id = "split"
-kind = "harness"
-skill = "split"
-harness = "dsh"
-model = "opencode-go/deepseek-v4.1-flash"
-effort = "high"
 
 [[step]]
 id = "approve-plan"
@@ -145,20 +147,51 @@ cwd = "."
 timeout_secs = 300
 per_task = false
 
+# The merge lands one task's branch. If the rebase conflicts it writes the
+# conflicted attempt's repair and runs `resolve-conflict` inside its turn, then
+# retries; the merge's attempt budget bounds the rounds (ADR-0020).
 [[step]]
 id = "merge"
 kind = "merge"
 per_task = true
 mode = "local"
 push = false
+on_conflict = "resolve-conflict"
+
+# The conflict step: takes the rebase that failed on the task branch, resolves
+# it and finishes it, so the retry has nothing left to replay. Its input is the
+# newest `repairs/` entry the conflicted attempt wrote; it writes no artifact,
+# because the evidence is the task branch and its session record. It resolves
+# and commits code, so `max`.
+[[step]]
+id = "resolve-conflict"
+kind = "harness"
+skill = "merge-conflict"
+per_task = true
+depends_on = ["merge"]
+harness = "dsh"
+model = "opencode-go/deepseek-v4.1-flash"
+effort = "max"
 
 # The run's closing report: what landed, what did not, and what needs a person.
-# It reads the whole run and writes prose, so `high`.
+# It reads the whole run and writes prose, so `high`. It and `cleanup` are
+# siblings: both name `merge`, so neither waits for the other.
 [[step]]
 id = "summary"
 kind = "harness"
 skill = "summary"
 produces = "summary.md"
+depends_on = ["merge"]
 harness = "dsh"
 model = "opencode-go/deepseek-v4.1-flash"
 effort = "high"
+
+# The run's own housekeeping, not a session and not per task: it removes every
+# merged task's worktree, deletes its branch and prunes. `main`, the issue
+# folder and unresolved tasks are untouched; the issue folder still outlives
+# the run (ADR-0021).
+[[step]]
+id = "cleanup"
+kind = "cleanup"
+per_task = false
+depends_on = ["merge"]

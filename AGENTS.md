@@ -119,11 +119,13 @@ withdraws the door and asks a blocking engine to stop.
   work and every step writes `run.md` into it. Do not relax the dirty check to
   make the queue faster; the barrier is what makes it correct.
 - **A merge may name its conflict step.** `on_conflict` names an enabled,
-  per-task harness step declared after the merge and naming it; when the rebase
-  conflicts the engine records the attempt and its repair, runs that step inside
-  the merge's turn (the barrier still holds), and retries. The step never gets
-  an ordinary job — its task is resolved once the merge lands — and the merge's
-  attempt budget bounds the rounds (ADR-0020).
+  per-task harness step declared after the merge and waiting for it; an enabled
+  conflict step needs its merge enabled too, because a disabled merge would
+  pass its own dependencies through and let the step run as ordinary work. When
+  the rebase conflicts the engine records the attempt and its repair, runs that
+  step inside the merge's turn (the barrier still holds), and retries. The step
+  never gets an ordinary job — its task is resolved once the merge lands — and
+  the merge's attempt budget bounds the rounds (ADR-0020).
 - **A run cleans up after itself.** A `cleanup` step, not per task and declared
   after the summary, names the merge like the summary does: it removes each
   merged task's worktree, deletes its branch and prunes. `main`, the issue

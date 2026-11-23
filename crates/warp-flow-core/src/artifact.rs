@@ -857,14 +857,14 @@ mod tests {
     }
 
     #[test]
-    fn the_split_skill_teaches_a_task_the_parser_accepts() {
-        let document = crate::skill::document("split").expect("this build ships split");
+    fn the_analyze_skill_teaches_a_task_the_parser_accepts() {
+        let document = crate::skill::document("analyze").expect("this build ships analyze");
         let example = indented_block(document, "Each file:")
             .replace("<title>", "A task")
             .replace("<category>", "feature");
         let task =
             Task::parse(Path::new("issues/01-a-task.md"), &example).unwrap_or_else(|error| {
-                panic!("the split skill's example is refused: {error}\n{example}")
+                panic!("the analyze skill's example is refused: {error}\n{example}")
             });
         assert_eq!(task.number, 1);
         assert_eq!(task.title, "A task");
@@ -877,7 +877,7 @@ mod tests {
     ///
     /// The example is what an agent copies into every file, so it has to be a
     /// shape this module accepts — a doc that teaches `open` makes a run stop at
-    /// the step boundary after `split`.
+    /// the next step boundary, after `analyze`.
     fn indented_block(document: &str, marker: &str) -> String {
         let mut block = String::new();
         let mut started = false;

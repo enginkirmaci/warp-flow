@@ -190,6 +190,9 @@ struct Fields {
     cwd: Entity<InputState>,
     timeout: Entity<InputState>,
     produces: Entity<InputState>,
+    /// The step a merge hands its conflicted branch to (ADR-0020); empty names
+    /// none, which is a merge that blocks on a conflict instead.
+    on_conflict: Entity<InputState>,
     /// How many times the step may send the work back: the rework budget. The
     /// picker beside it is stateless (it reads the selection), so only the
     /// budget is an input that has to be carried between selections.
@@ -598,6 +601,12 @@ impl WorkflowScreen {
             step.produces.clone().unwrap_or_default(),
             "an artifact in the run folder",
         );
+        let on_conflict = make(
+            window,
+            cx,
+            step.on_conflict.clone().unwrap_or_default(),
+            "the step that resolves a conflicted merge; empty names none",
+        );
         let rework_max = make(
             window,
             cx,
@@ -613,6 +622,7 @@ impl WorkflowScreen {
             (cwd.clone(), Field::Cwd),
             (timeout.clone(), Field::Timeout),
             (produces.clone(), Field::Produces),
+            (on_conflict.clone(), Field::OnConflict),
             (rework_max.clone(), Field::ReworkMax),
         ];
         for (input, which) in watched {
@@ -632,6 +642,7 @@ impl WorkflowScreen {
                         step.timeout_secs = text.parse::<u64>().ok().filter(|secs| *secs > 0)
                     }
                     Field::Produces => step.produces = (!text.is_empty()).then_some(text),
+                    Field::OnConflict => step.on_conflict = (!text.is_empty()).then_some(text),
                     // `validate` refuses a budget of 0, and an empty field is
                     // "unset", which means one.
                     Field::ReworkMax => {
@@ -648,6 +659,7 @@ impl WorkflowScreen {
             cwd,
             timeout,
             produces,
+            on_conflict,
             rework_max,
         };
         self.fields = Some(fields.clone());
@@ -681,6 +693,10 @@ impl WorkflowScreen {
                 step.produces.clone().unwrap_or_default(),
             ),
             (
+                fields.on_conflict.clone(),
+                step.on_conflict.clone().unwrap_or_default(),
+            ),
+            (
                 fields.rework_max.clone(),
                 step.rework_max
                     .map(|max| max.to_string())
@@ -702,10 +718,17 @@ impl WorkflowScreen {
             "gate" => StepKind::Gate,
             "question" => StepKind::Question,
             "merge" => StepKind::Merge,
+            "cleanup" => StepKind::Cleanup,
             _ => StepKind::Harness,
         };
         self.edit_step(cx, |step| {
             step.kind = kind;
+            // `on_conflict` is a merge's field and nobody else's: validation
+            // refuses it on another kind, and a cleanup step in particular
+            // declares nothing (ADR-0020, ADR-0021).
+            if kind != StepKind::Merge {
+                step.on_conflict = None;
+            }
             if kind == StepKind::Merge {
                 step.per_task = true;
                 step.skill = None;
@@ -715,6 +738,23 @@ impl WorkflowScreen {
                 // with the rest of the step's fixed shape.
                 step.rework_to = None;
                 step.rework_max = None;
+            }
+            if kind == StepKind::Cleanup {
+                // A cleanup is the engine's own housekeeping (ADR-0021): it
+                // runs once over the tasks the run resolved and carries nothing
+                // to run, so the form's other fields go with the kind.
+                step.per_task = false;
+                step.command = None;
+                step.skill = None;
+                step.harness = None;
+                step.model = None;
+                step.effort = None;
+                step.mode = None;
+                step.push = false;
+                step.produces = None;
+                step.rework_to = None;
+                step.rework_max = None;
+                step.on_conflict = None;
             }
         });
     }
@@ -760,6 +800,7 @@ impl WorkflowScreen {
             per_task: false,
             mode: None,
             push: false,
+            on_conflict: None,
         };
         let at = match place {
             Place::Front => 0,
@@ -1369,6 +1410,15 @@ impl WorkflowScreen {
             "produces",
             fields.as_ref().map(|fields| fields.produces.clone()),
         ));
+        // What a conflicted merge hands the branch to (ADR-0020): the named
+        // step is declared after the merge and runs inside its turn.
+        if step.kind == StepKind::Merge {
+            rows.push((
+                "On conflict",
+                "on-conflict",
+                fields.as_ref().map(|fields| fields.on_conflict.clone()),
+            ));
+        }
         for (label, key, input) in rows {
             body = body.child(self.field_row(label, key, input, window, cx));
         }
@@ -1796,6 +1846,7 @@ impl WorkflowScreen {
             kit::Choice::new("gate", "gate", step.kind == StepKind::Gate),
             kit::Choice::new("question", "question", step.kind == StepKind::Question),
             kit::Choice::new("merge", "merge", step.kind == StepKind::Merge),
+            kit::Choice::new("cleanup", "cleanup", step.kind == StepKind::Cleanup),
         ];
         div()
             .flex()
@@ -2629,6 +2680,7 @@ enum Field {
     Cwd,
     Timeout,
     Produces,
+    OnConflict,
     ReworkMax,
 }
 
@@ -2703,6 +2755,7 @@ fn kind_word(kind: StepKind) -> &'static str {
         StepKind::Gate => "gate",
         StepKind::Question => "question",
         StepKind::Merge => "merge",
+        StepKind::Cleanup => "cleanup",
     }
 }
 
@@ -2714,6 +2767,7 @@ fn kind_glyph(kind: StepKind) -> &'static str {
         StepKind::Gate => "icons/icon-gate.svg",
         StepKind::Question => "icons/icon-help.svg",
         StepKind::Merge => "icons/icon-merge.svg",
+        StepKind::Cleanup => "icons/icon-trash.svg",
     }
 }
 
@@ -3169,6 +3223,7 @@ fn new_step(id: &str, kind: StepKind, depends_on: &[&str]) -> Step {
         per_task: false,
         mode: None,
         push: false,
+        on_conflict: None,
     }
 }
 
@@ -3177,9 +3232,10 @@ fn new_step(id: &str, kind: StepKind, depends_on: &[&str]) -> Step {
 ///
 /// A new repository's editor is a menu, not a scaffold: a person enables the
 /// steps their project has instead of deleting the ones it does not. The shape
-/// is this repository's own `.flow/workflow.toml` — analyze the request, split
-/// it, let a person approve the plan, then per-task code, review and the three
-/// gates, then the bump gate, the merge and the closing report — with this
+/// is this repository's own `.flow/workflow.toml` — analyze the request and
+/// write the plan (ADR-0022), let a person approve it, then per-task code,
+/// review and the three gates, then the bump gate, the merge and its conflict
+/// step (ADR-0020), and the closing summary and cleanup (ADR-0021) — with this
 /// repository's own gate commands. A harness step whose skill this build does
 /// not ship is left out, because preparation refuses a graph naming one.
 fn new_graph() -> Workflow {
@@ -3203,8 +3259,10 @@ fn new_graph() -> Workflow {
     // every step above it, so only the fork names a parent. `bump` and `merge`
     // name nothing on purpose — that is what makes them the join.
     let mut steps = vec![
+        // The request is read once and the whole plan comes out of this one
+        // session: the spec and the task files (ADR-0022), so there is no
+        // separate split step.
         harness("analyze", "analyze", Some("spec.md"), false, &[]),
-        harness("split", "split", None, false, &[]),
         new_step("approve-plan", StepKind::Question, &[]),
         harness("code", "code", None, true, &[]),
         harness("review", "review", None, true, &[]),
@@ -3227,20 +3285,43 @@ fn new_graph() -> Workflow {
     // conflict on the second merge. Merge is the barrier after it and summary
     // is the run's closing report.
     steps.push(gate("bump", "python3 scripts/bump.py", 300, false, &[]));
+    // A conflicted merge hands the branch to the step it names (ADR-0020): the
+    // step is declared after the merge and depends on it alone, so the run
+    // draws the return. The menu offers the step but no merge names it: a
+    // named step must be enabled, and this document arrives with every step
+    // off, so naming it here would be a graph the editor refuses to save. A
+    // person turns the pair on, names the step in the merge's form, and the
+    // shipped template does both already. A build that does not ship the
+    // document leaves the step out, because preparation refuses a graph naming
+    // a skill it does not carry.
+    let conflict = ships("merge-conflict");
     let mut merge = new_step("merge", StepKind::Merge, &[]);
     merge.per_task = true;
     merge.mode = Some("local".to_owned());
     merge.push = false;
     steps.push(merge);
+    if conflict {
+        steps.push(harness(
+            "resolve-conflict",
+            "merge-conflict",
+            None,
+            true,
+            &["merge"],
+        ));
+    }
+    // The run's close is two siblings: the summary reports it and the cleanup
+    // removes every merged task's worktree and branch (ADR-0021). Both name the
+    // merge, so neither waits for the other.
     if ships("summary") {
         steps.push(harness(
             "summary",
             "summary",
             Some("summary.md"),
             false,
-            &[],
+            &["merge"],
         ));
     }
+    steps.push(new_step("cleanup", StepKind::Cleanup, &["merge"]));
     Workflow {
         schema: SCHEMA,
         name: "implement".to_owned(),

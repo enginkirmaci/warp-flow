@@ -1342,6 +1342,7 @@ mod session_tests {
                 per_task: task.is_some(),
                 mode: None,
                 push: false,
+                on_conflict: None,
             },
             issue: dir.clone(),
             workdir: dir,
@@ -1701,6 +1702,7 @@ mod tests {
             per_task: false,
             mode: None,
             push: false,
+            on_conflict: None,
         }
     }
 

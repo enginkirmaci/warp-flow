@@ -242,6 +242,9 @@ enum StepWork {
     Harness { prompt: String },
     /// A gate command, with its `cwd` already resolved against the workdir.
     Gate { gate: crate::gate::Gate },
+    /// The run's closing housekeeping: the resolved tasks whose worktrees and
+    /// branches the worker removes (ADR-0021).
+    Cleanup { repo: Repo, tasks: Vec<Task> },
 }
 
 impl StepWork {
@@ -250,6 +253,7 @@ impl StepWork {
         match self {
             Self::Harness { .. } => "blocked",
             Self::Gate { .. } => "failed",
+            Self::Cleanup { .. } => "failed",
         }
     }
 }
@@ -321,6 +325,11 @@ pub struct Runner<H> {
     /// Whether [`Runner::resume`] loaded an existing log; `run` continues it
     /// instead of starting over.
     resumed: bool,
+    /// Retries of a blocked run, oldest first as `step @ timestamp`.
+    ///
+    /// A retry opens a new attempt window, so the log's attempt numbers start
+    /// again at 1; this list is the record that says why (AGENTS.md).
+    retried: Vec<String>,
 }
 
 impl<H: Harness + Send + 'static> Runner<H> {
@@ -360,6 +369,12 @@ impl<H: Harness + Send + 'static> Runner<H> {
                     step.id
                 )));
             }
+            if step.kind == StepKind::Cleanup && repo.is_none() {
+                return Err(Error::Run(format!(
+                    "step `{}` removes task worktrees, but the runner has no repository",
+                    step.id
+                )));
+            }
         }
         if !issue.is_dir() {
             return Err(Error::malformed_file(
@@ -391,6 +406,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
             started: timestamp(SystemTime::now()),
             note: None,
             resumed: false,
+            retried: Vec::new(),
         })
     }
 
@@ -573,26 +589,54 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 // Two steps that would run in the same folder never run
                 // together: a non-per-task step measures the repository root,
                 // and two sessions in one checkout would fight over the index.
-                let workdir = self.step_workdir(&step, task.as_ref())?;
+                //
+                // The cleanup is the one engine step that does not run in the
+                // checkout at all: it takes the worktrees folder as its place,
+                // which is what lets it run in the same wave as the summary.
+                let workdir = if step.kind == StepKind::Cleanup {
+                    self.workdir.join(".worktrees")
+                } else {
+                    self.step_workdir(&step, task.as_ref())?
+                };
                 if busy.contains(&workdir) || jobs.len() >= self.max_parallel() {
                     continue;
                 }
                 busy.insert(workdir.clone());
                 let key = (step.id.clone(), task.as_ref().map(|task| task.number));
                 let attempt = self.attempts.get(&key).copied().unwrap_or(0) + 1;
-                let work = if step.kind == StepKind::Gate {
-                    // A gate step carries its own command (ADR-0015); its `cwd`
-                    // is relative to the tree the step measures, so it is
-                    // resolved here, where that tree is known.
-                    let mut gate = step.gate()?;
-                    if gate.cwd.is_relative() {
-                        gate.cwd = workdir.join(&gate.cwd);
+                let work = match step.kind {
+                    StepKind::Gate => {
+                        // A gate step carries its own command (ADR-0015); its
+                        // `cwd` is relative to the tree the step measures, so it
+                        // is resolved here, where that tree is known.
+                        let mut gate = step.gate()?;
+                        if gate.cwd.is_relative() {
+                            gate.cwd = workdir.join(&gate.cwd);
+                        }
+                        StepWork::Gate { gate }
                     }
-                    StepWork::Gate { gate }
-                } else {
-                    StepWork::Harness {
+                    StepKind::Cleanup => {
+                        // Only a task that landed is a task to clean up: a task
+                        // the run did not resolve still has work in it.
+                        let tasks: Vec<Task> = issue
+                            .tasks()
+                            .iter()
+                            .filter(|task| task.status.is_resolved())
+                            .cloned()
+                            .collect();
+                        StepWork::Cleanup {
+                            repo: self.repo.clone().ok_or_else(|| {
+                                Error::Run(format!(
+                                    "cleanup step `{}` needs a repository in the runner config",
+                                    step.id
+                                ))
+                            })?,
+                            tasks,
+                        }
+                    }
+                    _ => StepWork::Harness {
                         prompt: self.prompt(&step, task.as_ref())?,
-                    }
+                    },
                 };
                 jobs.push(StepJob {
                     step,
@@ -744,6 +788,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
                             }),
                             Err(error) => Err(error),
                         },
+                        StepWork::Cleanup { repo, tasks } => run_cleanup(&repo, &tasks),
                     };
                     // The scheduler thread is the only writer, so a worker
                     // hands its report over rather than recording it. A closed
@@ -1001,6 +1046,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
         self.completed.clear();
         self.rows.clear();
         self.pending_questions.clear();
+        self.retried.clear();
         self.note = None;
         // One timestamp for the record and the skipped rows: they are written
         // together, before anything runs.
@@ -1102,6 +1148,26 @@ impl<H: Harness + Send + 'static> Runner<H> {
                     self.uncomplete_span(&span, None);
                 }
             }
+        }
+        if let Some(list) = document.front.get("retried") {
+            self.retried = list
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
+        // A person's retry of a blocked run opens a new attempt window: the
+        // numbers start again at 1, and this line is the record that says why.
+        if document.front.get("status") == Some("blocked")
+            && let Some(step) = self
+                .rows
+                .last()
+                .and_then(|line| LogRow::parse(line))
+                .map(|row| row.step.clone())
+        {
+            self.retried
+                .push(format!("{step} @ {}", timestamp(SystemTime::now())));
         }
         self.resumed = true;
         Ok(())
@@ -1273,6 +1339,13 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 return Ok(StepRun::Waiting(path));
             }
             StepKind::Merge => return self.run_merge_step(step, task),
+            StepKind::Cleanup => {
+                return Err(Error::Run(
+                    "a cleanup step is engine work and is dispatched, not run through the \
+                     attempt loop"
+                        .to_owned(),
+                ));
+            }
             StepKind::Gate | StepKind::Harness => {}
         }
 
@@ -1281,7 +1354,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
             let failure = match step.kind {
                 StepKind::Gate => self.attempt_gate(step, task)?,
                 StepKind::Harness => self.attempt_harness(step, task, attempt)?,
-                StepKind::Question | StepKind::Merge => {
+                StepKind::Question | StepKind::Merge | StepKind::Cleanup => {
                     return Err(Error::Run(format!(
                         "step `{}` reached the attempt loop with kind {:?}",
                         step.id, step.kind
@@ -1516,6 +1589,11 @@ impl<H: Harness + Send + 'static> Runner<H> {
     }
 
     /// Hand a harness step to the harness.
+    ///
+    /// A harness that cannot be built, or a session that errors, is a blocked
+    /// attempt rather than a run error: that is what the dispatched path does
+    /// with a worker's report, and a step the merge runs inline (its conflict
+    /// step) must fail the same way.
     fn attempt_harness(
         &mut self,
         step: &Step,
@@ -1531,8 +1609,27 @@ impl<H: Harness + Send + 'static> Runner<H> {
             task: task.map(|task| task.number),
             attempt,
         };
-        let mut harness = self.harness_factory.build()?;
-        match harness.run(&request)? {
+        let mut harness = match self.harness_factory.build() {
+            Ok(harness) => harness,
+            Err(error) => {
+                return Ok(Some(Failure {
+                    outcome: "blocked",
+                    summary: error.to_string(),
+                    detail: None,
+                }));
+            }
+        };
+        let outcome = match harness.run(&request) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Ok(Some(Failure {
+                    outcome: "blocked",
+                    summary: error.to_string(),
+                    detail: None,
+                }));
+            }
+        };
+        match outcome {
             StepOutcome::Done { .. } => Ok(None),
             StepOutcome::Blocked { reason } => Ok(Some(Failure {
                 outcome: "blocked",
@@ -1711,6 +1808,35 @@ impl<H: Harness + Send + 'static> Runner<H> {
                         Retry::WhileBudget,
                     )? {
                         return Ok(StepRun::Blocked);
+                    }
+                    // The conflicted attempt wrote the repair its conflict step
+                    // reads. Run that step inside the merge's turn: the merge is
+                    // a barrier, so nothing else is in flight, and its own
+                    // attempt loop records its rows and repairs on this thread.
+                    if let Some(target) = step.on_conflict.as_deref() {
+                        let resolver = self.workflow.step(target).cloned().ok_or_else(|| {
+                            Error::Run(format!(
+                                "merge step `{}` names the conflict step `{target}`, which is \
+                                 not in the graph",
+                                step.id
+                            ))
+                        })?;
+                        let merge_label = running_label(&step.id, Some(task.number));
+                        let resolver_label = running_label(&resolver.id, Some(task.number));
+                        // The merge's turn is not over until its resolver
+                        // reports: the record names both, so neither band reads
+                        // as failed while the conflict is being handled.
+                        self.current_step = Some(format!("{merge_label}, {resolver_label}"));
+                        self.write_run()?;
+                        let outcome = self.run_step_inner(&resolver, Some(task), &resolver_label);
+                        self.current_step = Some(merge_label);
+                        self.write_run()?;
+                        match outcome? {
+                            StepRun::Done => {}
+                            StepRun::Blocked | StepRun::Waiting(_) => {
+                                return Ok(StepRun::Blocked);
+                            }
+                        }
                     }
                 }
                 MergeOutcome::GateFailed { gate, tail } => {
@@ -2027,6 +2153,9 @@ impl<H: Harness + Send + 'static> Runner<H> {
         if let Some(step) = &self.current_step {
             front.set("running", step.clone());
         }
+        if !self.retried.is_empty() {
+            front.set("retried", self.retried.join(", "));
+        }
         front.set("started", self.started.clone());
         front.set("updated", timestamp(SystemTime::now()));
 
@@ -2254,6 +2383,48 @@ fn require_git(output: &std::process::Output, action: &str, dir: &Path) -> Resul
     )))
 }
 
+/// Remove the run's landed work: each merged task's worktree and branch, then
+/// whatever git still lists (ADR-0021).
+///
+/// Idempotent: a worktree or branch that is already gone is skipped, so a
+/// resumed cleanup finishes what a failed one started. A branch is deleted with
+/// `-d`, which refuses an unmerged branch — but every task here is resolved, so
+/// its branch is on `main`.
+fn run_cleanup(repo: &Repo, tasks: &[Task]) -> Result<StepOutcome> {
+    let mut removed = 0usize;
+    for task in tasks {
+        // The worktree knows the branch's exact name (a clash appends a
+        // suffix); with the worktree already gone, the task's own name is the
+        // branch the engine would create.
+        let branch = match TaskWorktree::find(repo, task.number)? {
+            Some(worktree) => {
+                let branch = worktree.branch.clone();
+                worktree.remove(true)?;
+                branch
+            }
+            None => crate::worktree::branch_name(task),
+        };
+        let listed = git(&repo.root, &["branch", "--list", &branch])?;
+        require_git(&listed, "list the task branch", &repo.root)?;
+        if String::from_utf8_lossy(&listed.stdout).trim().is_empty() {
+            removed += 1;
+            continue;
+        }
+        let deleted = git(&repo.root, &["branch", "-d", &branch])?;
+        require_git(
+            &deleted,
+            &format!("delete the merged branch `{branch}`"),
+            &repo.root,
+        )?;
+        removed += 1;
+    }
+    let pruned = crate::worktree::prune(repo)?;
+    Ok(StepOutcome::Done {
+        wrote: Vec::new(),
+        text: format!("cleaned up {removed} merged task(s); pruned {pruned} worktree(s)"),
+    })
+}
+
 /// An RFC 3339 UTC timestamp with second precision, with no date dependency.
 ///
 /// The app's host records when a run started and finished with it, so the app
@@ -2372,9 +2543,9 @@ kind = "harness"
 skill = "analyze"
 
 [[step]]
-id = "split"
+id = "code"
 kind = "harness"
-skill = "split"
+skill = "code"
 depends_on = ["analyze"]
 "#,
         );
@@ -2393,7 +2564,7 @@ depends_on = ["analyze"]
 
         assert_eq!(
             *seen.lock().expect("seen lock"),
-            vec!["running/analyze".to_owned(), "running/split".to_owned()],
+            vec!["running/analyze".to_owned(), "running/code".to_owned()],
             "each session is called while `run.md` names its step"
         );
         assert_eq!(
@@ -2403,6 +2574,71 @@ depends_on = ["analyze"]
         );
     }
 
+    #[test]
+    fn a_retry_of_a_blocked_run_says_so_in_run_md() {
+        // The retry gives the step a fresh attempt budget, so its rows start at
+        // 1 again. `run.md` records the retry, which is what makes the second
+        // `attempt 1` in the log read as a new window rather than a mistake.
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let workflow = workflow(
+            r#"
+schema = 2
+name = "implement"
+revision = 1
+
+[[step]]
+id = "analyze"
+kind = "harness"
+skill = "analyze"
+"#,
+        );
+        fs::write(
+            issue.join("run.md"),
+            r#"---
+issue: demo
+workflow: implement
+revision: 1
+status: blocked
+started: 2026-11-23T10:00:00Z
+---
+# Run: implement
+
+## Log
+
+| Step | Task | Attempt | Outcome | At |
+| --- | --- | --- | --- | --- |
+| analyze | - | 3 | blocked | 2026-11-23T10:01:00Z |
+"#,
+        )
+        .expect("run.md");
+        let mut harness = FakeHarness::new();
+        harness.script(
+            "analyze",
+            Scripted::Done {
+                files: Vec::new(),
+                text: "analyzed".to_owned(),
+            },
+        );
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.workdir = dir.path().to_path_buf();
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::resume(config).expect("resume");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+
+        let document = run_md(&issue);
+        let retried = document
+            .front
+            .get("retried")
+            .expect("the retry is recorded");
+        assert!(retried.contains("analyze @"), "{retried}");
+        assert!(
+            document.body.contains("| analyze | - | 1 | done |"),
+            "{}",
+            document.body
+        );
+    }
     #[test]
     fn the_prompt_carries_the_step_skill_document() {
         let dir = TempDir::new();
@@ -2455,10 +2691,10 @@ produces = "spec.md"
             },
         );
         harness.script(
-            "split",
+            "code",
             Scripted::Done {
                 files: vec![(issue.join("issues/01-first.md"), task.clone())],
-                text: "split".to_owned(),
+                text: "coded".to_owned(),
             },
         );
         let workflow = workflow(
@@ -2474,9 +2710,9 @@ skill = "analyze"
 produces = "spec.md"
 
 [[step]]
-id = "split"
+id = "code"
 kind = "harness"
-skill = "split"
+skill = "code"
 depends_on = ["analyze"]
 "#,
         );
@@ -2494,14 +2730,14 @@ depends_on = ["analyze"]
         let document = run_md(&issue);
         assert_eq!(document.front.get("status"), Some("done"));
         let analyze = document.body.find("| analyze | - | 1 | done |");
-        let split = document.body.find("| split | - | 1 | done |");
-        assert!(analyze.is_some() && split.is_some(), "{}", document.body);
-        assert!(analyze < split);
+        let code = document.body.find("| code | - | 1 | done |");
+        assert!(analyze.is_some() && code.is_some(), "{}", document.body);
+        assert!(analyze < code);
         assert!(log.lines().iter().any(|line| line.contains("run done")));
 
         assert_eq!(runner.harness().calls().len(), 2);
         assert!(runner.harness().calls()[0].prompt.contains("analyze"));
-        assert!(runner.harness().calls()[1].prompt.contains("split"));
+        assert!(runner.harness().calls()[1].prompt.contains("code"));
     }
 
     #[test]
@@ -2912,6 +3148,202 @@ depends_on = ["test"]
         assert_eq!(calls.len(), 2, "analyze then code");
         assert_eq!(calls[1].step.id, "code");
         assert_eq!(calls[1].workdir, worktree.path);
+    }
+
+    const CLEANUP_WORKFLOW: &str = r#"
+schema = 2
+name = "implement"
+revision = 1
+
+[[step]]
+id = "cleanup"
+kind = "cleanup"
+"#;
+
+    const CONFLICT_WORKFLOW: &str = r#"
+schema = 2
+name = "implement"
+revision = 1
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+per_task = true
+
+[[step]]
+id = "merge"
+kind = "merge"
+per_task = true
+mode = "local"
+on_conflict = "resolve-conflict"
+
+[[step]]
+id = "resolve-conflict"
+kind = "harness"
+skill = "merge-conflict"
+per_task = true
+depends_on = ["merge"]
+"#;
+
+    /// A harness that records the steps it is asked to run, and what `run.md`
+    /// said while the conflict step was on it.
+    #[derive(Clone)]
+    struct ConflictHarness {
+        issue: PathBuf,
+        calls: Arc<Mutex<Vec<String>>>,
+        running: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Harness for ConflictHarness {
+        fn run(&mut self, request: &StepRequest) -> Result<StepOutcome> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(request.step.id.clone());
+            if request.step.id == "resolve-conflict" {
+                let document = Document::read(self.issue.join("run.md"))?;
+                self.running
+                    .lock()
+                    .expect("running lock")
+                    .push(document.front.get("running").unwrap_or("none").to_owned());
+            }
+            Ok(StepOutcome::Done {
+                wrote: Vec::new(),
+                text: "done".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_cleanup_step_removes_merged_worktrees_and_branches() {
+        let dir = TempDir::new();
+        let root = repository(&dir);
+        let issue = root.join(".scratch/demo");
+        fs::create_dir_all(issue.join("issues")).expect("issue folder");
+        for (number, title) in [(1, "First task"), (2, "Second task")] {
+            fs::write(
+                issue.join(format!("issues/{number:02}-task.md")),
+                task_text(number, title, "resolved"),
+            )
+            .expect("task file");
+        }
+        fs::write(crate::layout::pinned_workflow(&issue), CLEANUP_WORKFLOW).expect("workflow");
+        run_git(&root, &["add", "-A"]);
+        run_git(&root, &["commit", "--quiet", "-m", "issue"]);
+
+        let repo = Repo::open(&root).expect("repo opens");
+        let opened = Issue::open(&issue).expect("issue opens");
+        let mut worktrees = Vec::new();
+        for task in opened.tasks() {
+            let worktree = TaskWorktree::create(&repo, task).expect("worktree created");
+            let name = format!("{}.txt", task.number);
+            fs::write(worktree.path.join(&name), "work\n").expect("work file");
+            run_git(&worktree.path, &["add", name.as_str()]);
+            run_git(&worktree.path, &["commit", "--quiet", "-m", "task work"]);
+            // A resolved task's branch is already on `main`, which is what lets
+            // the cleanup delete it with `-d` instead of forcing it.
+            run_git(
+                &root,
+                &[
+                    "merge",
+                    "--no-ff",
+                    "--quiet",
+                    "-m",
+                    "land",
+                    worktree.branch.as_str(),
+                ],
+            );
+            worktrees.push(worktree);
+        }
+
+        let workflow = Workflow::parse(CLEANUP_WORKFLOW).expect("workflow parses");
+        let mut config = RunnerConfig::new(&issue, workflow, FakeHarness::new());
+        config.workdir = root.clone();
+        config.repo = Some(repo);
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+
+        for worktree in &worktrees {
+            assert!(
+                !worktree.path.exists(),
+                "{} is gone",
+                worktree.path.display()
+            );
+            let listed = run_git(&root, &["branch", "--list", worktree.branch.as_str()]);
+            assert!(
+                listed.trim().is_empty(),
+                "the merged branch `{}` is deleted",
+                worktree.branch
+            );
+        }
+        let document = run_md(&issue);
+        assert!(
+            document.body.contains("| cleanup | - | 1 | done |"),
+            "{}",
+            document.body
+        );
+    }
+
+    #[test]
+    fn a_conflict_runs_the_conflict_step_between_two_attempts() {
+        let dir = TempDir::new();
+        let root = repository(&dir);
+        let issue = issue_in(&root);
+        fs::write(crate::layout::pinned_workflow(&issue), CONFLICT_WORKFLOW).expect("workflow");
+        run_git(&root, &["add", "-A"]);
+        run_git(&root, &["commit", "--quiet", "-m", "workflow"]);
+
+        let repo = Repo::open(&root).expect("repo opens");
+        let opened = Issue::open(&issue).expect("issue opens");
+        let worktree =
+            TaskWorktree::create(&repo, opened.task(1).expect("task 1")).expect("worktree");
+        fs::write(worktree.path.join("shared.txt"), "task\n").expect("task side");
+        run_git(&worktree.path, &["add", "shared.txt"]);
+        run_git(&worktree.path, &["commit", "--quiet", "-m", "task side"]);
+        fs::write(root.join("shared.txt"), "main\n").expect("main side");
+        run_git(&root, &["add", "shared.txt"]);
+        run_git(&root, &["commit", "--quiet", "-m", "main side"]);
+
+        let harness = ConflictHarness {
+            issue: issue.clone(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            running: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let workflow = Workflow::parse(CONFLICT_WORKFLOW).expect("workflow parses");
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.workdir = root.clone();
+        config.repo = Some(repo);
+        config.max_attempts = 2;
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Blocked);
+        assert_eq!(
+            *runner.harness().calls.lock().expect("calls lock"),
+            vec!["code", "resolve-conflict"],
+            "the conflict step runs once, between the two merge attempts"
+        );
+        assert_eq!(
+            *runner.harness().running.lock().expect("running lock"),
+            vec!["merge@01, resolve-conflict@01".to_owned()],
+            "the merge's turn names both steps while its resolver works"
+        );
+        let document = run_md(&issue);
+        for row in [
+            "| merge | 01 | 1 | conflicted |",
+            "| resolve-conflict | 01 | 1 | done |",
+            "| merge | 01 | 2 | conflicted |",
+        ] {
+            assert!(
+                document.body.contains(row),
+                "{row} missing:\n{}",
+                document.body
+            );
+        }
     }
 
     #[test]

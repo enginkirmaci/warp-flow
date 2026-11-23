@@ -864,12 +864,16 @@ impl FlowApp {
                             .text_color(theme::text_muted())
                             .child(if step.kind == Some(StepKind::Merge) {
                                 "the merge queue".to_owned()
+                            } else if step.kind == Some(StepKind::Cleanup) {
+                                "the run's cleanup".to_owned()
                             } else {
                                 kind.to_owned()
                             }),
                     )
                     .when(
-                        !detail.is_empty() && step.kind != Some(StepKind::Merge),
+                        !detail.is_empty()
+                            && step.kind != Some(StepKind::Merge)
+                            && step.kind != Some(StepKind::Cleanup),
                         |row| {
                             row.child(
                                 div()
@@ -2219,6 +2223,7 @@ fn kind_icon(kind: Option<StepKind>) -> &'static str {
         Some(StepKind::Gate) => "icons/icon-gate.svg",
         Some(StepKind::Question) => "icons/icon-help.svg",
         Some(StepKind::Merge) => "icons/icon-merge.svg",
+        Some(StepKind::Cleanup) => "icons/icon-trash.svg",
         None => "icons/icon-flow.svg",
     }
 }
@@ -2229,6 +2234,7 @@ fn kind_word(kind: Option<StepKind>) -> &'static str {
         Some(StepKind::Gate) => "gate",
         Some(StepKind::Question) => "question",
         Some(StepKind::Merge) => "merge",
+        Some(StepKind::Cleanup) => "cleanup",
         None => "step",
     }
 }

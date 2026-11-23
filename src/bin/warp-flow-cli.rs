@@ -313,6 +313,7 @@ fn kind_name(kind: StepKind) -> &'static str {
         StepKind::Gate => "gate",
         StepKind::Merge => "merge",
         StepKind::Question => "question",
+        StepKind::Cleanup => "cleanup",
     }
 }
 

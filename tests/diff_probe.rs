@@ -280,13 +280,13 @@ fn the_keyboard_switches_tasks_and_reloads_the_panel(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::gpui::test]
-fn a_run_without_tasks_says_the_split_step_writes_them(cx: &mut TestAppContext) {
+fn a_run_without_tasks_says_the_analyze_step_writes_them(cx: &mut TestAppContext) {
     let _guard = hold_home();
     let home = scratch_home("no-tasks");
     cx.update(gpui_kit::init);
     cx.update(theme::apply_kit_theme);
     let repo = seed_repo(&home);
-    // A run the scan still finds, before its split step wrote `issues/`.
+    // A run the scan still finds, before its analyze step wrote `issues/`.
     fs::remove_dir_all(repo.join(".scratch/demo/issues")).expect("drop the task folder");
 
     let (_screen, cx) = open_screen(cx, screen_run(&repo));

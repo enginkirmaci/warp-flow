@@ -127,6 +127,39 @@ skill = "code"
 depends_on = ["first"]
 "#;
 
+/// A merge that names no conflict step yet, the harness step that could resolve
+/// one, and the run's cleanup: the merge form's field, and a kind whose shape
+/// the schema refuses to carry fields.
+const CONFLICT: &str = r#"
+schema = 2
+name = "conflict"
+revision = 2
+max_parallel = 2
+
+[[step]]
+id = "merge"
+kind = "merge"
+per_task = true
+mode = "local"
+push = false
+
+[[step]]
+id = "resolver"
+kind = "harness"
+skill = "merge-conflict"
+per_task = true
+harness = "dsh"
+model = "deepseek/v4"
+effort = "max"
+depends_on = ["merge"]
+
+[[step]]
+id = "cleanup"
+kind = "cleanup"
+per_task = false
+depends_on = ["merge"]
+"#;
+
 /// A straight pipeline: each step waits for the one before it, nothing forks.
 /// The list is a chain, and the whole of it must be drawn flat.
 const CHAIN: &str = r#"
@@ -514,7 +547,7 @@ fn a_run_with_no_workflow_starts_from_the_shipped_shape(cx: &mut TestAppContext)
         .read_with(cx, |host, cx| host.0.read(cx).graph_for_probe().cloned())
         .expect("the window is open")
         .expect("a graph is offered");
-    assert_eq!(graph.steps.len(), 11, "the known pipeline, not one step");
+    assert_eq!(graph.steps.len(), 12, "the known pipeline, not one step");
     assert_eq!(graph.steps[0].id, "analyze");
     assert!(
         graph.steps.iter().all(|step| !step.enabled),
@@ -529,7 +562,7 @@ fn a_run_with_no_workflow_starts_from_the_shipped_shape(cx: &mut TestAppContext)
         .expect("the editor created the file");
     assert_eq!(
         on_disk.steps.len(),
-        12,
+        13,
         "the default document, plus the step the editor added"
     );
     assert_eq!(on_disk.revision, 2, "a fresh graph starts at revision 1");
@@ -901,6 +934,103 @@ fn a_rework_budget_follows_its_target(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("flow-field-rework-max").is_none(),
         "and the field is off again"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A merge names the step that resolves its conflict (ADR-0020), and a cleanup
+/// is the engine's own housekeeping (ADR-0021): the form shows the conflict
+/// field on the merge and nowhere else, typing it writes the graph and the
+/// file, and switching a step to cleanup takes its fields with the kind.
+#[gpui_kit::gpui::test]
+fn a_merge_names_its_conflict_step_and_a_cleanup_carries_nothing(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("conflict-cleanup");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let (repo, _issue) = seed_repo(&home, Some(CONFLICT));
+
+    let handle = open_template(cx, &repo, CONFLICT);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    // Only a merge shows the field: the resolver step is a harness step and
+    // has no conflict of its own to name.
+    select(&handle, cx, 0);
+    assert!(
+        cx.debug_bounds("flow-field-on-conflict").is_some(),
+        "the merge form names the step that resolves its conflict"
+    );
+    select(&handle, cx, 1);
+    assert!(
+        cx.debug_bounds("flow-field-on-conflict").is_none(),
+        "a harness step has no conflict step to name"
+    );
+
+    // Typing the name writes the graph and the file: it is the merge's field,
+    // not a note beside it.
+    select(&handle, cx, 0);
+    set_field(cx, "flow-field-on-conflict", "resolver");
+    assert_eq!(
+        graph_of(&handle, cx).steps[0].on_conflict.as_deref(),
+        Some("resolver")
+    );
+    assert!(
+        cx.debug_bounds("flow-workflow-dirty").is_some(),
+        "naming the conflict step is an unsaved change"
+    );
+    click(cx, "flow-workflow-save");
+    let saved = Workflow::read(warp_flow_core::layout::workflow_file(&repo))
+        .expect("the template was written");
+    assert_eq!(
+        saved.steps[0].on_conflict.as_deref(),
+        Some("resolver"),
+        "the field round-trips through the file"
+    );
+
+    // The kind chooser offers cleanup, and a cleanup step carries nothing for
+    // a session or a command: the engine does the housekeeping itself.
+    select(&handle, cx, 1);
+    assert!(
+        cx.debug_bounds("flow-step-kind-cleanup").is_some(),
+        "the chooser offers the cleanup kind"
+    );
+    click(cx, "flow-step-kind-cleanup");
+    let graph = graph_of(&handle, cx);
+    assert_eq!(graph.steps[1].kind, StepKind::Cleanup);
+    assert!(
+        !graph.steps[1].per_task,
+        "a run cleans up once, not per task"
+    );
+    for (field, carried) in [
+        ("command", graph.steps[1].command.is_some()),
+        ("skill", graph.steps[1].skill.is_some()),
+        ("harness", graph.steps[1].harness.is_some()),
+        ("model", graph.steps[1].model.is_some()),
+        ("effort", graph.steps[1].effort.is_some()),
+        ("mode", graph.steps[1].mode.is_some()),
+        ("push", graph.steps[1].push),
+        ("produces", graph.steps[1].produces.is_some()),
+        ("rework_to", graph.steps[1].rework_to.is_some()),
+        ("rework_max", graph.steps[1].rework_max.is_some()),
+        ("on_conflict", graph.steps[1].on_conflict.is_some()),
+    ] {
+        assert!(!carried, "a cleanup step carries no {field}");
+    }
+
+    // A merge's own policy and conflict step go with its kind too.
+    select(&handle, cx, 0);
+    click(cx, "flow-step-kind-cleanup");
+    let graph = graph_of(&handle, cx);
+    assert_eq!(graph.steps[0].kind, StepKind::Cleanup);
+    assert!(!graph.steps[0].per_task);
+    assert_eq!(graph.steps[0].mode, None, "a merge policy is the merge's");
+    assert!(!graph.steps[0].push);
+    assert_eq!(graph.steps[0].on_conflict, None);
+    assert!(
+        cx.debug_bounds("flow-field-on-conflict").is_none(),
+        "the form stops offering the merge's field"
     );
 
     let _ = std::fs::remove_dir_all(&home);
@@ -1325,7 +1455,6 @@ fn the_default_document_has_every_step_disabled(cx: &mut TestAppContext) {
             .collect::<Vec<_>>(),
         vec![
             "analyze",
-            "split",
             "approve-plan",
             "code",
             "review",
@@ -1334,7 +1463,9 @@ fn the_default_document_has_every_step_disabled(cx: &mut TestAppContext) {
             "test",
             "bump",
             "merge",
+            "resolve-conflict",
             "summary",
+            "cleanup",
         ],
         "the default document is the known pipeline"
     );
@@ -1392,6 +1523,34 @@ fn the_default_document_has_every_step_disabled(cx: &mut TestAppContext) {
     assert_eq!(merge.mode.as_deref(), Some("local"));
     assert!(merge.per_task);
     assert!(!merge.push);
+    // A merge may name its conflict step (ADR-0020), but the menu's names none:
+    // a named step must be enabled, and this document arrives with every step
+    // off, so naming it here would be a graph Save refuses. The step is
+    // offered, and the form names it when the pair is switched on.
+    assert_eq!(merge.on_conflict, None);
+    let resolve = graph
+        .step("resolve-conflict")
+        .expect("the conflict step is offered");
+    assert_eq!(resolve.kind, StepKind::Harness);
+    assert_eq!(resolve.skill.as_deref(), Some("merge-conflict"));
+    assert!(resolve.per_task, "a conflict belongs to one task's branch");
+    assert_eq!(
+        resolve.depends_on,
+        Some(vec!["merge".to_owned()]),
+        "the conflict step is declared under the merge it serves"
+    );
+    // The run closes with two siblings after the merge (ADR-0021): the summary
+    // writes the report and the cleanup removes what the queue left behind.
+    let summary = graph.step("summary").expect("the summary step");
+    assert_eq!(summary.depends_on, Some(vec!["merge".to_owned()]));
+    let cleanup = graph.step("cleanup").expect("the cleanup step");
+    assert_eq!(cleanup.kind, StepKind::Cleanup);
+    assert!(!cleanup.per_task, "one cleanup belongs to the run");
+    assert_eq!(cleanup.depends_on, Some(vec!["merge".to_owned()]));
+    assert!(
+        cleanup.command.is_none() && cleanup.skill.is_none(),
+        "the cleanup is engine work, not a command or a session"
+    );
     // a harness step never names a skill this build does not ship
     for step in graph
         .steps
@@ -1411,14 +1570,16 @@ fn the_default_document_has_every_step_disabled(cx: &mut TestAppContext) {
     // the list draws the whole graph, and it is still the graph while every
     // step is off: the shape belongs to the graph, not to today's run
     assert!(
-        cx.debug_bounds("flow-workflow-step-10").is_some(),
-        "eleven rows"
+        cx.debug_bounds("flow-workflow-step-11").is_some(),
+        "twelve rows"
     );
-    assert!(cx.debug_bounds("flow-workflow-step-11").is_none());
+    assert!(cx.debug_bounds("flow-workflow-step-12").is_none());
     // The shipped document is a pipeline with one fork: `fmt` and `clippy`
     // leave `review` together, `test` follows `clippy`, and `bump` joins them.
     // So the trunk is flat, the two branches sit one level in, and the join
-    // comes back out — the level rule, on the document a new repository gets.
+    // comes back out. The merge then fans out to its resolver, the summary and
+    // the cleanup, so those three sit one level in — the level rule, on the
+    // document a new repository gets.
     let trunk = indent_of(cx, 0);
     let index = |id: &str| {
         graph
@@ -1427,7 +1588,7 @@ fn the_default_document_has_every_step_disabled(cx: &mut TestAppContext) {
             .position(|step| step.id == id)
             .expect("the step is in the document")
     };
-    for id in ["analyze", "split", "approve-plan", "code", "review"] {
+    for id in ["analyze", "approve-plan", "code", "review"] {
         let indent = indent_of(cx, index(id));
         assert!(
             (indent - trunk).abs() < 0.5,
@@ -1446,11 +1607,23 @@ fn the_default_document_has_every_step_disabled(cx: &mut TestAppContext) {
             "`{id}` is inside the branch: {branch} vs {indent}"
         );
     }
-    for id in ["bump", "merge", "summary"] {
+    for id in ["bump", "merge"] {
         let indent = indent_of(cx, index(id));
         assert!(
             (indent - trunk).abs() < 0.5,
             "`{id}` is after the join, so it comes back out: {trunk} vs {indent}"
+        );
+    }
+    let fan = indent_of(cx, index("resolve-conflict"));
+    assert!(
+        fan > trunk + 8. && fan < trunk + 48.,
+        "the merge fans out, so its steps sit one level in: {trunk} vs {fan}"
+    );
+    for id in ["resolve-conflict", "summary", "cleanup"] {
+        let indent = indent_of(cx, index(id));
+        assert!(
+            (indent - fan).abs() < 0.5,
+            "`{id}` hangs under the merge: {fan} vs {indent}"
         );
     }
 
@@ -1477,7 +1650,6 @@ fn the_shipped_template_draws_its_fork_and_its_join(cx: &mut TestAppContext) {
     // The file's own order, which is also the row index.
     let ids = [
         "analyze",
-        "split",
         "approve-plan",
         "code",
         "review",
@@ -1486,7 +1658,9 @@ fn the_shipped_template_draws_its_fork_and_its_join(cx: &mut TestAppContext) {
         "test",
         "bump",
         "merge",
+        "resolve-conflict",
         "summary",
+        "cleanup",
     ];
     let index = |id: &str| ids.iter().position(|known| *known == id).expect(id);
 
@@ -1496,7 +1670,9 @@ fn the_shipped_template_draws_its_fork_and_its_join(cx: &mut TestAppContext) {
         ("bump", "fmt"),
         ("bump", "test"),
         ("merge", "bump"),
+        ("resolve-conflict", "merge"),
         ("summary", "merge"),
+        ("cleanup", "merge"),
         ("clippy", "fmt"),
         ("test", "clippy"),
     ] {
@@ -1510,7 +1686,7 @@ fn the_shipped_template_draws_its_fork_and_its_join(cx: &mut TestAppContext) {
 
     // The two branches are indented; the fork's own steps and the join are not.
     let root = indent_of(view, index("analyze"));
-    for id in ["analyze", "split", "approve-plan", "code", "review"] {
+    for id in ["analyze", "approve-plan", "code", "review"] {
         let indent = indent_of(view, index(id));
         assert!(
             (indent - root).abs() < 0.5,
@@ -1529,11 +1705,25 @@ fn the_shipped_template_draws_its_fork_and_its_join(cx: &mut TestAppContext) {
             "`{id}` is inside a branch, so it sits one level in: {root} vs {indent}"
         );
     }
-    for id in ["bump", "merge", "summary"] {
+    for id in ["bump", "merge"] {
         let indent = indent_of(view, index(id));
         assert!(
             (indent - root).abs() < 0.5,
             "`{id}` is after the join, so it comes back out: {root} vs {indent}"
+        );
+    }
+    // The merge fans out to its conflict step and the run's two closing steps,
+    // so they hang one level under it.
+    let fan = indent_of(view, index("resolve-conflict")) - root;
+    assert!(
+        fan > 8. && fan < 48.,
+        "the merge's steps sit one level in: {fan}"
+    );
+    for id in ["resolve-conflict", "summary", "cleanup"] {
+        let indent = indent_of(view, index(id));
+        assert!(
+            (indent - root - fan).abs() < 1.5,
+            "`{id}` hangs under the merge: {root} vs {indent}"
         );
     }
 

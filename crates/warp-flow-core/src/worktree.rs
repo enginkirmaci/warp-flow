@@ -143,6 +143,18 @@ impl TaskWorktree {
         })
     }
 
+    /// The worktree registered for `task_number`, or `None` when there is none.
+    ///
+    /// The cleanup asks this, so a resumed cleanup skips a task whose worktree
+    /// it already removed instead of failing on it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Run`] when the repository's worktrees cannot be listed.
+    pub fn find(repo: &Repo, task_number: u32) -> Result<Option<Self>> {
+        lookup(repo, task_number, None)
+    }
+
     /// Remove the worktree's folder and its registration.
     ///
     /// The branch always survives, so the task's commits stay reachable for a
@@ -160,12 +172,29 @@ impl TaskWorktree {
     }
 }
 
+/// Drop git's records of worktrees whose folders are gone.
+///
+/// # Errors
+///
+/// Returns [`Error::Run`] when git refuses the prune.
+pub fn prune(repo: &Repo) -> Result<usize> {
+    kit::prune(&repo.root).map_err(|error| kit_error("prune the worktrees", error))
+}
+
 /// The branch a task's worktree is created on.
 ///
 /// The task number is part of the text fed to the kit, so the slug starts with
 /// the two-digit number: `agent/01-fix-the-login`.
 fn branch_for(task: &Task) -> String {
     kit::branch_name(&format!("{:02} {}", task.number, task.title))
+}
+
+/// The branch a task's worktree would be created on.
+///
+/// The cleanup uses it when the worktree is already gone but the branch may
+/// still be there, so the name comes from the same rule that created it.
+pub fn branch_name(task: &Task) -> String {
+    branch_for(task)
 }
 
 /// The branch prefix every worktree of one task shares.

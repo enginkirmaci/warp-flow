@@ -1506,6 +1506,22 @@ impl DiffScreen {
             };
         };
         if !diff.exists {
+            // A merged task's branch does not outlive the run: the cleanup
+            // removes the worktree and deletes the branch (ADR-0021), so a done
+            // task reads as landed-and-cleaned rather than as never having had
+            // a branch.
+            if self
+                .selected_task()
+                .is_some_and(|task| task.status == Status::Resolved)
+            {
+                return empty_block(
+                    "icons/icon-check.svg",
+                    "This task landed",
+                    "The run's cleanup removed its worktree and deleted its branch; its commits \
+                     are on the base branch.",
+                    "flow-diff-branch-cleaned",
+                );
+            }
             return state_line("This task has no branch yet.", "flow-diff-empty-branch");
         }
         if diff.files.is_empty() {

@@ -13,8 +13,6 @@
 
 /// The document behind `skill = "analyze"`.
 const ANALYZE: &str = include_str!("../skills/analyze.md");
-/// The document behind `skill = "split"`.
-const SPLIT: &str = include_str!("../skills/split.md");
 /// The document behind `skill = "code"`.
 const CODE: &str = include_str!("../skills/code.md");
 /// The document behind `skill = "review"`.
@@ -23,9 +21,18 @@ const REVIEW: &str = include_str!("../skills/review.md");
 const BUMP: &str = include_str!("../skills/bump.md");
 /// The document behind `skill = "summary"`.
 const SUMMARY: &str = include_str!("../skills/summary.md");
+/// The document behind `skill = "merge-conflict"`.
+const MERGE_CONFLICT: &str = include_str!("../skills/merge-conflict.md");
 
 /// Every skill this build ships, in the order a workflow should offer them.
-pub const NAMES: &[&str] = &["analyze", "split", "code", "review", "bump", "summary"];
+pub const NAMES: &[&str] = &[
+    "analyze",
+    "code",
+    "review",
+    "bump",
+    "summary",
+    "merge-conflict",
+];
 
 /// The document for `name`, or `None` when this build does not ship it.
 ///
@@ -34,11 +41,11 @@ pub const NAMES: &[&str] = &["analyze", "split", "code", "review", "bump", "summ
 pub fn document(name: &str) -> Option<&'static str> {
     match name {
         "analyze" => Some(ANALYZE),
-        "split" => Some(SPLIT),
         "code" => Some(CODE),
         "review" => Some(REVIEW),
         "bump" => Some(BUMP),
         "summary" => Some(SUMMARY),
+        "merge-conflict" => Some(MERGE_CONFLICT),
         _ => None,
     }
 }
@@ -71,7 +78,11 @@ mod tests {
     #[test]
     fn a_name_that_is_not_shipped_has_no_document() {
         assert!(document("repair").is_none());
+        assert!(document("split").is_none());
         assert!(document("").is_none());
-        assert_eq!(shipped(), "analyze, split, code, review, bump, summary");
+        assert_eq!(
+            shipped(),
+            "analyze, code, review, bump, summary, merge-conflict"
+        );
     }
 }

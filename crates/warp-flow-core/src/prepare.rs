@@ -460,7 +460,7 @@ depends_on = ["check"]
             "the refusal says what is wrong: {text}"
         );
         assert!(
-            text.contains("analyze, split, code, review"),
+            text.contains("analyze, code, review, bump, summary, merge-conflict"),
             "the refusal names what is available: {text}"
         );
     }

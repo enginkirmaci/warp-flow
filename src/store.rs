@@ -1284,7 +1284,8 @@ fn lane_view(
 ) -> LaneView {
     // A resolved task has landed: its lane is done whatever an older log row
     // still says.
-    let mut state = if task.status.is_resolved() {
+    let resolved = task.status.is_resolved();
+    let mut state = if resolved {
         StepState::Done
     } else {
         step_state(
@@ -1296,9 +1297,11 @@ fn lane_view(
             run_step,
         )
     };
-    if state == StepState::Idle
-        && run_status == "running"
-        && running_names(run_step, &step.id, task.number, tasks)
+    // The record's present beats the log: while the run is running, the lane
+    // `running:` names is working whatever its last row says — a retried lane
+    // still carries the attempt that failed as its newest row. A resolved
+    // task's lane stays done: the task file is not the log.
+    if !resolved && run_status == "running" && running_names(run_step, &step.id, task.number, tasks)
     {
         state = StepState::Running;
     }
@@ -1309,8 +1312,10 @@ fn lane_view(
     }
 }
 
-/// A step row's state. The log wins; a question is waiting only while its file
-/// is open; the step `run.md` names is running while the status says so.
+/// A step row's state. While the run is running, the step `run.md` names is
+/// running whatever the log's last row says; a stopped run keeps that row, so
+/// it still shows the failure. A question is waiting only while its file is
+/// open.
 fn step_state(
     step: &Step,
     task: Option<u32>,
@@ -1320,6 +1325,12 @@ fn step_state(
     run_step: &str,
 ) -> StepState {
     let open = question_open(step, task, questions);
+    // The record's present beats the log, so it is read before the rows: a
+    // retried step's newest row is still the attempt that failed. A lane's
+    // task suffix is read by `running_names`, in `lane_view`.
+    if task.is_none() && run_status == "running" && running_has(run_step, &step.id) {
+        return StepState::Running;
+    }
     if let Some(row) = latest_row(rows, &step.id, task) {
         if row.outcome == "waiting" {
             return if open || step.kind != StepKind::Question {
@@ -1336,9 +1347,6 @@ fn step_state(
     }
     if open {
         return StepState::Waiting;
-    }
-    if task.is_none() && run_status == "running" && running_has(run_step, &step.id) {
-        return StepState::Running;
     }
     StepState::Idle
 }
@@ -1468,6 +1476,9 @@ fn step_detail(step: &Step) -> String {
     }
     if step.kind == StepKind::Merge {
         parts.push("merge queue".to_owned());
+    }
+    if step.kind == StepKind::Cleanup {
+        parts.push("cleanup".to_owned());
     }
     parts.join(" · ")
 }
@@ -1972,13 +1983,13 @@ depends_on = []
         );
     }
 
-    #[test]
-    fn the_step_run_md_names_is_the_running_one() {
-        let step = Step {
-            id: "split".to_owned(),
+    /// A non-`per_task` harness step, for the single-step tests.
+    fn harness_step(id: &str) -> Step {
+        Step {
+            id: id.to_owned(),
             kind: StepKind::Harness,
             enabled: true,
-            skill: Some("split".to_owned()),
+            skill: Some(id.to_owned()),
             harness: None,
             model: None,
             effort: None,
@@ -1992,18 +2003,92 @@ depends_on = []
             per_task: false,
             mode: None,
             push: false,
-        };
-        let rows = vec![row("analyze", "-", 1, "done")];
+            on_conflict: None,
+        }
+    }
+
+    #[test]
+    fn the_step_run_md_names_is_the_running_one() {
+        let step = harness_step("analyze");
+        let rows = vec![row("code", "-", 1, "done")];
 
         assert_eq!(
-            step_state(&step, None, &rows, &[], "running", "split"),
+            step_state(&step, None, &rows, &[], "running", "analyze"),
             StepState::Running,
             "a run mid-step names that step while its session works"
         );
         assert_eq!(
-            step_state(&step, None, &rows, &[], "blocked", "split"),
+            step_state(&step, None, &rows, &[], "blocked", "analyze"),
             StepState::Idle,
             "a stopped run shows no step as running"
+        );
+    }
+
+    /// The log a resumed run leaves behind: three blocked attempts, and then
+    /// `run.md` says `status: running` and `running: analyze`.
+    fn blocked_analyze_rows() -> Vec<RunRow> {
+        vec![
+            row("analyze", "-", 1, "blocked"),
+            row("analyze", "-", 2, "blocked"),
+            row("analyze", "-", 3, "blocked"),
+        ]
+    }
+
+    /// The record's present beats the log: a resumed run names the step it is
+    /// working on, so that step is running even though its newest row is the
+    /// attempt the retry replaced.
+    #[test]
+    fn a_retried_step_is_running_while_the_record_names_it() {
+        let step = harness_step("analyze");
+        assert_eq!(
+            step_state(
+                &step,
+                None,
+                &blocked_analyze_rows(),
+                &[],
+                "running",
+                "analyze"
+            ),
+            StepState::Running,
+            "the record says analyze is working, whatever the log's last row says"
+        );
+    }
+
+    /// The same record once the run stops: the log's last row is the state
+    /// again, so the blocked attempt is what the band shows.
+    #[test]
+    fn a_stopped_run_still_shows_the_failure() {
+        let step = harness_step("analyze");
+        assert_eq!(
+            step_state(
+                &step,
+                None,
+                &blocked_analyze_rows(),
+                &[],
+                "blocked",
+                "analyze"
+            ),
+            StepState::Failed,
+            "a stopped run keeps the log's last row"
+        );
+    }
+
+    /// The rule reaches a lane too: `running:` names `code@01`, so task 01's
+    /// lane is running even though its newest row is a failed attempt.
+    #[test]
+    fn a_retried_lane_is_running_while_the_record_names_it() {
+        let step = per_task_step("code");
+        let tasks = vec![task(1, &[]), task(2, &[])];
+        let rows = vec![row("code", "01", 1, "failed")];
+        assert_eq!(
+            lane_view(&step, &tasks[0], &tasks, &rows, &[], "running", "code@01").state,
+            StepState::Running,
+            "the record says task 01 is working, whatever its last row says"
+        );
+        assert_eq!(
+            lane_view(&step, &tasks[0], &tasks, &rows, &[], "blocked", "code@01").state,
+            StepState::Failed,
+            "a stopped run keeps the lane's failed row"
         );
     }
 
@@ -2027,6 +2112,7 @@ depends_on = []
             per_task: true,
             mode: None,
             push: false,
+            on_conflict: None,
         }
     }
 

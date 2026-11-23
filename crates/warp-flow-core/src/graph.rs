@@ -56,6 +56,11 @@ pub enum StepKind {
     Merge,
     /// The run pauses on a question for a person.
     Question,
+    /// The run's closing housekeeping step (ADR-0021).
+    ///
+    /// It is not per task and carries no command, skill or session: the engine
+    /// removes the worktrees and branches the run's own queue left behind.
+    Cleanup,
 }
 
 /// One node of a workflow graph.
@@ -143,6 +148,14 @@ pub struct Step {
     /// Whether a merge step may push. Unset means it may not.
     #[serde(default)]
     pub push: bool,
+    /// The per-task harness step that resolves a merge's conflict, if any.
+    ///
+    /// A merge step may name the step that resolves its conflict (ADR-0020).
+    /// The named step is never an ordinary candidate: it runs inside the
+    /// merge's turn, and [`Workflow::validate`] holds it to the shape that
+    /// makes that safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_conflict: Option<String>,
 }
 
 /// The default for a field that is on unless the file says otherwise.
@@ -338,11 +351,13 @@ impl Workflow {
     ///   non-empty and unique, every `depends_on` names a real step, a merge
     ///   step is per task and carries no skill or command, a step that is not a
     ///   gate step carries no command, a step that is not a harness step names
-    ///   no harness, model or effort, a merge policy lives on a merge step, and
-    ///   there is no cycle. The graph's shape does not depend on which steps are
-    ///   switched on: a step that is off today is one a person may switch on
-    ///   tomorrow, and a graph that only validates while half of it is disabled
-    ///   is a trap.
+    ///   no harness, model or effort, a merge policy lives on a merge step, a
+    ///   cleanup step is not per task and carries nothing to run, the step a
+    ///   merge names as its conflict step has the shape ADR-0020 requires and is
+    ///   named by no other merge, and there is no cycle. The graph's shape does
+    ///   not depend on which steps are switched on: a step that is off today is
+    ///   one a person may switch on tomorrow, and a graph that only validates
+    ///   while half of it is disabled is a trap.
     /// - **Content**, applied to enabled steps only: a gate step has a command,
     ///   a harness step has a skill, and an `effort` names a `model`. A step
     ///   that will not run should not refuse the run, so a half-written gate
@@ -375,6 +390,38 @@ impl Workflow {
         }
 
         for step in &self.steps {
+            if step.kind == StepKind::Cleanup {
+                // A cleanup is engine work at the run's close (ADR-0021): it
+                // runs once over the tasks the run resolved, so it is not per
+                // task and declares nothing for a session or a command to do.
+                if step.per_task {
+                    return Err(Error::Workflow(format!(
+                        "cleanup step `{}` must not be per_task; a run cleans up once, after \
+                         every task",
+                        step.id
+                    )));
+                }
+                let carried = [
+                    ("command", step.command.is_some()),
+                    ("skill", step.skill.is_some()),
+                    ("harness", step.harness.is_some()),
+                    ("model", step.model.is_some()),
+                    ("effort", step.effort.is_some()),
+                    ("mode", step.mode.is_some()),
+                    ("push", step.push),
+                    ("produces", step.produces.is_some()),
+                    ("rework_to", step.rework_to.is_some()),
+                    ("rework_max", step.rework_max.is_some()),
+                    ("on_conflict", step.on_conflict.is_some()),
+                ];
+                if let Some((field, _)) = carried.iter().find(|(_, carried)| *carried) {
+                    return Err(Error::Workflow(format!(
+                        "cleanup step `{}` carries `{field}`; a cleanup step is the engine's own \
+                         housekeeping and declares nothing to run",
+                        step.id
+                    )));
+                }
+            }
             if step.kind != StepKind::Gate && step.command.is_some() {
                 return Err(Error::Workflow(format!(
                     "step `{}` carries a command but is not a gate step",
@@ -436,6 +483,108 @@ impl Workflow {
         }
 
         self.check_acyclic()?;
+
+        // A merge may name the step that resolves its conflict (ADR-0020). The
+        // named step never gets an ordinary job, so the graph must leave the
+        // scheduler nothing to give it: it is declared after the merge and no
+        // step the merge waits for. The target is checked here rather than in
+        // the structural loop because both its own shape and the merge's place
+        // are needed, and a step may be named by at most one merge.
+        let mut conflict_named_by: BTreeMap<&str, &str> = BTreeMap::new();
+        for step in &self.steps {
+            let Some(target) = step.on_conflict.as_deref() else {
+                continue;
+            };
+            if step.kind != StepKind::Merge {
+                return Err(Error::Workflow(format!(
+                    "step `{}` names a conflict step but is not a merge step; only a merge has \
+                     conflicts to resolve",
+                    step.id
+                )));
+            }
+            let Some((target_index, target_step)) = self
+                .steps
+                .iter()
+                .enumerate()
+                .find(|(_, candidate)| candidate.id == target)
+            else {
+                return Err(Error::Workflow(format!(
+                    "merge step `{}` names conflict step `{target}`, which is not in the graph",
+                    step.id
+                )));
+            };
+            if target_step.id == step.id {
+                return Err(Error::Workflow(format!(
+                    "merge step `{}` names itself as its conflict step",
+                    step.id
+                )));
+            }
+            if !target_step.enabled {
+                return Err(Error::Workflow(format!(
+                    "merge step `{}` names conflict step `{target}`, which is disabled; the \
+                     step that resolves a conflict must be enabled",
+                    step.id
+                )));
+            }
+            if !target_step.per_task {
+                return Err(Error::Workflow(format!(
+                    "conflict step `{target}` must be per_task, because a conflict is resolved \
+                     for one task"
+                )));
+            }
+            if target_step.kind != StepKind::Harness {
+                return Err(Error::Workflow(format!(
+                    "conflict step `{target}` must be a harness step, because the conflict is \
+                     resolved in a session"
+                )));
+            }
+            if !step.enabled {
+                return Err(Error::Workflow(format!(
+                    "conflict step `{target}` is enabled but merge step `{}` is disabled; \
+                     enabling the conflict step alone would run it as an ordinary step",
+                    step.id
+                )));
+            }
+            let merge_index = self
+                .steps
+                .iter()
+                .position(|candidate| candidate.id == step.id)
+                .unwrap_or(self.steps.len());
+            if target_index <= merge_index {
+                return Err(Error::Workflow(format!(
+                    "conflict step `{target}` must be declared after merge step `{}`, so the \
+                     scheduler has no task to give it",
+                    step.id
+                )));
+            }
+            if !self
+                .dependencies(target_step)
+                .iter()
+                .any(|dependency| dependency == &step.id)
+            {
+                return Err(Error::Workflow(format!(
+                    "conflict step `{target}` must wait for merge step `{}`; otherwise the \
+                     scheduler would give it ordinary work",
+                    step.id
+                )));
+            }
+            let mut ancestors = BTreeSet::new();
+            self.ancestors_into(step, &mut ancestors);
+            if ancestors.contains(target) {
+                return Err(Error::Workflow(format!(
+                    "merge step `{}` names conflict step `{target}`, which is a step it waits \
+                     for; the conflict step runs inside the merge's turn",
+                    step.id
+                )));
+            }
+            if let Some(first) = conflict_named_by.insert(target, &step.id) {
+                return Err(Error::Workflow(format!(
+                    "conflict step `{target}` is named by merge steps `{first}` and `{}`; a \
+                     step resolves one merge's conflicts",
+                    step.id
+                )));
+            }
+        }
 
         // A rework edge is not a dependency, so `check_acyclic` cannot see it.
         // Everything it could get wrong is caught here instead.
@@ -879,6 +1028,7 @@ mod tests {
             per_task: false,
             mode: None,
             push: false,
+            on_conflict: None,
         }
     }
 
@@ -1710,5 +1860,55 @@ depends-on = ["b"]
         graph.steps[2].produces = Some("review.md".to_owned());
         graph.steps[2].rework_to = Some("analyze".to_owned());
         graph.validate().expect("an earlier step is upstream");
+    }
+
+    /// A merge and the step it names: the shape ADR-0020 asks for.
+    fn merge_with_conflict_step(conflict: Step) -> Workflow {
+        let mut graph = workflow(vec![
+            linked("code", StepKind::Harness),
+            linked("merge", StepKind::Merge),
+            conflict,
+        ]);
+        graph.steps[1].per_task = true;
+        graph.steps[1].on_conflict = Some("resolve".to_owned());
+        graph
+    }
+
+    #[test]
+    fn a_merge_may_name_the_step_that_resolves_its_conflict() {
+        let mut conflict = linked("resolve", StepKind::Harness);
+        conflict.per_task = true;
+        merge_with_conflict_step(conflict)
+            .validate()
+            .expect("the conflict step has the shape ADR-0020 asks for");
+    }
+
+    #[test]
+    fn a_conflict_step_must_wait_for_its_merge() {
+        // A root conflict step would be an ordinary candidate for every ready
+        // task, which is the one thing its declaration must prevent.
+        let mut conflict = step("resolve", StepKind::Harness, &[]);
+        conflict.per_task = true;
+        let error = merge_with_conflict_step(conflict)
+            .validate()
+            .expect_err("a conflict step that does not wait for the merge gets ordinary work");
+        assert!(
+            error.to_string().contains("must wait for merge step"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_enabled_conflict_step_needs_its_merge_enabled() {
+        // With the merge off, `resolve` would inherit the merge's own
+        // dependencies and run as an ordinary per-task step.
+        let mut conflict = linked("resolve", StepKind::Harness);
+        conflict.per_task = true;
+        let mut graph = merge_with_conflict_step(conflict);
+        graph.steps[1].enabled = false;
+        let error = graph
+            .validate()
+            .expect_err("an enabled resolver beside a disabled merge runs alone");
+        assert!(error.to_string().contains("is disabled"), "{error}");
     }
 }
