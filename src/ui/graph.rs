@@ -443,6 +443,14 @@ pub fn layout_at(workflow: &Workflow, metrics: Metrics) -> Layout {
     //    scheduler still waits on everything `dependencies()` returns.
     let mut ancestor_memo: Vec<Option<BTreeSet<usize>>> = vec![None; count];
     let mut links: Vec<Link> = Vec::new();
+    // `placed` is in rank order, so a step's declaration index is not its
+    // position in it. A workflow may declare a step before the step it waits
+    // for, and reading `placed[index]` as if it were would draw that
+    // dependency backwards.
+    let mut slot_of: Vec<usize> = vec![0; count];
+    for (position, node) in placed.iter().enumerate() {
+        slot_of[node.index] = position;
+    }
     for (index, step) in workflow.steps.iter().enumerate() {
         let implied: BTreeSet<usize> = parents(index)
             .iter()
@@ -460,16 +468,19 @@ pub fn layout_at(workflow: &Workflow, metrics: Metrics) -> Layout {
             let Some(target) = layout_index(&placed, &dependency) else {
                 continue;
             };
-            if target == index || implied.contains(&target) {
+            // `target` is a position in `placed`; `index` and everything the
+            // ancestor sets hold are declaration indices.
+            let declared = placed[target].index;
+            if declared == index || implied.contains(&declared) {
                 continue;
             }
-            let back = placed[target].y >= placed[index].y;
+            let back = placed[target].y >= placed[slot_of[index]].y;
             // A dependency that skips a rank jumps over the boxes between the
             // two edges; the file says the step waits for that one, so the line
             // has to go around them rather than through them.
-            let long = !back && rank[index] > rank[placed[target].index] + 1;
+            let long = !back && rank[index] > rank[declared] + 1;
             links.push(Link {
-                from: index,
+                from: slot_of[index],
                 to: target,
                 trigger: None,
                 back,
@@ -483,7 +494,7 @@ pub fn layout_at(workflow: &Workflow, metrics: Metrics) -> Layout {
                 continue;
             };
             links.push(Link {
-                from: index,
+                from: slot_of[index],
                 to: target,
                 trigger: Some(edge.when),
                 // A back-edge is drawn as a loop even when its target happens
@@ -1511,6 +1522,48 @@ depends_on = ["deep"]
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_dependency_declared_earlier_is_still_drawn_forwards() {
+        // A step may be declared before the step it waits for. `placed` is in
+        // rank order, so reading it by declaration index would draw this
+        // dependency as a return.
+        let workflow = graph(
+            r#"
+schema = 3
+name = "out-of-order"
+revision = 1
+
+[[step]]
+id = "child"
+kind = "harness"
+skill = "code"
+depends_on = ["root"]
+
+[[step]]
+id = "root"
+kind = "harness"
+skill = "analyze"
+depends_on = []
+"#,
+        );
+        let layout = layout(&workflow);
+        let link = layout
+            .links
+            .iter()
+            .find(|link| {
+                layout.nodes[link.from].id == "child" && layout.nodes[link.to].id == "root"
+            })
+            .expect("child waits for root");
+        assert!(
+            !link.back,
+            "a dependency is drawn forwards however the file orders the two steps"
+        );
+        assert!(
+            layout.nodes[link.from].y > layout.nodes[link.to].y,
+            "and the step that waits sits below the one it waits for"
+        );
     }
 
     #[test]
