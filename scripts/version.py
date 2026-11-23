@@ -30,7 +30,11 @@ ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = ROOT / "version.toml"
 LOCK_FILE = ROOT / "Cargo.lock"
 HOOKS_DIR = ".githooks"
-SKIP_DIRS = {".git", "target", "out", "dist", ".build"}
+# `.worktrees` holds a run's per-task checkouts: each is a full copy of this
+# repository with its own manifests, and git excludes them, so treating one as
+# a manifest of *this* checkout bumps a version into a tree the engine needs
+# clean and then fails to stage a path git refuses to add.
+SKIP_DIRS = {".git", "target", "out", "dist", ".build", ".worktrees"}
 
 SEMVER = re.compile(
     r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"

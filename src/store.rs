@@ -1287,8 +1287,7 @@ fn lane_view(
     };
     if state == StepState::Idle
         && run_status == "running"
-        && running_has(run_step, &step.id)
-        && next_ready_task(tasks) == Some(task.number)
+        && running_names(run_step, &step.id, task.number, tasks)
     {
         state = StepState::Running;
     }
@@ -1343,6 +1342,25 @@ fn running_has(running: &str, step: &str) -> bool {
         .split(',')
         .map(str::trim)
         .any(|entry| entry.split('@').next() == Some(step))
+}
+
+/// Whether `running` names this task's lane of `step`: `code@02` for task 02.
+///
+/// The suffix is the record's own answer to "which task is working": two
+/// tasks' jobs of one step are two entries, and reading only the step id made
+/// every lane but the first look idle. An entry that names the step with no
+/// task at all cannot say which lane it means — a record from before the
+/// suffix existed — so it falls back to the first task that may start.
+fn running_names(running: &str, step: &str, task: u32, tasks: &[TaskRow]) -> bool {
+    let wanted = format!("{step}@{task:02}");
+    let mut bare = false;
+    for entry in running.split(',').map(str::trim) {
+        if entry == wanted {
+            return true;
+        }
+        bare |= entry == step;
+    }
+    bare && next_ready_task(tasks) == Some(task)
 }
 
 /// A `per_task` band's state: the worst lane wins, and all done is done.
@@ -1946,5 +1964,75 @@ depends_on = []
             StepState::Idle,
             "a stopped run shows no step as running"
         );
+    }
+
+    /// A `per_task` harness step, for the lane tests.
+    fn per_task_step(id: &str) -> Step {
+        Step {
+            id: id.to_owned(),
+            kind: StepKind::Harness,
+            enabled: true,
+            skill: Some(id.to_owned()),
+            harness: None,
+            model: None,
+            effort: None,
+            command: None,
+            cwd: None,
+            timeout_secs: None,
+            depends_on: Some(Vec::new()),
+            produces: None,
+            rework_to: None,
+            rework_max: None,
+            per_task: true,
+            mode: None,
+            push: false,
+        }
+    }
+
+    #[test]
+    fn every_lane_the_record_names_is_running() {
+        // Two tasks' jobs of one step are in flight at once. `run.md` names
+        // both (`code@01, code@02`), so both lanes are running — reading only
+        // the step id made every lane but the first look idle while its
+        // session worked.
+        let step = per_task_step("code");
+        let tasks = vec![task(1, &[]), task(2, &[])];
+        let lanes = |running: &str| -> Vec<StepState> {
+            tasks
+                .iter()
+                .map(|task| lane_view(&step, task, &tasks, &[], &[], "running", running).state)
+                .collect()
+        };
+
+        assert_eq!(
+            lanes("code@01, code@02"),
+            vec![StepState::Running, StepState::Running],
+            "both tasks are working, so both lanes say so"
+        );
+        assert_eq!(
+            lanes("code@02"),
+            vec![StepState::Idle, StepState::Running],
+            "the lane the record names is the one working, even when it is not the first"
+        );
+        assert_eq!(
+            lanes("code"),
+            vec![StepState::Running, StepState::Idle],
+            "a record that names the step and no task means the first task it may pick"
+        );
+    }
+
+    #[test]
+    fn a_landed_lane_is_done_while_its_sibling_still_runs() {
+        // Task 02's session finished while task 01's still works: its own row
+        // says done, and 01's lane keeps running. The two facts are read from
+        // the same record and must not contradict each other.
+        let step = per_task_step("code");
+        let tasks = vec![task(1, &[]), task(2, &[])];
+        let rows = vec![row("code", "02", 1, "done")];
+        let lanes: Vec<StepState> = tasks
+            .iter()
+            .map(|task| lane_view(&step, task, &tasks, &rows, &[], "running", "code@01").state)
+            .collect();
+        assert_eq!(lanes, vec![StepState::Running, StepState::Done]);
     }
 }

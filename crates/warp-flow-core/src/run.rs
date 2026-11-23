@@ -38,6 +38,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -599,33 +600,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
 
             if !jobs.is_empty() {
                 ran = true;
-                // Name the steps that are about to run before they start, so
-                // `run.md` says what the engine is doing while a session works
-                // — a step can run for minutes, and the record otherwise only
-                // changes when it finishes. A per-task job names its task
-                // (`code@01`): two tasks' jobs of one step sit in the same list,
-                // and a bare id would say "code, code".
-                self.current_step = Some(
-                    jobs.iter()
-                        .map(|job| {
-                            running_label(&job.step.id, job.task.as_ref().map(|task| task.number))
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
-                self.write_run()?;
-                let reports = self.dispatch(jobs)?;
-                // Every report is applied, even when an earlier one stops the
-                // run: a step that finished in the same pass still gets its
-                // row and its `mark_done`. The first stopping status is what
-                // the run returns, once nothing is left unrecorded.
-                let mut stopped = None;
-                for report in reports {
-                    if let Some(status) = self.apply_report(report)? {
-                        stopped.get_or_insert(status);
-                    }
-                }
-                if let Some(status) = stopped {
+                if let Some(status) = self.dispatch(jobs)? {
                     return Ok(status);
                 }
                 issue = Issue::open(&self.issue)?;
@@ -689,24 +664,50 @@ impl<H: Harness + Send + 'static> Runner<H> {
     }
 
     /// Run `jobs` at once, each on its own thread with its own harness, and
-    /// return their reports in the order the jobs were dispatched.
+    /// apply each report on this thread the moment its worker sends it.
     ///
     /// The worker does the session and nothing else: it writes no issue-folder
     /// file, so the scheduler stays the only writer. A harness that cannot be
     /// built or a session that fails comes back as a report, not as an error
     /// that would abandon the other steps in flight.
     ///
+    /// A report is applied when it lands, not when the slowest job of the pass
+    /// lands. Two tasks' sessions run beside each other and finish minutes
+    /// apart, so a pass that waited for both would keep `run.md` silent about
+    /// the one that is done — and keep naming it in `running:` — for as long
+    /// as its sibling worked. The row, the `mark_done` and the shortened
+    /// `running:` are what a screen reads; each must arrive with the report.
+    ///
+    /// Every report is applied even when an earlier one stops the run: a step
+    /// that finished beside the failing one still gets its row and its
+    /// `mark_done`, and the first stopping status is what comes back once every
+    /// worker has been joined.
+    ///
     /// A worker that could not be started, or one that panicked, is still an
     /// error — but only after every handle already spawned has been joined: a
     /// dropped `JoinHandle` detaches its thread, and a detached worker keeps
     /// writing into the checkout after the run has reported the failure.
-    fn dispatch(&mut self, jobs: Vec<StepJob>) -> Result<Vec<StepReport>> {
+    fn dispatch(&mut self, jobs: Vec<StepJob>) -> Result<Option<RunStatus>> {
         let factory = self.harness_factory.clone();
+        let (sender, receiver) = mpsc::channel();
+        // Name the steps that are about to run before they start, so `run.md`
+        // says what the engine is doing while a session works — a step can run
+        // for minutes, and the record otherwise only changes when it finishes.
+        // A per-task job names its task (`code@01`): two tasks' jobs of one
+        // step sit in the same list, and a bare id would say "code, code".
+        self.current_step = Some(
+            jobs.iter()
+                .map(|job| running_label(&job.step.id, job.task.as_ref().map(|task| task.number)))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        self.write_run()?;
         let mut handles = Vec::with_capacity(jobs.len());
         let mut spawn_error = None;
         for job in jobs {
             let factory = Arc::clone(&factory);
             let issue = self.issue.clone();
+            let sender = sender.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("warp-flow-step-{}", job.step.id))
                 .spawn(move || {
@@ -739,13 +740,17 @@ impl<H: Harness + Send + 'static> Runner<H> {
                             Err(error) => Err(error),
                         },
                     };
-                    StepReport {
+                    // The scheduler thread is the only writer, so a worker
+                    // hands its report over rather than recording it. A closed
+                    // channel means the scheduler has already stopped
+                    // listening and there is nobody left to tell.
+                    let _ = sender.send(StepReport {
                         step: job.step.id.clone(),
                         task: job.task.as_ref().map(|task| task.number),
                         attempt: job.attempt,
                         failure_outcome,
                         result,
-                    }
+                    });
                 });
             match spawned {
                 Ok(handle) => handles.push(handle),
@@ -755,21 +760,60 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 }
             }
         }
-        let mut reports = Vec::with_capacity(handles.len());
-        let mut panicked = false;
+        // Every worker holds a clone; dropping the scheduler's own handle is
+        // what lets `recv` see the last worker finish instead of waiting for a
+        // report no thread will send.
+        drop(sender);
+
+        let expected = handles.len();
+        let mut applied = 0;
+        let mut stopped = None;
+        let mut apply_error = None;
+        while applied < expected {
+            let Ok(report) = receiver.recv() else {
+                // A worker died without reporting: a panic, caught below when
+                // its handle is joined.
+                break;
+            };
+            applied += 1;
+            // The job leaves `running:` before its row is written, so the
+            // write that records it as done is the one that stops naming it.
+            self.clear_running(&report.step, report.task);
+            if apply_error.is_some() {
+                // Keep draining: the remaining workers still have to be joined
+                // before the error can leave this function.
+                continue;
+            }
+            match self.apply_report(report) {
+                Ok(Some(status)) => {
+                    stopped.get_or_insert(status);
+                }
+                Ok(None) => {}
+                Err(error) => apply_error = Some(error),
+            }
+        }
+        let mut panicked = applied < expected;
         for handle in handles {
-            match handle.join() {
-                Ok(report) => reports.push(report),
-                Err(_) => panicked = true,
+            if handle.join().is_err() {
+                panicked = true;
             }
         }
         if let Some(error) = spawn_error {
+            // `running:` names what is in flight. A pass that is abandoned
+            // leaves nothing there, and a record naming a dead worker outlives
+            // the run that started it.
+            self.current_step = None;
+            return Err(error);
+        }
+        if let Some(error) = apply_error {
+            self.current_step = None;
             return Err(error);
         }
         if panicked {
+            self.current_step = None;
             return Err(Error::Run("a step worker panicked".to_owned()));
         }
-        Ok(reports)
+        Ok(stopped)
     }
 
     /// Apply one worker's report on the scheduler thread.
@@ -1151,9 +1195,21 @@ impl<H: Harness + Send + 'static> Runner<H> {
         // Record which step is running before the first attempt, so the run
         // strip names it while its session works — a step can run for minutes
         // and `run.md` otherwise only changes when it finishes.
-        self.current_step = Some(step.id.clone());
+        self.current_step = Some(running_label(&step.id, task.map(|task| task.number)));
         self.write_run()?;
+        let outcome = self.run_step_inner(step, task, &label);
+        // The step has returned, whatever it said: nothing of it is in flight,
+        // and a record that kept naming it would describe a run that is not
+        // the one on disk.
+        self.clear_running(&step.id, task.map(|task| task.number));
+        if outcome.is_ok() {
+            self.write_run()?;
+        }
+        outcome
+    }
 
+    /// Run one step's attempts with `running:` already naming it.
+    fn run_step_inner(&mut self, step: &Step, task: Option<&Task>, label: &str) -> Result<StepRun> {
         match step.kind {
             StepKind::Question => {
                 // A resumed run must not ask again what a person already
@@ -1895,6 +1951,28 @@ impl<H: Harness + Send + 'static> Runner<H> {
         self.write_run()
     }
 
+    /// Drop one job from `run.md`'s `running:` list, once its report landed.
+    ///
+    /// `running:` is the record of what is *in flight*, so a job leaves it the
+    /// moment it reports — not when the last job of the pass does. A per-task
+    /// step with five tasks would otherwise keep naming four finished ones
+    /// while the fifth worked, which is the opposite of what the field means.
+    ///
+    /// The list keeps its dispatch order, so the jobs still working read in the
+    /// order they were started.
+    fn clear_running(&mut self, step: &str, task: Option<u32>) {
+        let label = running_label(step, task);
+        let Some(list) = self.current_step.clone() else {
+            return;
+        };
+        let kept: Vec<&str> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| *entry != label)
+            .collect();
+        self.current_step = (!kept.is_empty()).then(|| kept.join(", "));
+    }
+
     /// Write `run.md` from the front matter, the log table and the stop note.
     fn write_run(&self) -> Result<()> {
         let mut front = FrontMatter::new();
@@ -2280,8 +2358,8 @@ depends_on = ["analyze"]
         );
         assert_eq!(
             run_md(&issue).front.get("running"),
-            Some("split"),
-            "the finished record keeps the last step it ran"
+            None,
+            "a finished run names nothing as in flight, not the last step it ran"
         );
     }
 
@@ -3192,6 +3270,69 @@ depends_on = ["first"]
         }
     }
 
+    /// A harness whose two sessions are ordered by hand: task 02 waits until
+    /// task 01 has read the record, and task 01 then waits for task 02's row.
+    ///
+    /// The first wait is what makes the reads deterministic — 01's session is
+    /// in flight for every moment 02 is, so what 01 reads cannot be a record
+    /// that already forgot 02. The second is the property under test: a pass
+    /// that applied reports only after joining every worker would never write
+    /// 02's row while 01 still ran, so the wait would time out and there would
+    /// be no row to see.
+    #[derive(Clone)]
+    struct WatchingHarness {
+        issue: PathBuf,
+        /// Set once task 01's session has read `run.md` and is waiting.
+        started: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        /// The `running:` each session read when it was called, by task.
+        at_start: Arc<Mutex<Vec<(u32, String)>>>,
+        /// The `running:` task 01 read once task 02's row had landed.
+        after_sibling: Arc<Mutex<Option<String>>>,
+    }
+
+    impl Harness for WatchingHarness {
+        fn run(&mut self, request: &StepRequest) -> Result<StepOutcome> {
+            let task = request.task.unwrap_or_default();
+            let document = Document::read(self.issue.join("run.md"))?;
+            self.at_start.lock().expect("start lock").push((
+                task,
+                document.front.get("running").unwrap_or("none").to_owned(),
+            ));
+            if task == 2 {
+                // Let 01 reach its own read before this session reports, so
+                // both reads happen while both jobs are named.
+                let (lock, ready) = &*self.started;
+                let started = lock.lock().expect("started lock");
+                let (started, _) = ready
+                    .wait_timeout_while(started, Duration::from_secs(5), |started| !*started)
+                    .expect("started wait");
+                drop(started);
+                return Ok(StepOutcome::Done {
+                    wrote: Vec::new(),
+                    text: "done".to_owned(),
+                });
+            }
+            // Task 01: let 02 report, then look for its row while still in
+            // flight ourselves.
+            *self.started.0.lock().expect("started lock") = true;
+            self.started.1.notify_all();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                let document = Document::read(self.issue.join("run.md"))?;
+                if document.body.contains("| code | 02 | 1 | done |") {
+                    *self.after_sibling.lock().expect("sibling lock") =
+                        Some(document.front.get("running").unwrap_or("none").to_owned());
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(StepOutcome::Done {
+                wrote: Vec::new(),
+                text: "done".to_owned(),
+            })
+        }
+    }
+
     /// A repository with one issue folder and two tasks, for the overlap tests.
     ///
     /// `issue_in` already seeds task 01, so this adds 02 and commits both.
@@ -3276,6 +3417,65 @@ depends_on = ["code"]
             summary_at > last_code,
             "summary ran after the last task's code"
         );
+    }
+
+    #[test]
+    fn a_finished_task_is_recorded_while_its_sibling_still_runs() {
+        // Two tasks in flight: the one that lands first gets its row and leaves
+        // `running:` at once, without waiting for its sibling's session.
+        let dir = TempDir::new();
+        let (root, issue) = two_task_repo(&dir);
+        let workflow = workflow(
+            r#"
+schema = 2
+name = "implement"
+revision = 1
+max_parallel = 2
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+per_task = true
+"#,
+        );
+        let harness = WatchingHarness {
+            issue: issue.clone(),
+            started: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
+            at_start: Arc::new(Mutex::new(Vec::new())),
+            after_sibling: Arc::new(Mutex::new(None)),
+        };
+        let at_start = Arc::clone(&harness.at_start);
+        let after_sibling = Arc::clone(&harness.after_sibling);
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.workdir = root.clone();
+        config.repo = Some(Repo::open(&root).expect("repo opens"));
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+        let mut started = at_start.lock().expect("start lock").clone();
+        started.sort();
+        assert_eq!(
+            started,
+            vec![
+                (1, "code@01, code@02".to_owned()),
+                (2, "code@01, code@02".to_owned()),
+            ],
+            "both jobs were in flight when they started, each named with its task"
+        );
+        assert_eq!(
+            *after_sibling.lock().expect("sibling lock"),
+            Some("code@01".to_owned()),
+            "task 02's row landed while 01 still ran, and only 01 stayed in `running:`"
+        );
+        let document = run_md(&issue);
+        for row in ["| code | 01 | 1 | done |", "| code | 02 | 1 | done |"] {
+            assert!(
+                document.body.contains(row),
+                "{row} is in the record: {}",
+                document.body
+            );
+        }
     }
 
     #[test]
@@ -3973,8 +4173,8 @@ per_task = true
         );
         assert_eq!(
             run_md(&issue).front.get("running"),
-            Some("code@01"),
-            "two tasks' jobs of one step are two entries, not `code, code`"
+            None,
+            "the finished run names nothing as in flight"
         );
     }
 
