@@ -1619,3 +1619,85 @@ fn a_graph_wider_than_the_window_scrolls_sideways(cx: &mut TestAppContext) {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// The shell sizes every length through `theme::scaled`, so a larger text-size
+/// setting makes a node's label grow. The box must grow with it, and the gaps,
+/// the lane room and the picture's own size too, or the picture is a fixed
+/// drawing with bigger words clipped inside it.
+#[gpui_kit::gpui::test]
+fn the_picture_grows_with_the_text_size(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("diagram-scaled");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let (repo, _issue) = seed_repo(&home, Some(PIPELINE));
+
+    // The family's Larger step, set before the window so the first frame is
+    // drawn at it. The factor is read while it is live, then the scale goes
+    // back before an assertion can fail and leave another probe drawing at the
+    // wrong size: the factor is process-wide.
+    let before = theme::font_scale();
+    theme::set_font_scale(Some(theme::FONT_LARGER));
+    let factor = theme::scaled(1.);
+    let handle = open_template_sized(cx, &repo, PIPELINE, 2600., 1000.);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+    theme::set_font_scale(Some(before));
+
+    let graph = graph_of(&handle, cx);
+    let base = warp_flow::ui::graph::layout(&graph);
+    let design = |v: f32| v * factor;
+
+    // a node is the design's box at the live factor: the label inside it is
+    // already drawn that much bigger
+    let first = cx
+        .debug_bounds("flow-workflow-step-0")
+        .expect("the first node is drawn");
+    for (axis, drawn, sized) in [
+        (
+            "width",
+            f32::from(first.size.width),
+            warp_flow::ui::graph::NODE_W,
+        ),
+        (
+            "height",
+            f32::from(first.size.height),
+            warp_flow::ui::graph::NODE_H,
+        ),
+    ] {
+        assert!(
+            (drawn - design(sized)).abs() < 0.5,
+            "the box's {axis} grows with the label it holds: {drawn} vs {}",
+            design(sized)
+        );
+    }
+
+    // the rank gap grows with it: the second rank sits one scaled row down
+    let second = cx
+        .debug_bounds("flow-workflow-step-1")
+        .expect("the second node is drawn");
+    let row = f32::from(second.origin.y) - f32::from(first.origin.y);
+    let design_row = design(warp_flow::ui::graph::NODE_H + warp_flow::ui::graph::GAP_Y);
+    assert!(
+        (row - design_row).abs() < 0.5,
+        "a rank is the design's row at the live factor: {row} vs {design_row}"
+    );
+
+    // and the picture, the lane room beside it included, is the design's
+    // picture that much bigger
+    let diagram = cx
+        .debug_bounds("flow-workflow-diagram")
+        .expect("the picture is drawn");
+    for (axis, drawn, sized) in [
+        ("width", f32::from(diagram.size.width), base.width),
+        ("height", f32::from(diagram.size.height), base.height),
+    ] {
+        assert!(
+            (drawn - design(sized)).abs() < 1.5,
+            "the picture's {axis} is the design's, scaled: {drawn} vs {}",
+            design(sized)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&home);
+}

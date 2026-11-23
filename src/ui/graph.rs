@@ -22,6 +22,25 @@
 //! A **back-edge** is drawn as a loop on the right: out of the sender's right
 //! side, around, and into the target's right side. That is the one shape the
 //! diagram exists to show, and it is why the layout leaves room to its right.
+//! A routed link enters its target at its own height on the target's right
+//! edge, so two loops into one step are two arrivals rather than one arrowhead
+//! drawn twice.
+//!
+//! A **forward dependency that skips a rank** is routed the same way: a
+//! straight line between the two facing edges would run through every box
+//! between them. It leaves the sender's right side, runs its vertical stretch
+//! in a lane of its own just beside the boxes it skips — inside the picture
+//! when those ranks leave the room, outside it when they do not — and comes
+//! back in at the target's right side. A dependency between adjacent ranks is
+//! still the straight facing-edge line it always was.
+//!
+//! # Scale
+//!
+//! The shell measures everything through `theme::scaled`, so a larger
+//! text-size setting grows the labels inside the boxes. [`Metrics`] is every
+//! length this module draws from at one scale: [`layout`] places the picture at
+//! the design's own size, [`live_layout`] at the running one, and the layout
+//! math is the same pure function either way.
 //!
 //! # Drawing
 //!
@@ -30,7 +49,7 @@
 //! The nodes are ordinary `div`s laid over the canvas by the caller, so they
 //! keep their text, their hover, and their accessibility.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use gpui::prelude::*;
 use gpui::{
@@ -39,7 +58,8 @@ use gpui::{
 };
 use warp_flow_core::graph::{StepKind, Trigger, Workflow};
 
-/// One node's box: 168 × 48, the design's step row turned on its side.
+/// One node's box at the design's size: 168 × 48, the design's step row turned
+/// on its side. [`Metrics`] carries the size a picture is drawn at.
 pub const NODE_W: f32 = 168.;
 pub const NODE_H: f32 = 48.;
 
@@ -51,24 +71,101 @@ pub const NODE_PADDING: f32 = 10.;
 pub const GAP_X: f32 = 72.;
 pub const GAP_Y: f32 = 24.;
 
-/// Room beside the widest rank for a back-edge to loop through: at least this,
-/// and one lane step more for each loop past the first.
+/// Room beside the widest rank for the routed links' lanes: at least this, and
+/// one lane step more for each lane past the first.
 pub const LOOP_ROOM: f32 = 56.;
 
 /// The air the screen leaves around the picture: the scroller's padding.
 pub const DIAGRAM_PADDING: f32 = 14.;
 
-/// The gap between a node's right edge and the corridor a loop turns in. Less
-/// than [`GAP_X`], so the corridor always runs between two boxes, never through
-/// one.
+/// The gap between a node's right edge and the corridor a routed link turns in.
+/// Less than [`GAP_X`], so the corridor always runs between two boxes, never
+/// through one.
 const LOOP_CORRIDOR: f32 = 8.;
 
-/// The distance between two loop lanes, so two back-edges that share the
-/// picture's right side still read as two lines.
+/// The distance between two lanes, so two routed links that share the picture's
+/// right side still read as two lines. Also the widest spacing the arrivals at
+/// one node use.
 const LANE_STEP: f32 = 14.;
 
-/// The air a loop lane keeps from the widest rank and from the picture's edge.
+/// The air a lane keeps from the widest rank and from the picture's edge.
 const LANE_MARGIN: f32 = 12.;
+
+/// The painted line's width, at the design's size.
+const STROKE_WIDTH: f32 = 1.5;
+
+/// The length of each arm of an arrowhead, at the design's size.
+const ARROW_LENGTH: f32 = 9.;
+
+/// The angle between an arrowhead's arm and the line it ends: a direction, so
+/// it does not scale.
+const ARROW_SPREAD: f32 = 0.55;
+
+/// Every length the picture is drawn from, at one scale.
+///
+/// The shell sizes everything through `theme::scaled`, so a larger text-size
+/// setting makes a node's label grow; a box that stayed 168 × 48 while its
+/// label grew would clip it. [`Metrics::base`] is the design as drawn,
+/// [`Metrics::live`] is the same at the running text size, and [`layout_at`]
+/// takes either — the layout math is a pure function of the workflow and the
+/// metrics.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Metrics {
+    /// One node's box.
+    pub node_w: f32,
+    pub node_h: f32,
+    /// The air a node leaves inside its box, either side of its text.
+    pub node_padding: f32,
+    /// The gap between two ranks, and between two steps in one rank.
+    pub gap_x: f32,
+    pub gap_y: f32,
+    /// Room beside the widest rank for the routed links' lanes.
+    pub loop_room: f32,
+    /// The air the picture leaves around itself.
+    pub diagram_padding: f32,
+    /// The gap between a node's right edge and a routed link's corridor.
+    pub loop_corridor: f32,
+    /// The distance between two lanes.
+    pub lane_step: f32,
+    /// The air a lane keeps from the widest rank and the picture's edge.
+    pub lane_margin: f32,
+    /// The painted line's width.
+    pub stroke_width: f32,
+    /// The length of one arrowhead arm.
+    pub arrow_length: f32,
+}
+
+impl Metrics {
+    /// The design's own size, factor 1.
+    pub fn base() -> Self {
+        Self::at(1.)
+    }
+
+    /// The design scaled by `factor`: node size, gaps, lane room and stroke.
+    pub fn at(factor: f32) -> Self {
+        let scaled = |v: f32| v * factor;
+        Self {
+            node_w: scaled(NODE_W),
+            node_h: scaled(NODE_H),
+            node_padding: scaled(NODE_PADDING),
+            gap_x: scaled(GAP_X),
+            gap_y: scaled(GAP_Y),
+            loop_room: scaled(LOOP_ROOM),
+            diagram_padding: scaled(DIAGRAM_PADDING),
+            loop_corridor: scaled(LOOP_CORRIDOR),
+            lane_step: scaled(LANE_STEP),
+            lane_margin: scaled(LANE_MARGIN),
+            stroke_width: scaled(STROKE_WIDTH),
+            arrow_length: scaled(ARROW_LENGTH),
+        }
+    }
+
+    /// The design at the running text size: the scale the rest of the shell
+    /// measures through.
+    pub fn live() -> Self {
+        Self::at(crate::theme::scaled(1.))
+    }
+}
 
 /// One step, placed.
 #[derive(Clone, Debug, PartialEq)]
@@ -90,9 +187,10 @@ pub struct Node {
 }
 
 impl Node {
-    /// The node's centre, which is where an edge starts and ends.
-    pub fn centre(&self) -> (f32, f32) {
-        (self.x + NODE_W / 2., self.y + NODE_H / 2.)
+    /// The node's centre, which is where an edge starts and ends, at the
+    /// picture's own scale.
+    pub fn centre(&self, metrics: Metrics) -> (f32, f32) {
+        (self.x + metrics.node_w / 2., self.y + metrics.node_h / 2.)
     }
 
     /// The node's second line: the compact vocabulary a 168-wide box fits.
@@ -138,9 +236,25 @@ pub struct Link {
     /// A dependency is never a back-link — the graph is acyclic — so this is
     /// how the diagram knows to draw a loop.
     pub back: bool,
-    /// The x of the lane a back-link runs down, in diagram coordinates. `0.`
-    /// for a forward link, which needs no lane.
+    /// Whether the link skips a rank: a forward dependency whose target is more
+    /// than one rank above it, drawn around the boxes between the two edges
+    /// rather than through them.
+    pub long: bool,
+    /// The x of the lane a routed link runs down, in diagram coordinates. `0.`
+    /// for a link drawn straight between the two boxes.
     pub lane: f32,
+    /// The y offset from the target's right-edge middle where a routed link
+    /// re-enters it, so two links into one node are two arrowheads. `0.` for a
+    /// link drawn straight.
+    pub entry: f32,
+}
+
+impl Link {
+    /// Whether the line is routed around the boxes between its two ends — a
+    /// loop on the right, or a skip's lane — rather than drawn straight.
+    pub fn routed(&self) -> bool {
+        self.back || self.long
+    }
 }
 
 /// The picture: every node placed, every link routed.
@@ -148,12 +262,20 @@ pub struct Link {
 pub struct Layout {
     pub nodes: Vec<Node>,
     pub links: Vec<Link>,
-    /// The diagram's size, including the room the back-edges loop in.
+    /// The diagram's size, including the room the routed links loop in.
     pub width: f32,
     pub height: f32,
+    /// The measurements the picture was placed at.
+    metrics: Metrics,
 }
 
 impl Layout {
+    /// The measurements the picture was placed at: a node's box, the gaps, the
+    /// painted line's width.
+    pub fn metrics(&self) -> Metrics {
+        self.metrics
+    }
+
     /// The node for `id`.
     pub fn node(&self, id: &str) -> Option<&Node> {
         self.nodes.iter().find(|node| node.id == id)
@@ -171,18 +293,34 @@ impl Layout {
     /// fork the file draws is never clipped by a width chosen for the shipped
     /// pipeline.
     pub fn column_width(&self) -> f32 {
-        self.width + 2. * DIAGRAM_PADDING
+        self.width + 2. * self.metrics.diagram_padding
     }
 }
 
-/// Place `workflow` as a picture.
+/// Place `workflow` as a picture at the design's own size.
+///
+/// This is [`layout_at`] with [`Metrics::base`]: the layout math is a pure
+/// function of the workflow, so a test or a probe compares pictures rather than
+/// screens. The screen draws [`live_layout`], the same picture at the running
+/// text size.
+pub fn layout(workflow: &Workflow) -> Layout {
+    layout_at(workflow, Metrics::base())
+}
+
+/// The picture as the shell draws it: [`layout_at`] at the running text size.
+pub fn live_layout(workflow: &Workflow) -> Layout {
+    layout_at(workflow, Metrics::live())
+}
+
+/// Place `workflow` as a picture drawn at `metrics`.
 ///
 /// The graph is walked by declaration order and `depends_on` only — never by
 /// the edges, which would make the picture's own order depend on the loops it
 /// is drawing. A graph with a cycle (which `validate` refuses, but the editor
 /// draws mid-edit) is laid out with every step in some rank rather than
 /// recursing forever.
-pub fn layout(workflow: &Workflow) -> Layout {
+pub fn layout_at(workflow: &Workflow, metrics: Metrics) -> Layout {
+    let m = metrics;
     let count = workflow.steps.len();
     if count == 0 {
         return Layout {
@@ -190,6 +328,7 @@ pub fn layout(workflow: &Workflow) -> Layout {
             links: Vec::new(),
             width: 0.,
             height: 0.,
+            metrics,
         };
     }
 
@@ -245,17 +384,17 @@ pub fn layout(workflow: &Workflow) -> Layout {
     // 3. Place: y from the rank, x from the order, centred on the parents.
     let mut nodes: Vec<Option<Node>> = vec![None; count];
     let widest = columns.values().map(Vec::len).max().unwrap_or(1);
-    let content_width = widest as f32 * NODE_W + (widest.saturating_sub(1)) as f32 * GAP_X;
+    let content_width = widest as f32 * m.node_w + (widest.saturating_sub(1)) as f32 * m.gap_x;
     for (row, members) in &columns {
         let count_in_row = members.len();
         let row_width =
-            count_in_row as f32 * NODE_W + (count_in_row.saturating_sub(1)) as f32 * GAP_X;
+            count_in_row as f32 * m.node_w + (count_in_row.saturating_sub(1)) as f32 * m.gap_x;
         // centre a short row in the widest one, so a single step under a fork
         // sits level with the middle of the fork instead of hanging left
         let left = (content_width - row_width) / 2.;
         for (position, index) in members.iter().enumerate() {
-            let x = left + position as f32 * (NODE_W + GAP_X);
-            let y = *row as f32 * (NODE_H + GAP_Y);
+            let x = left + position as f32 * (m.node_w + m.gap_x);
+            let y = *row as f32 * (m.node_h + m.gap_y);
             nodes[*index] = Some(Node {
                 index: *index,
                 id: workflow.steps[*index].id.clone(),
@@ -285,28 +424,58 @@ pub fn layout(workflow: &Workflow) -> Layout {
             .sum::<f32>()
             / parents.len() as f32;
         if let Some(node) = placed.iter_mut().find(|node| node.index == index) {
-            node.x = mean.clamp(0., (content_width - NODE_W).max(0.));
+            node.x = mean.clamp(0., (content_width - m.node_w).max(0.));
         }
     }
 
-    // 4. Links: every dependency, then every declared edge. A link is "back"
-    //    when its target is not strictly to the left of its sender.
+    // 4. Links: the dependencies a step *has* to be told apart by, then every
+    //    declared edge. A link is "back" when its target is not strictly above
+    //    its sender, and "long" when a dependency skips a rank and so has to be
+    //    drawn around the boxes between the two edges.
+    //
+    //    The drawn dependencies are the covering relation of the order, not the
+    //    whole of it: a step's `depends_on` is omitted almost everywhere, so it
+    //    names every step above it, and most of those are reached through
+    //    another one anyway. Drawing them all turns a pipeline into a circuit
+    //    — the shipped template resolves to 29 links, 16 of them implied. A
+    //    line that another line already implies says nothing a reader needs,
+    //    so an implied dependency is left out of the *picture* only: the
+    //    scheduler still waits on everything `dependencies()` returns.
+    let mut ancestor_memo: Vec<Option<BTreeSet<usize>>> = vec![None; count];
     let mut links: Vec<Link> = Vec::new();
     for (index, step) in workflow.steps.iter().enumerate() {
+        let implied: BTreeSet<usize> = parents(index)
+            .iter()
+            .flat_map(|dependency| {
+                ancestors(
+                    workflow,
+                    &rank_of,
+                    &mut ancestor_memo,
+                    &mut Vec::new(),
+                    *dependency,
+                )
+            })
+            .collect();
         for dependency in workflow.dependencies(step) {
             let Some(target) = layout_index(&placed, &dependency) else {
                 continue;
             };
-            if target == index {
+            if target == index || implied.contains(&target) {
                 continue;
             }
             let back = placed[target].y >= placed[index].y;
+            // A dependency that skips a rank jumps over the boxes between the
+            // two edges; the file says the step waits for that one, so the line
+            // has to go around them rather than through them.
+            let long = !back && rank[index] > rank[placed[target].index] + 1;
             links.push(Link {
                 from: index,
                 to: target,
                 trigger: None,
                 back,
+                long,
                 lane: 0.,
+                entry: 0.,
             });
         }
         for edge in &step.edges {
@@ -321,48 +490,157 @@ pub fn layout(workflow: &Workflow) -> Layout {
                 // to sit far to the left, because the file says it is a return
                 // and the picture must say the same thing.
                 back: true,
+                long: false,
                 lane: 0.,
+                entry: 0.,
             });
         }
     }
 
-    // 5. Lanes: one column of empty space to the right of the widest rank per
-    //    back-link, so two loops sharing the picture's right side are still two
-    //    lines. The room is charged only when there is a loop to draw.
-    let loops = links.iter().filter(|link| link.back).count();
-    let lanes_room = if loops == 0 { 0. } else { loop_room(loops) };
-    if loops > 0 {
-        let first = content_width + lanes_room / 2. - (loops as f32 - 1.) * LANE_STEP / 2.;
-        for (number, link) in links.iter_mut().filter(|link| link.back).enumerate() {
-            link.lane = first + number as f32 * LANE_STEP;
+    // 5. A dependency that skips a rank runs its vertical stretch in the first
+    //    clear channel beside the boxes it skips. That channel is inside the
+    //    picture when the ranks it passes are narrower than the widest one — the
+    //    shipped template names its dependencies, so a lane per skipped rank
+    //    would make the picture wider than the window it is read in. When the
+    //    skipped ranks reach the picture's edge there is no channel, and the
+    //    link takes an outside lane like a loop.
+    for link in links.iter_mut().filter(|link| link.long) {
+        if let Some(channel) = forward_channel(&placed, m, content_width, link) {
+            link.lane = channel;
         }
     }
 
-    // The lanes turn in the gap under a rank, and a loop that leaves the last
+    // 6. Outside lanes: one column of empty space to the right of the widest
+    //    rank per routed link that needs one — every loop, and a dependency
+    //    that skips a rank with no channel inside the picture — so two lines
+    //    sharing the picture's right side are still two lines. The room is
+    //    charged only when there is such a line to draw.
+    let outside: Vec<usize> = links
+        .iter()
+        .enumerate()
+        .filter(|(_, link)| link.back || (link.long && link.lane == 0.))
+        .map(|(number, _)| number)
+        .collect();
+    let lanes_room = if outside.is_empty() {
+        0.
+    } else {
+        loop_room(outside.len(), m)
+    };
+    if !outside.is_empty() {
+        let first =
+            content_width + lanes_room / 2. - (outside.len() as f32 - 1.) * m.lane_step / 2.;
+        for (slot, number) in outside.iter().enumerate() {
+            links[*number].lane = first + slot as f32 * m.lane_step;
+        }
+    }
+
+    // 7. Arrivals: a routed link re-enters its target at its own height on the
+    //    target's right edge, so two loops into one step are two arrowheads
+    //    rather than one drawn twice. One link into a step keeps the middle;
+    //    several share the box's inside air, evenly.
+    let mut arrivals: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (number, link) in links.iter().enumerate() {
+        if link.routed() {
+            arrivals.entry(link.to).or_default().push(number);
+        }
+    }
+    for numbers in arrivals.values() {
+        if numbers.len() < 2 {
+            continue;
+        }
+        let span = (m.node_h - 2. * m.node_padding).max(0.);
+        let step = (span / (numbers.len() - 1) as f32).min(m.lane_step);
+        for (slot, number) in numbers.iter().enumerate() {
+            let offset = slot as f32 - (numbers.len() - 1) as f32 / 2.;
+            links[*number].entry = offset * step;
+        }
+    }
+
+    // The lanes turn in the gap under a rank, and a link that leaves the last
     // rank needs a gap there too.
-    let bottom_room = if loops == 0 { 0. } else { GAP_Y };
-    let height = columns.len() as f32 * NODE_H
-        + (columns.len().saturating_sub(1)) as f32 * GAP_Y
+    let routed = links.iter().filter(|link| link.routed()).count();
+    let bottom_room = if routed == 0 { 0. } else { m.gap_y };
+    let height = columns.len() as f32 * m.node_h
+        + (columns.len().saturating_sub(1)) as f32 * m.gap_y
         + bottom_room;
     Layout {
         nodes: placed,
         links,
-        width: content_width.max(NODE_W) + lanes_room,
-        height: height.max(NODE_H),
+        width: content_width.max(m.node_w) + lanes_room,
+        height: height.max(m.node_h),
+        metrics,
     }
 }
 
-/// The room the loop lanes need beside the widest rank: the design's
-/// [`LOOP_ROOM`] for one loop, and one [`LANE_STEP`] more for each extra one,
-/// with [`LANE_MARGIN`] either side.
-fn loop_room(loops: usize) -> f32 {
-    let lanes = loops.saturating_sub(1) as f32 * LANE_STEP;
-    LOOP_ROOM.max(lanes + 2. * LANE_MARGIN)
+/// The x of the clear channel a long forward link runs its vertical stretch in:
+/// just outside the boxes of every rank it passes, while that is still inside
+/// the picture. `None` when those ranks reach the picture's right edge, where
+/// the link has to take an outside lane instead.
+fn forward_channel(
+    nodes: &[Node],
+    metrics: Metrics,
+    content_width: f32,
+    link: &Link,
+) -> Option<f32> {
+    let from = &nodes[link.from];
+    let to = &nodes[link.to];
+    // The stretch starts in the gap under the target's rank and ends in the gap
+    // under the sender's, so it passes every rank from the target's next one
+    // through the sender's own band.
+    let passes = |node: &&Node| node.rank > to.rank && node.rank <= from.rank;
+    let right = nodes
+        .iter()
+        .filter(passes)
+        .map(|node| node.x + metrics.node_w)
+        .fold(f32::MIN, f32::max);
+    let channel = right + metrics.loop_corridor;
+    (right.is_finite() && channel <= content_width - metrics.lane_margin).then_some(channel)
+}
+
+/// The room the lanes need beside the widest rank: the design's [`LOOP_ROOM`]
+/// for one lane, and one [`LANE_STEP`] more for each extra one, with
+/// [`LANE_MARGIN`] either side.
+fn loop_room(lanes: usize, metrics: Metrics) -> f32 {
+    let steps = lanes.saturating_sub(1) as f32 * metrics.lane_step;
+    metrics.loop_room.max(steps + 2. * metrics.lane_margin)
 }
 
 /// The placed node index for a step id.
 fn layout_index(nodes: &[Node], id: &str) -> Option<usize> {
     nodes.iter().position(|node| node.id == id)
+}
+
+/// Every step `index` waits for, directly or through another step.
+///
+/// The picture leaves out a dependency that another dependency of the same step
+/// already reaches, so this is what decides which lines are worth drawing.
+/// `memo` is per-layout, `walking` is the guard that keeps a cycle (which
+/// `validate` refuses but the editor draws mid-edit) from recursing forever.
+fn ancestors(
+    workflow: &Workflow,
+    rank_of: &BTreeMap<&str, usize>,
+    memo: &mut [Option<BTreeSet<usize>>],
+    walking: &mut Vec<usize>,
+    index: usize,
+) -> BTreeSet<usize> {
+    if let Some(known) = &memo[index] {
+        return known.clone();
+    }
+    if walking.contains(&index) {
+        return BTreeSet::new();
+    }
+    walking.push(index);
+    let mut out = BTreeSet::new();
+    for dependency in workflow.dependencies(&workflow.steps[index]) {
+        let Some(step) = rank_of.get(dependency.as_str()).copied() else {
+            continue;
+        };
+        out.insert(step);
+        out.extend(ancestors(workflow, rank_of, memo, walking, step));
+    }
+    walking.pop();
+    memo[index] = Some(out.clone());
+    out
 }
 
 /// A step's rank: one past the deepest of its dependencies.
@@ -410,21 +688,24 @@ pub struct Stroke {
 
 /// The line one link is drawn as.
 ///
-/// A forward link is a straight line between the two centres, clipped to each
-/// node's box so it starts at the border rather than inside the text. A back
-/// link leaves the sender's right side, turns out of the sender's rank through
-/// the gap below it, runs down its own lane past the widest rank, and turns
-/// back into the target's right side through the gap below the target's rank —
-/// the loop shape a flowchart draws.
+/// A one-rank forward link is a straight line between the two facing edges,
+/// clipped to each node's box so it starts at the border rather than inside the
+/// text. A routed link — a back-edge, or a dependency that skips a rank — leaves
+/// the sender's right side, turns out of the sender's rank through the gap
+/// below it, runs up or down its own lane, and turns back into the target's
+/// right side through the gap below the target's rank, at the arrival height
+/// [`Link::entry`] gives it — the loop shape a flowchart draws.
 ///
-/// Every horizontal run of a loop is in a rank gap, which no node occupies, and
-/// both vertical runs are either in the lane (outside the widest rank) or in
-/// the space beside one box (inside [`GAP_X`]). That is what keeps a lane from
-/// crossing a node's box: it touches only the two boxes it belongs to.
+/// Every horizontal run of a routed link is in a rank gap, which no node
+/// occupies, and both vertical runs are either in the lane (placed outside the
+/// boxes the link skips) or in the space beside one box (inside [`GAP_X`]).
+/// That is what keeps a lane from crossing a node's box: it touches only the
+/// boxes it runs beside.
 pub fn stroke(layout: &Layout, link: &Link) -> Stroke {
+    let m = layout.metrics;
     let from = &layout.nodes[link.from];
     let to = &layout.nodes[link.to];
-    if !link.back {
+    if !link.routed() {
         // A forward link joins the two **facing** edges: the dependent's top
         // and the dependency's bottom. Drawing it bottom-to-top instead makes
         // the line run through both boxes — and since the node divs are painted
@@ -432,12 +713,12 @@ pub fn stroke(layout: &Layout, link: &Link) -> Stroke {
         // the arrowhead landed on the target's far side and was never seen.
         let downward = to.y > from.y;
         let start = (
-            from.x + NODE_W / 2.,
-            if downward { from.y + NODE_H } else { from.y },
+            from.x + m.node_w / 2.,
+            if downward { from.y + m.node_h } else { from.y },
         );
         let end = (
-            to.x + NODE_W / 2.,
-            if downward { to.y } else { to.y + NODE_H },
+            to.x + m.node_w / 2.,
+            if downward { to.y } else { to.y + m.node_h },
         );
         let angle = (end.1 - start.1).atan2(end.0 - start.0);
         return Stroke {
@@ -450,23 +731,31 @@ pub fn stroke(layout: &Layout, link: &Link) -> Stroke {
     // empty gap under their rank, and the corridor between a box and its
     // neighbour is narrower than the gap between two boxes, so the line never
     // has to cross one.
-    let exit_x = from.x + NODE_W;
-    let enter_x = to.x + NODE_W;
-    let exit_y = from.y + NODE_H + GAP_Y / 2.;
-    let enter_y = to.y + NODE_H + GAP_Y / 2.;
-    let start = (exit_x, from.y + NODE_H / 2.);
-    let end = (enter_x, to.y + NODE_H / 2.);
+    let exit_x = from.x + m.node_w;
+    let enter_x = to.x + m.node_w;
+    let exit_y = from.y + m.node_h + m.gap_y / 2.;
+    let enter_y = to.y + m.node_h + m.gap_y / 2.;
+    let start = (exit_x, from.y + m.node_h / 2.);
+    let end = (enter_x, to.y + m.node_h / 2. + link.entry);
+    // A channel inside the picture can sit exactly on the corridor, so the turn
+    // is a right angle with one leg of no length: skip the repeated point
+    // rather than feeding a zero-length segment to the painter.
+    let mut points = vec![start];
+    for point in [
+        (exit_x + m.loop_corridor, start.1),
+        (exit_x + m.loop_corridor, exit_y),
+        (link.lane, exit_y),
+        (link.lane, enter_y),
+        (enter_x + m.loop_corridor, enter_y),
+        (enter_x + m.loop_corridor, end.1),
+        end,
+    ] {
+        if points.last() != Some(&point) {
+            points.push(point);
+        }
+    }
     Stroke {
-        points: vec![
-            start,
-            (exit_x + LOOP_CORRIDOR, start.1),
-            (exit_x + LOOP_CORRIDOR, exit_y),
-            (link.lane, exit_y),
-            (link.lane, enter_y),
-            (enter_x + LOOP_CORRIDOR, enter_y),
-            (enter_x + LOOP_CORRIDOR, end.1),
-            end,
-        ],
+        points,
         arrow: (end, std::f32::consts::PI),
     }
 }
@@ -483,6 +772,7 @@ pub fn paint(
     color: impl Fn(&Link) -> Hsla + 'static,
 ) -> AnyElement {
     let size = (layout.width, layout.height);
+    let metrics = layout.metrics;
     canvas(
         move |_, _, _| {},
         move |bounds, _, window, _| {
@@ -492,7 +782,7 @@ pub fn paint(
             );
             for link in &layout.links {
                 let stroke = stroke(&layout, link);
-                paint_stroke(window, origin, &stroke, color(link));
+                paint_stroke(window, origin, &stroke, color(link), metrics);
             }
         },
     )
@@ -502,8 +792,14 @@ pub fn paint(
 }
 
 /// One stroke: the line, then its arrowhead.
-fn paint_stroke(window: &mut Window, origin: (f32, f32), stroke: &Stroke, color: Hsla) {
-    let mut builder = PathBuilder::stroke(px(1.5));
+fn paint_stroke(
+    window: &mut Window,
+    origin: (f32, f32),
+    stroke: &Stroke,
+    color: Hsla,
+    metrics: Metrics,
+) {
+    let mut builder = PathBuilder::stroke(px(metrics.stroke_width));
     let first = stroke.points.first().copied().unwrap_or((0., 0.));
     builder.move_to(to_point(origin, first));
     // A right-angle corner or a straight run: both are polylines, and a
@@ -525,11 +821,10 @@ fn paint_stroke(window: &mut Window, origin: (f32, f32), stroke: &Stroke, color:
     // arm is the shape of path this gpui does paint, so the arrowhead is built
     // the way the line is.
     let ((tip_x, tip_y), angle) = stroke.arrow;
-    let length = 9.0;
-    let spread = 0.55;
+    let length = metrics.arrow_length;
     for side in [-1.0_f32, 1.0] {
-        let arm = angle + std::f32::consts::PI + side * spread;
-        let mut head = PathBuilder::stroke(px(1.5));
+        let arm = angle + std::f32::consts::PI + side * ARROW_SPREAD;
+        let mut head = PathBuilder::stroke(px(metrics.stroke_width));
         head.move_to(to_point(origin, (tip_x, tip_y)));
         head.line_to(to_point(
             origin,
@@ -974,6 +1269,353 @@ depends_on = ["left", "middle", "right"]
                 }
             }
         }
+    }
+
+    /// Two loops into one step are two lines, so they need two arrivals: the
+    /// drawer that draws one arrowhead for both is the defect ADR-0023's list
+    /// of edges made visible in the shipped template.
+    #[test]
+    fn two_loops_into_one_step_get_two_arrowheads() {
+        let workflow = graph(
+            r#"
+schema = 3
+name = "two-loops"
+revision = 1
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+
+[[step]]
+id = "review"
+kind = "harness"
+skill = "review"
+produces = "review.md"
+edges = [{ to = "code", when = "verdict_changes" }]
+
+[[step]]
+id = "test"
+kind = "gate"
+command = "true"
+edges = [{ to = "code", when = "gate_failed" }]
+"#,
+        );
+        let layout = layout(&workflow);
+        let code = layout.node("code").expect("code");
+        let tips: Vec<(f32, f32)> = layout
+            .links
+            .iter()
+            .filter(|link| link.back && layout.nodes[link.to].id == "code")
+            .map(|link| stroke(&layout, link).arrow.0)
+            .collect();
+        assert_eq!(tips.len(), 2, "the fixture's two loops target `code`");
+        assert_ne!(
+            tips[0], tips[1],
+            "each loop has its own arrowhead: {tips:?}"
+        );
+        for (x, y) in tips {
+            assert_eq!(
+                x,
+                code.x + NODE_W,
+                "a loop arrives on the target's right edge"
+            );
+            assert!(
+                y > code.y && y < code.y + NODE_H,
+                "and inside the box it enters: {y}"
+            );
+        }
+    }
+
+    /// A dependency more than one rank up jumps over the boxes between the two
+    /// edges, so it is routed around them like a loop; a one-rank link stays
+    /// the straight line between the two facing edges.
+    #[test]
+    fn a_long_forward_link_never_crosses_a_node_box() {
+        let workflow = graph(
+            r#"
+schema = 3
+name = "skip"
+revision = 1
+
+[[step]]
+id = "a"
+kind = "harness"
+skill = "analyze"
+depends_on = []
+
+[[step]]
+id = "c"
+kind = "harness"
+skill = "code"
+depends_on = []
+
+[[step]]
+id = "b"
+kind = "harness"
+skill = "code"
+depends_on = ["a"]
+
+[[step]]
+id = "d"
+kind = "harness"
+skill = "code"
+depends_on = ["c"]
+
+[[step]]
+id = "deep"
+kind = "harness"
+skill = "review"
+produces = "deep.md"
+depends_on = ["a", "d"]
+"#,
+        );
+        let layout = layout(&workflow);
+        let link = |from: &str, to: &str| {
+            layout
+                .links
+                .iter()
+                .find(|link| {
+                    !link.back
+                        && layout.nodes[link.from].id == from
+                        && layout.nodes[link.to].id == to
+                })
+                .unwrap_or_else(|| panic!("the {from} -> {to} dependency"))
+        };
+        let long = link("deep", "a");
+        let drawn = stroke(&layout, long);
+        for node in &layout.nodes {
+            let rect = (node.x, node.y, node.x + NODE_W, node.y + NODE_H);
+            for segment in drawn.points.windows(2) {
+                assert!(
+                    !crosses_box(segment[0], segment[1], rect),
+                    "the deep -> a dependency crosses step `{}`",
+                    node.id
+                );
+            }
+        }
+        assert!(
+            drawn.points.len() > 2,
+            "a dependency two ranks up is routed, not a line through the boxes: {:?}",
+            drawn.points
+        );
+        assert!(long.lane > 0., "and it runs down a lane of its own");
+        assert!(
+            layout.width > 2. * NODE_W + GAP_X,
+            "with no channel inside the picture, the lane is charged beside it"
+        );
+        let near = link("deep", "d");
+        assert_eq!(
+            stroke(&layout, near).points.len(),
+            2,
+            "a one-rank dependency is still the straight facing-edge line"
+        );
+        assert!(
+            !near.long && near.lane == 0.,
+            "and it costs neither a lane nor a routing"
+        );
+    }
+
+    #[test]
+    fn a_skipping_dependency_stays_inside_the_picture_when_there_is_room() {
+        let workflow = graph(
+            r#"
+schema = 3
+name = "skip-inside"
+revision = 1
+
+[[step]]
+id = "a"
+kind = "harness"
+skill = "analyze"
+depends_on = []
+
+[[step]]
+id = "c"
+kind = "harness"
+skill = "code"
+depends_on = []
+
+[[step]]
+id = "b"
+kind = "harness"
+skill = "code"
+depends_on = ["a"]
+
+[[step]]
+id = "deep"
+kind = "harness"
+skill = "review"
+produces = "deep.md"
+depends_on = ["b", "c"]
+
+[[step]]
+id = "tail-left"
+kind = "harness"
+skill = "code"
+depends_on = ["deep"]
+
+[[step]]
+id = "tail-mid"
+kind = "harness"
+skill = "code"
+depends_on = ["deep"]
+
+[[step]]
+id = "tail-right"
+kind = "harness"
+skill = "code"
+depends_on = ["deep"]
+"#,
+        );
+        let layout = layout(&workflow);
+        let long = layout
+            .links
+            .iter()
+            .find(|link| {
+                !link.back
+                    && layout.nodes[link.from].id == "deep"
+                    && layout.nodes[link.to].id == "c"
+            })
+            .expect("deep waits for c");
+        // The widest rank is the three tails below it, so a channel that has to
+        // clear the target's own row still fits inside the picture.
+        let widest = 3. * NODE_W + 2. * GAP_X;
+        let skipped = layout
+            .nodes
+            .iter()
+            .filter(|node| node.rank == 1)
+            .map(|node| node.x + NODE_W)
+            .fold(0., f32::max);
+        assert!(
+            long.lane > skipped,
+            "the channel runs beside the boxes it skips: {} vs {skipped}",
+            long.lane
+        );
+        assert!(
+            long.lane < widest,
+            "and inside the picture, so it costs no lane room: {} vs {widest}",
+            long.lane
+        );
+        assert_eq!(
+            layout.width, widest,
+            "a channel inside the picture charges nothing"
+        );
+        for node in &layout.nodes {
+            let rect = (node.x, node.y, node.x + NODE_W, node.y + NODE_H);
+            for segment in stroke(&layout, long).points.windows(2) {
+                assert!(
+                    !crosses_box(segment[0], segment[1], rect),
+                    "the deep -> c dependency crosses step `{}`",
+                    node.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_implied_dependency_is_not_drawn() {
+        // `depends_on` omitted means "every step above", so a chain names its
+        // transitive closure. The picture draws the covering relation instead:
+        // three steps, two lines.
+        let workflow = graph(
+            r#"
+schema = 3
+name = "implied"
+revision = 1
+
+[[step]]
+id = "a"
+kind = "harness"
+skill = "analyze"
+
+[[step]]
+id = "b"
+kind = "harness"
+skill = "code"
+
+[[step]]
+id = "c"
+kind = "harness"
+skill = "review"
+"#,
+        );
+        let layout = layout(&workflow);
+        let drawn: Vec<String> = layout
+            .links
+            .iter()
+            .map(|link| {
+                format!(
+                    "{}->{}",
+                    layout.nodes[link.from].id, layout.nodes[link.to].id
+                )
+            })
+            .collect();
+        assert_eq!(
+            drawn,
+            vec!["b->a", "c->b"],
+            "the chain is drawn as a chain, not as its closure"
+        );
+        assert_eq!(
+            workflow.dependencies(&workflow.steps[2]).len(),
+            2,
+            "while the scheduler still waits for both steps above it"
+        );
+    }
+
+    #[test]
+    fn every_length_scales_with_the_text_size() {
+        let workflow = diagram();
+        let base = layout(&workflow);
+        let larger = layout_at(&workflow, Metrics::at(1.25));
+        for (drawn, design) in [
+            (larger.metrics().node_w, NODE_W),
+            (larger.metrics().node_h, NODE_H),
+            (larger.metrics().gap_x, GAP_X),
+            (larger.metrics().gap_y, GAP_Y),
+            (larger.metrics().lane_step, LANE_STEP),
+            (larger.metrics().stroke_width, STROKE_WIDTH),
+            (larger.metrics().arrow_length, ARROW_LENGTH),
+        ] {
+            assert!(
+                (drawn - design * 1.25).abs() < 1e-3,
+                "{drawn} is the design's {design} at the live text size"
+            );
+        }
+        assert_eq!(
+            Metrics::base(),
+            Metrics::at(1.),
+            "the design's own size is factor 1"
+        );
+
+        // the picture is the design's own picture, that much bigger: the same
+        // nodes in the same places, the lane room included
+        assert!((larger.width - base.width * 1.25).abs() < 0.5);
+        assert!((larger.height - base.height * 1.25).abs() < 0.5);
+        for (small, big) in base.nodes.iter().zip(&larger.nodes) {
+            assert!((big.x - small.x * 1.25).abs() < 0.5);
+            assert!((big.y - small.y * 1.25).abs() < 0.5);
+        }
+        for (small, big) in base.links.iter().zip(&larger.links) {
+            assert!((big.lane - small.lane * 1.25).abs() < 0.5);
+        }
+
+        // and a stroke is drawn at the picture's scale, not the design's
+        let loop_link = larger
+            .links
+            .iter()
+            .find(|link| link.back)
+            .expect("the fixture's loop");
+        let drawn = stroke(&larger, loop_link);
+        let from = &larger.nodes[loop_link.from];
+        assert_eq!(
+            drawn.points.first().copied(),
+            Some((
+                from.x + larger.metrics().node_w,
+                from.y + larger.metrics().node_h / 2.
+            )),
+            "the loop leaves the sender's right edge at the picture's own size"
+        );
     }
 
     /// A node's second line is one word plus, at most, one short marker: the

@@ -8,7 +8,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use gpui::{Modifiers, Point, TestAppContext, VisualTestContext, WindowHandle, px, size};
+use gpui::{
+    Bounds, Modifiers, Pixels, Point, Role, TestAppContext, VisualTestContext, WindowHandle, px,
+    size,
+};
+use gpui_kit::test::TestQueryExt as _;
 use warp_flow::app::Launch;
 use warp_flow::theme;
 use warp_flow::ui::window::FlowApp;
@@ -93,6 +97,39 @@ fn click(cx: &mut VisualTestContext, name: &str) {
     };
     cx.simulate_click(center, Modifiers::default());
     settle(cx);
+}
+
+/// One control as the accessibility tree reports it: the role and the name a
+/// screen reader hears, the state it announces and the point it names. This is
+/// the same native information AT-SPI carries; the headless adapter just never
+/// builds the platform tree, so the suite reads it through its observation API.
+struct Named {
+    role: Option<Role>,
+    label: String,
+    selected: Option<bool>,
+    bounds: Bounds<Pixels>,
+}
+
+fn named(cx: &mut VisualTestContext, label: &str) -> Named {
+    cx.update(|window, _| {
+        let element = window.find_by_label(label);
+        Named {
+            role: element.role(),
+            label: element.label().unwrap_or_default().to_owned(),
+            selected: element.selected(),
+            bounds: element.bounds(),
+        }
+    })
+}
+
+fn page_tab_names(cx: &mut VisualTestContext) -> Vec<String> {
+    cx.update(|window, _| {
+        window
+            .find_all_by_role(Role::Tab)
+            .into_iter()
+            .filter_map(|element| element.label().map(str::to_owned))
+            .collect()
+    })
 }
 
 #[gpui_kit::gpui::test]
@@ -296,6 +333,112 @@ fn ctrl_backslash_folds_the_list_away_and_back(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("flow-list").is_none(),
         "the title bar's toggle still folds the pane"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The rail's foot item is found by the name a screen reader hears, and a
+/// press at the point that name names opens Settings' group list.
+///
+/// The rail is the window's only `page tab` set: Runs and Repos come from
+/// `Section::WORK`, Settings is the item the rail pins to its foot after the
+/// `flex_1` spacer. A missing or renamed name here would take Settings away
+/// from assistive technology, so this probe reads the name, the role, the
+/// announced selection and the point, then presses that point — not the
+/// debug selector — and asserts the section's page actually opened.
+///
+/// The kit's rail item is a `div` with an `on_click` listener. GPUI exposes it
+/// to AT-SPI as a tab with a Click action, but `on_a11y_action` listeners only
+/// exist when an app registers one, and the headless test adapter never
+/// activates accessibility, so there is no a11y action to dispatch in a probe;
+/// the press is the pointer click the other probes make, aimed from the tree's
+/// own point instead of `debug_bounds`.
+#[gpui_kit::gpui::test]
+fn the_rails_settings_item_is_named_at_its_foot_and_opens_its_groups(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("rail-settings");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let repo = seed_repo(&home);
+
+    let handle = open_app(cx, vec![repo]);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    // start elsewhere, so the press below is a real section change
+    click(cx, "flow-rail-repos");
+    assert!(
+        cx.debug_bounds("flow-repo-detail").is_some(),
+        "the rail's second item put the window on Repos"
+    );
+
+    // the rail's whole tab set, by accessible name: Settings is a page tab
+    // like the two work sections, and it is the only one at the foot
+    assert_eq!(
+        page_tab_names(cx),
+        ["Runs", "Repos", "Settings"],
+        "the rail is three named page tabs, Settings included"
+    );
+    let settings = named(cx, "Settings");
+    assert_eq!(
+        settings.role,
+        Some(Role::Tab),
+        "the foot item is exposed with the rail's role, not as a plain label"
+    );
+    assert_eq!(
+        settings.label, "Settings",
+        "the accessible name is the section's word"
+    );
+    assert_eq!(
+        settings.selected,
+        Some(false),
+        "the tab says Repos, not Settings, is the open section"
+    );
+
+    // the named point is a real point in the window, at the rail's foot: a
+    // screen reader's press and a pointer press must reach the same control.
+    let viewport = cx.update(|window, _| window.viewport_size());
+    let bounds = settings.bounds;
+    let center = Point {
+        x: bounds.origin.x + bounds.size.width / 2.,
+        y: bounds.origin.y + bounds.size.height / 2.,
+    };
+    assert!(
+        bounds.origin.x >= px(0.)
+            && bounds.origin.y >= px(0.)
+            && bounds.origin.x + bounds.size.width <= viewport.width
+            && bounds.origin.y + bounds.size.height <= viewport.height,
+        "the named point {bounds:?} is outside the {viewport:?} window"
+    );
+    assert!(
+        center.x < px(120.) && center.y > viewport.height - px(120.),
+        "Settings is the rail's foot item; its point {center:?} is not at the \
+         left edge near the bottom of the {viewport:?} window"
+    );
+
+    // press the point the name names
+    cx.simulate_click(center, Modifiers::default());
+    settle(cx);
+    assert!(
+        cx.debug_bounds("flow-screen-settings").is_some(),
+        "a press at the Settings tab's named point opened the Settings page"
+    );
+    for group in ["appearance", "engine", "files", "about"] {
+        assert!(
+            cx.debug_bounds(selector(&format!("flow-settings-{group}")))
+                .is_some(),
+            "the group list is the Settings page's signal: {group} is missing"
+        );
+    }
+    assert!(
+        cx.debug_bounds("settings-row-text-size").is_some(),
+        "the section opens on its first group, not on an empty page"
+    );
+    assert_eq!(
+        named(cx, "Settings").selected,
+        Some(true),
+        "the tab now announces that Settings is the open section"
     );
 
     let _ = std::fs::remove_dir_all(&home);

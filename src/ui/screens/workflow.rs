@@ -951,7 +951,10 @@ impl WorkflowScreen {
         // share scrolls sideways rather than squeezing the form beside it.
         let (diagram, diagram_width) = match &self.graph {
             Some(graph) => {
-                let layout = crate::ui::graph::layout(graph);
+                // The picture is built at the shell's scale: a larger text size
+                // grows the labels inside the boxes, so the boxes, the gaps and
+                // the lanes grow with them.
+                let layout = crate::ui::graph::live_layout(graph);
                 let width = layout.column_width();
                 (self.render_diagram(&layout, cx), width)
             }
@@ -961,7 +964,7 @@ impl WorkflowScreen {
                     "No graph",
                     "The file could not be read, so there is no picture to draw.",
                 ),
-                DIAGRAM_MIN_WIDTH,
+                theme::scaled(DIAGRAM_MIN_WIDTH),
             ),
         };
         div()
@@ -970,7 +973,7 @@ impl WorkflowScreen {
             .flex()
             .flex_col()
             .flex_shrink_0()
-            .w(px(theme::scaled(diagram_width)))
+            .w(px(diagram_width))
             .min_w(px(theme::scaled(DIAGRAM_MIN_WIDTH)))
             .max_w(relative(DIAGRAM_MAX_SHARE))
             .h_full()
@@ -992,8 +995,8 @@ impl WorkflowScreen {
                     .overflow_y_scroll()
                     .overflow_x_scroll()
                     .track_scroll(&self.list_scroll)
-                    .px(px(crate::ui::graph::DIAGRAM_PADDING))
-                    .py(px(crate::ui::graph::DIAGRAM_PADDING))
+                    .px(px(theme::scaled(crate::ui::graph::DIAGRAM_PADDING)))
+                    .py(px(theme::scaled(crate::ui::graph::DIAGRAM_PADDING)))
                     .child(diagram),
             )
             .into_any_element()
@@ -1011,6 +1014,7 @@ impl WorkflowScreen {
         layout: &crate::ui::graph::Layout,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let metrics = layout.metrics();
         let mut stage = div()
             .debug_selector(|| "flow-workflow-diagram".into())
             .relative()
@@ -1046,9 +1050,9 @@ impl WorkflowScreen {
                 .absolute()
                 .left(px(node.x))
                 .top(px(node.y))
-                .w(px(crate::ui::graph::NODE_W))
-                .h(px(crate::ui::graph::NODE_H))
-                .px(px(crate::ui::graph::NODE_PADDING))
+                .w(px(metrics.node_w))
+                .h(px(metrics.node_h))
+                .px(px(metrics.node_padding))
                 .rounded(px(8.))
                 .border_1()
                 .border_color(if selected {

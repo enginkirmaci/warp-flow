@@ -11,6 +11,7 @@ use gpui::{
     AnyElement, Context, FontWeight, MouseButton, SharedString, Window, WindowControlArea, div, px,
 };
 
+use gpui_kit::TestSupportExt as _;
 use warpui_kit_core::A11y as _;
 use warpui_kit_core::about::AppId;
 use warpui_kit_core::tooltip::tooltip_text;
@@ -187,6 +188,13 @@ impl FlowApp {
             self.section == section,
         )
         .debug_selector(move || selector.clone())
+        // The kit's item carries the role and the name a screen reader hears
+        // (`a11y_tab`); the suite's observation API reads the same native
+        // properties, so registering the item is what lets a probe find a
+        // section by its accessible name instead of by its debug selector —
+        // the way `tests/screens_probe.rs` finds the rail's foot item. Inert
+        // outside test builds, where it returns the element untouched.
+        .test_support()
         .on_click(cx.listener(move |this, _, window, cx| {
             this.open_section(section, window, cx);
         }));
