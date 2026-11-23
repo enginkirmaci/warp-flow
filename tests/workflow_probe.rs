@@ -1759,3 +1759,34 @@ fn a_field_with_no_catalog_says_so(cx: &mut TestAppContext) {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[gpui_kit::gpui::test]
+fn a_step_with_no_dependency_says_it_starts_with_the_run(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("starts-first");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let (repo, _issue) = seed_repo(&home, Some(WORKFLOW));
+    let handle = open_template(cx, &repo, WORKFLOW);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+    select(&handle, cx, 0);
+
+    // `analyze` waits for nothing, so it is a root: the row says so rather than
+    // leaving an empty set to be read as "in the place it is drawn"
+    assert!(cx.debug_bounds("flow-step-depends-note").is_some());
+    assert!(
+        meta_of(&handle, cx, 0).contains("first"),
+        "the row meta already says it runs first"
+    );
+
+    // naming a step it waits for answers the question, so the note goes
+    click(cx, "flow-step-depends-check");
+    assert_eq!(graph_of(&handle, cx).steps[0].depends_on, vec!["check"]);
+    assert!(
+        cx.debug_bounds("flow-step-depends-note").is_none(),
+        "a step that waits for one is not a root"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}

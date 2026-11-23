@@ -2186,6 +2186,7 @@ impl WorkflowScreen {
                     .collect()
             })
             .unwrap_or_default();
+        let has_others = !others.is_empty();
         let mut chips = div()
             .flex()
             .flex_wrap()
@@ -2193,7 +2194,7 @@ impl WorkflowScreen {
             .gap(px(6.))
             .flex_1()
             .min_w_0();
-        if others.is_empty() {
+        if !has_others {
             chips = chips.child(quiet_word("No other steps yet."));
         }
         for id in others {
@@ -2243,7 +2244,27 @@ impl WorkflowScreen {
                     .child(id),
             );
         }
-        row.child(chips).into_any_element()
+        // A step's place is its dependencies, so a step that names none is a
+        // root: it is ready the moment the run starts, beside the other roots,
+        // whatever order the file declares it in. The drawn list can read as if
+        // its order were the run's — a join drawn near the end looks like it
+        // comes last even with nothing to wait for — so the row says what an
+        // empty set means instead of leaving it to unselected chips.
+        let mut column = div().flex().flex_col().gap(px(4.)).child(row.child(chips));
+        if step.depends_on.is_empty() && has_others {
+            column = column.child(
+                div()
+                    .debug_selector(|| "flow-step-depends-note".into())
+                    .pl(px(theme::scaled(LABEL_WIDTH) + 12.))
+                    .text_size(px(theme::font_meta()))
+                    .text_color(theme::text_muted())
+                    .child(
+                        "Waits for nothing, so it starts with the run — press a step to wait for \
+                         it.",
+                    ),
+            );
+        }
+        column.into_any_element()
     }
 
     /// The step's rework edge: the earlier step it sends the work back to.
