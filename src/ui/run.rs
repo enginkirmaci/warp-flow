@@ -1,8 +1,9 @@
 //! The Run tab's body: the one card the run's state calls for (a question, a
-//! block, a pause, or a run that has not started), the workflow's step bands,
-//! the task list, the attempt history, the live engine log and the harness
-//! sessions. The head, the tabs and the 44 strip belong to the detail pane
-//! ([`crate::ui::detail`]); this file draws what sits under them.
+//! block, a pause, or a run that has not started), the workflow as one
+//! tasks-across steps-down matrix, the task list, the attempt history, the live
+//! engine log and the harness sessions. The head, the tabs and the 44 strip
+//! belong to the detail pane ([`crate::ui::detail`]); this file draws what sits
+//! under them.
 //!
 //! The card order is the design's: state, workflow, tasks, attempts, log. One
 //! column at `shell::READING_WIDTH`, every card `surface` on a 1 px hairline,
@@ -761,213 +762,37 @@ impl FlowApp {
 
     // ---- the workflow card -------------------------------------------------
 
-    /// One 44-high band per workflow step, a per-task step's rows hanging under
-    /// it on one hairline, and the outcome at the right of each band.
+    /// The workflow as one matrix: the run's tasks across as columns, its steps
+    /// down as rows, and one compact state cell where a `per_task` step meets a
+    /// task. A step that runs once carries its single pill instead of cells.
     fn render_workflow_card(&self, run: &Run, phase: Option<Phase>) -> AnyElement {
+        let columns = matrix_columns(run);
+        let column_width = matrix_column_width(columns.len());
         let mut head = Vec::new();
         if let Some(busy) = phase.and_then(|phase| busy_word("flow-run-workflow-spinner", phase)) {
             head.push(busy);
         }
         let mut meta = div().flex().items_center().gap(px(6.));
         if !run.workflow.trim().is_empty() && run.workflow.trim() != "—" {
-            meta = meta.child(head_mono(run.workflow.clone())).child(
-                div()
-                    .text_size(px(theme::font_meta()))
-                    .text_color(theme::text_muted())
-                    .child("·"),
-            );
+            meta = meta.child(head_mono(run.workflow.clone())).child(dot());
         }
         meta = meta.child(head_word(count_word(run.steps.len(), "step")));
-        head.push(meta.into_any_element());
-
-        let mut steps = div()
-            .debug_selector(|| "flow-run-steps".into())
-            .flex()
-            .flex_col();
-        for (index, step) in run.steps.iter().enumerate() {
-            steps = steps.child(self.render_step_band(step, index > 0));
+        if !columns.is_empty() {
+            meta = meta
+                .child(dot())
+                .child(head_word(count_word(columns.len(), "task")));
         }
+        head.push(meta.into_any_element());
 
         let mut card = card()
             .id("flow-run-workflow-card")
             .debug_selector(|| "flow-run-workflow".into())
             .child(card_head("Workflow", head))
-            .child(steps);
+            .child(step_matrix(run, &columns, column_width));
         if let Some(note) = &run.workflow_note {
             card = card.child(workflow_note_row(note));
         }
         card.into_any_element()
-    }
-
-    fn render_step_band(&self, step: &StepView, separated: bool) -> AnyElement {
-        let selector = format!("flow-run-step-{}", step.id);
-        let state_selector = format!("flow-run-state-{}", step.id);
-        let kind = kind_word(step.kind);
-        // The design reads `gate · test` and `harness · skill analyze ·
-        // produces spec.md`: the gate's own name is the value, not the word
-        // "gate" again; a harness step keeps its skill and output names.
-        let detail = match step.kind {
-            Some(StepKind::Gate) => step
-                .detail
-                .strip_prefix("gate: ")
-                .unwrap_or(&step.detail)
-                .to_owned(),
-            _ => step.detail.replace(": ", " "),
-        };
-
-        let mut band = div()
-            .id(SharedString::from(selector.clone()))
-            .debug_selector(move || selector.clone())
-            .flex()
-            .flex_col()
-            .when(separated, |band| {
-                band.border_t_1().border_color(theme::border_light())
-            });
-
-        let mut row = div()
-            .flex()
-            .items_center()
-            .gap(px(10.))
-            .min_h(px(theme::scaled(theme::STEP_HEIGHT)))
-            .px(px(16.))
-            .child(
-                div()
-                    .w(px(18.))
-                    .flex_shrink_0()
-                    .flex()
-                    .justify_center()
-                    .child(icon(
-                        kind_icon(step.kind),
-                        px(theme::icon_small()),
-                        theme::text_muted(),
-                    )),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(theme::font_name()))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::text())
-                    .child(step.id.clone()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_size(px(theme::font_meta()))
-                            .text_color(theme::text_muted())
-                            .child(if step.kind == Some(StepKind::Merge) {
-                                "the merge queue".to_owned()
-                            } else if step.kind == Some(StepKind::Cleanup) {
-                                "the run's cleanup".to_owned()
-                            } else {
-                                kind.to_owned()
-                            }),
-                    )
-                    .when(
-                        !detail.is_empty()
-                            && step.kind != Some(StepKind::Merge)
-                            && step.kind != Some(StepKind::Cleanup),
-                        |row| {
-                            row.child(
-                                div()
-                                    .text_size(px(theme::font_meta()))
-                                    .text_color(theme::text_muted())
-                                    .child("·"),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .font_family(theme::code_font())
-                                    .text_size(px(theme::font_mono_meta()))
-                                    .text_color(theme::text_dim())
-                                    .child(detail.clone()),
-                            )
-                        },
-                    ),
-            );
-
-        if step.state == StepState::Idle {
-            row = row.child(
-                div()
-                    .id(SharedString::from(format!("{state_selector}-idle")))
-                    .debug_selector({
-                        let selector = state_selector.clone();
-                        move || selector.clone()
-                    })
-                    .flex_shrink_0()
-                    .text_size(px(theme::font_meta()))
-                    .text_color(theme::text_muted())
-                    .child("not run yet"),
-            );
-        } else {
-            row = row.child(state_pill(state_selector, step.state));
-        }
-        band = band.child(row);
-
-        if step.per_task {
-            let mut lanes = div()
-                .flex()
-                .flex_col()
-                .ml(px(44.))
-                .mr(px(16.))
-                .mb(px(6.))
-                .mt(px(-4.))
-                .border_l_1()
-                .border_color(theme::hairline());
-            if step.lanes.is_empty() {
-                lanes = lanes.child(
-                    div()
-                        .px(px(12.))
-                        .py(px(6.))
-                        .text_size(px(theme::font_meta()))
-                        .text_color(theme::text_muted())
-                        .child("No task files yet."),
-                );
-            }
-            for lane in &step.lanes {
-                lanes = lanes.child(self.render_lane(step, lane));
-            }
-            band = band.child(lanes);
-        }
-        band.into_any_element()
-    }
-
-    fn render_lane(&self, step: &StepView, lane: &LaneView) -> AnyElement {
-        let selector = format!("flow-run-lane-{}-{:02}", step.id, lane.number);
-        let state_selector = format!("flow-run-state-{}-{:02}", step.id, lane.number);
-        div()
-            .id(SharedString::from(selector.clone()))
-            .debug_selector(move || selector.clone())
-            .flex()
-            .items_center()
-            .gap(px(10.))
-            .min_h(px(theme::scaled(theme::TASK_ROW_HEIGHT)))
-            .pl(px(12.))
-            .pr(px(8.))
-            .child(number_chip(
-                None,
-                format!("{:02}", lane.number),
-                state_color(lane.state),
-            ))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(theme::font_body()))
-                    .text_color(theme::text_dim())
-                    .child(lane.title.clone()),
-            )
-            .child(state_pill(state_selector, lane.state))
-            .into_any_element()
     }
 
     // ---- the tasks card ----------------------------------------------------
@@ -1684,6 +1509,380 @@ impl FlowApp {
     }
 }
 
+// ---- the workflow matrix --------------------------------------------------
+//
+// The workflow reads as one matrix: the run's tasks across as columns, the
+// workflow's steps down as rows. A `per_task` step is the row that crosses
+// every task, so it holds one small state square per task instead of a lane
+// per task — the template's seven per-task steps over five tasks become seven
+// rows of five cells instead of thirty-five near-identical rows.
+
+/// One task column of the matrix: the number a lane matches on and the title
+/// the header carries (truncated on screen).
+struct MatrixColumn {
+    number: u32,
+    title: String,
+}
+
+/// The matrix's compact density: one 24 px square per (step, task) crossing,
+/// in a 26 px row, where the old band was 44 px plus a 36 px lane per task.
+const MATRIX_CELL: f32 = 24.;
+const MATRIX_ROW_HEIGHT: f32 = 26.;
+const MATRIX_HEADER_HEIGHT: f32 = 26.;
+
+/// A task column: wide enough for the header's number and a truncated title,
+/// never narrower than one cell and its gutter.
+const MATRIX_COLUMN_MAX: f32 = 68.;
+const MATRIX_COLUMN_MIN: f32 = 30.;
+/// Below this width the header drops the title and keeps the task number only.
+const MATRIX_TITLE_MIN: f32 = 56.;
+/// The gap between two matrix columns, in the header and in every row.
+const MATRIX_GAP: f32 = 8.;
+
+/// What the reading column keeps for the step's name, kind and detail line
+/// before the task columns take their share.
+const MATRIX_LABEL_MIN: f32 = 240.;
+
+/// The card row's own horizontal padding, shared by the header and every row.
+const MATRIX_SIDE: f32 = 16.;
+
+/// The matrix's columns: the run's tasks in task-number order, plus any lane
+/// that names a task the task files do not carry, so no state is dropped.
+fn matrix_columns(run: &Run) -> Vec<MatrixColumn> {
+    let mut columns: Vec<MatrixColumn> = Vec::new();
+    let mut push = |number: u32, title: &str| {
+        if !columns.iter().any(|column| column.number == number) {
+            columns.push(MatrixColumn {
+                number,
+                title: title.to_owned(),
+            });
+        }
+    };
+    for task in &run.task_rows {
+        push(task.number, &task.title);
+    }
+    for step in run.steps.iter().filter(|step| step.per_task) {
+        for lane in &step.lanes {
+            push(lane.number, &lane.title);
+        }
+    }
+    columns.sort_by_key(|column| column.number);
+    columns
+}
+
+/// The width of one task column. The reading column is fixed, so more tasks
+/// shrink the columns instead of scrolling them: a horizontal scroll container
+/// inside the run body's own vertical scroll would take the wheel before the
+/// page did. Sixteen tasks still keep the step label 120 px, and nineteen still
+/// fit the reading column before anything is clipped.
+fn matrix_column_width(tasks: usize) -> f32 {
+    let min = theme::scaled(MATRIX_COLUMN_MIN);
+    let max = theme::scaled(MATRIX_COLUMN_MAX);
+    if tasks == 0 {
+        return max;
+    }
+    let room = theme::scaled(shell::READING_WIDTH)
+        - theme::scaled(2. * MATRIX_SIDE)
+        - theme::scaled(MATRIX_LABEL_MIN);
+    let gap = theme::scaled(MATRIX_GAP);
+    ((room + gap) / tasks as f32 - gap).clamp(min, max)
+}
+
+/// The lane a step holds for one task, when the task files gave the step one.
+fn matrix_lane(step: &StepView, number: u32) -> Option<&LaneView> {
+    step.lanes.iter().find(|lane| lane.number == number)
+}
+
+/// The matrix's header: the axis word, then one column per task carrying the
+/// number the run gave it and its title, truncated once.
+fn matrix_head(columns: &[MatrixColumn], column_width: f32) -> AnyElement {
+    let mut head = div()
+        .debug_selector(|| "flow-run-matrix-head".into())
+        .flex()
+        .items_center()
+        .gap(px(theme::scaled(MATRIX_GAP)))
+        .min_h(px(theme::scaled(MATRIX_HEADER_HEIGHT)))
+        .px(px(theme::scaled(MATRIX_SIDE)))
+        .border_b_1()
+        .border_color(theme::border_light())
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(px(theme::font_micro()))
+                .text_color(theme::text_muted())
+                .child("Step"),
+        );
+    let titled = column_width >= theme::scaled(MATRIX_TITLE_MIN);
+    for column in columns {
+        let selector = format!("flow-run-matrix-task-{:02}", column.number);
+        let mut cell = div()
+            .id(SharedString::from(selector.clone()))
+            .debug_selector(move || selector.clone())
+            .flex_shrink_0()
+            .w(px(column_width))
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(5.))
+            .tooltip(tooltip_text(column.title.clone()))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .font_family(theme::code_font())
+                    .text_size(px(theme::font_micro()))
+                    .text_color(theme::text_muted())
+                    .child(format!("{:02}", column.number)),
+            );
+        if titled {
+            cell = cell.child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(theme::font_meta()))
+                    .text_color(theme::text_dim())
+                    .child(column.title.clone()),
+            );
+        }
+        head = head.child(cell);
+    }
+    head.into_any_element()
+}
+
+/// One step row's left side: the kind glyph, the step's name, its kind word,
+/// the marker that says whether it runs once or per task, and the detail line
+/// that says what the step does.
+fn matrix_step_label(step: &StepView, detail: &str, tasks: usize) -> AnyElement {
+    let phrase = match step.kind {
+        Some(StepKind::Merge) => "the merge queue",
+        Some(StepKind::Cleanup) => "the run's cleanup",
+        _ => kind_word(step.kind),
+    };
+    // A per-task row is marked with the count it crosses, so the row says what
+    // the columns are for without a word the narrow reading column cannot fit.
+    let marker = match (step.per_task, tasks) {
+        (true, 0) => "per task".to_owned(),
+        (true, tasks) => format!("×{tasks}"),
+        (false, _) => "once".to_owned(),
+    };
+    let mut label = div()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .child(
+            div()
+                .w(px(18.))
+                .flex_shrink_0()
+                .flex()
+                .justify_center()
+                .child(icon(
+                    kind_icon(step.kind),
+                    px(theme::icon_small()),
+                    theme::text_muted(),
+                )),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(theme::font_name()))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme::text())
+                .child(step.id.clone()),
+        )
+        .child(
+            div()
+                // The kind word is a category, not an example: when the row is
+                // tight the detail below is what gives way, so a row never
+                // reads `review har…` or `fmt … ×5`.
+                .flex_shrink_0()
+                .text_size(px(theme::font_meta()))
+                .text_color(theme::text_muted())
+                .child(phrase),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .font_family(theme::code_font())
+                .text_size(px(theme::font_micro()))
+                .text_color(theme::text_muted())
+                .child(marker),
+        );
+    if !detail.is_empty()
+        && step.kind != Some(StepKind::Merge)
+        && step.kind != Some(StepKind::Cleanup)
+    {
+        label = label
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(theme::font_meta()))
+                    .text_color(theme::text_muted())
+                    .child("·"),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(theme::code_font())
+                    .text_size(px(theme::font_mono_meta()))
+                    .text_color(theme::text_dim())
+                    .child(detail.to_owned()),
+            );
+    }
+    label.into_any_element()
+}
+
+/// One crossing of a `per_task` step and a task: a small square carrying the
+/// state's colour and icon, with the state word as its accessibility label. An
+/// idle crossing is a quiet well, not a hole; a task the step has no lane for
+/// is the same quiet square with a dash.
+fn matrix_cell(step: &StepView, column: &MatrixColumn, column_width: f32) -> AnyElement {
+    let selector = format!("flow-run-lane-{}-{:02}", step.id, column.number);
+    let state_selector = format!("flow-run-state-{}-{:02}", step.id, column.number);
+    let state = matrix_lane(step, column.number).map(|lane| lane.state);
+    let color = state.map_or_else(theme::text_muted, state_color_public);
+    let quiet = matches!(state, None | Some(StepState::Idle));
+    let mut square = div()
+        .id(SharedString::from(selector.clone()))
+        .debug_selector(move || selector.clone())
+        .role(gpui::Role::Status)
+        .aria_label(format!(
+            "{} task {:02}: {}",
+            step.id,
+            column.number,
+            state.map_or("no lane", StepState::label)
+        ))
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(theme::scaled(MATRIX_CELL)))
+        .rounded(px(6.));
+    if quiet {
+        square = square
+            .bg(theme::well())
+            .border_1()
+            .border_color(theme::hairline());
+    } else {
+        square = square.bg(theme::tint(color));
+    }
+    let inner = match state {
+        Some(state) => div()
+            .id(SharedString::from(format!("{state_selector}-icon")))
+            .debug_selector({
+                let selector = state_selector.clone();
+                move || selector.clone()
+            })
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(icon(state_icon(state), px(theme::icon_tiny()), color))
+            .into_any_element(),
+        None => div()
+            .id(SharedString::from(format!("{state_selector}-none")))
+            .debug_selector(move || state_selector.clone())
+            .text_size(px(theme::font_micro()))
+            .text_color(theme::text_muted())
+            .child("–")
+            .into_any_element(),
+    };
+    div()
+        .flex_shrink_0()
+        .w(px(column_width))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(square.child(inner))
+        .into_any_element()
+}
+
+/// One step's matrix row: its label, then either the pill a step that runs once
+/// carries or one cell for every task a `per_task` step runs for.
+fn matrix_step_row(
+    step: &StepView,
+    columns: &[MatrixColumn],
+    column_width: f32,
+    separated: bool,
+) -> AnyElement {
+    let selector = format!("flow-run-step-{}", step.id);
+    let state_selector = format!("flow-run-state-{}", step.id);
+    // The design reads `gate · test` and `harness · skill analyze ·
+    // produces spec.md`: a gate keeps its own command; a harness step keeps its
+    // skill and output names.
+    let detail = match step.kind {
+        Some(StepKind::Gate) => step
+            .detail
+            .strip_prefix("gate: ")
+            .unwrap_or(&step.detail)
+            .to_owned(),
+        _ => step.detail.replace(": ", " "),
+    };
+    let mut row = div()
+        .id(SharedString::from(selector.clone()))
+        .debug_selector(move || selector.clone())
+        .flex()
+        .items_center()
+        .gap(px(theme::scaled(MATRIX_GAP)))
+        .min_h(px(theme::scaled(MATRIX_ROW_HEIGHT)))
+        .px(px(theme::scaled(MATRIX_SIDE)))
+        .when(separated, |row| {
+            row.border_t_1().border_color(theme::border_light())
+        })
+        .child(matrix_step_label(step, &detail, columns.len()));
+    if step.per_task {
+        for column in columns {
+            row = row.child(matrix_cell(step, column, column_width));
+        }
+    } else if step.state == StepState::Idle {
+        row = row.child(
+            div()
+                .id(SharedString::from(format!("{state_selector}-idle")))
+                .debug_selector({
+                    let selector = state_selector.clone();
+                    move || selector.clone()
+                })
+                .flex_shrink_0()
+                .text_size(px(theme::font_meta()))
+                .text_color(theme::text_muted())
+                .child("not run yet"),
+        );
+    } else {
+        row = row.child(state_pill(state_selector, step.state));
+    }
+    row.into_any_element()
+}
+
+/// The workflow's matrix: the task header over one row per step. With no task
+/// files there are no columns to draw; the one note under the rows says why the
+/// per-task rows carry no cells.
+fn step_matrix(run: &Run, columns: &[MatrixColumn], column_width: f32) -> AnyElement {
+    let mut matrix = div()
+        .debug_selector(|| "flow-run-steps".into())
+        .flex()
+        .flex_col()
+        .w_full();
+    if !columns.is_empty() {
+        matrix = matrix.child(matrix_head(columns, column_width));
+    }
+    for (index, step) in run.steps.iter().enumerate() {
+        matrix = matrix.child(matrix_step_row(step, columns, column_width, index > 0));
+    }
+    if columns.is_empty() && run.steps.iter().any(|step| step.per_task) {
+        matrix = matrix.child(
+            div()
+                .debug_selector(|| "flow-run-matrix-note".into())
+                .px(px(theme::scaled(MATRIX_SIDE)))
+                .py(px(8.))
+                .text_size(px(theme::font_meta()))
+                .text_color(theme::text_muted())
+                .child("No task files yet."),
+        );
+    }
+    matrix.into_any_element()
+}
+
 // ---- small rendering helpers ----------------------------------------------
 
 /// How many lines of a session's transcript the run tab shows: the tail is what
@@ -1774,6 +1973,15 @@ fn head_mono(text: impl Into<String>) -> AnyElement {
         .text_size(px(theme::font_mono_meta()))
         .text_color(theme::text_muted())
         .child(text.into())
+        .into_any_element()
+}
+
+/// The `·` between two words in a card head.
+fn dot() -> AnyElement {
+    div()
+        .text_size(px(theme::font_meta()))
+        .text_color(theme::text_muted())
+        .child("·")
         .into_any_element()
 }
 
@@ -2195,6 +2403,11 @@ fn state_pill(selector: String, state: StepState) -> AnyElement {
         });
     pill = pill.child(state.label().to_owned());
     pill.into_any_element()
+}
+
+/// The colour a step state is drawn in, for the workflow diagram.
+pub(crate) fn state_color_public(state: StepState) -> gpui::Rgba {
+    state_color(state)
 }
 
 fn state_color(state: StepState) -> gpui::Rgba {
@@ -2751,5 +2964,127 @@ mod tests {
             1,
             "blank action errors are not lines"
         );
+    }
+
+    fn task(number: u32, title: &str) -> TaskRow {
+        TaskRow {
+            number,
+            title: title.to_owned(),
+            status: Status::ReadyForAgent,
+            blocked_by: Vec::new(),
+        }
+    }
+
+    fn lane(number: u32, title: &str, state: StepState) -> LaneView {
+        LaneView {
+            number,
+            title: title.to_owned(),
+            state,
+        }
+    }
+
+    fn step(id: &str, per_task: bool, lanes: Vec<LaneView>) -> StepView {
+        StepView {
+            id: id.to_owned(),
+            kind: Some(StepKind::Harness),
+            detail: String::new(),
+            per_task,
+            state: StepState::Idle,
+            note: None,
+            lanes,
+        }
+    }
+
+    #[test]
+    fn the_matrix_puts_every_task_across_once_and_keeps_a_stray_lane_column() {
+        let mut run = run();
+        run.task_rows = vec![task(1, "One"), task(2, "Two")];
+        run.steps = vec![
+            step(
+                "code",
+                true,
+                vec![
+                    lane(1, "One", StepState::Done),
+                    lane(2, "Two", StepState::Running),
+                    lane(7, "A task the files lost", StepState::Failed),
+                ],
+            ),
+            step("test", true, vec![lane(1, "One", StepState::Done)]),
+        ];
+
+        let columns = matrix_columns(&run);
+        let numbers: Vec<u32> = columns.iter().map(|column| column.number).collect();
+        assert_eq!(
+            numbers,
+            vec![1, 2, 7],
+            "each task is one column, in task order"
+        );
+        assert_eq!(
+            columns[2].title, "A task the files lost",
+            "a lane naming a task the task files lost keeps its own title"
+        );
+    }
+
+    #[test]
+    fn a_run_with_no_task_files_has_no_columns() {
+        let mut run = run();
+        run.steps = vec![step("code", true, Vec::new())];
+        assert!(
+            matrix_columns(&run).is_empty(),
+            "no tasks means no header and no cells"
+        );
+    }
+
+    #[test]
+    fn a_task_without_a_lane_reads_as_no_lane() {
+        let mut run = run();
+        run.task_rows = vec![task(1, "One"), task(2, "Two")];
+        let code = step("code", true, vec![lane(1, "One", StepState::Done)]);
+        assert_eq!(
+            matrix_lane(&code, 2),
+            None,
+            "a task the step never ran has no lane"
+        );
+        assert_eq!(
+            matrix_lane(&code, 1).map(|lane| lane.state),
+            Some(StepState::Done),
+            "the lane a step does hold keeps its state"
+        );
+    }
+
+    #[test]
+    fn more_tasks_shrink_the_columns_to_fit_the_reading_column() {
+        let max = theme::scaled(MATRIX_COLUMN_MAX);
+        let min = theme::scaled(MATRIX_COLUMN_MIN);
+        let single = matrix_column_width(1);
+        let five = matrix_column_width(5);
+        let twelve = matrix_column_width(12);
+        let many = matrix_column_width(40);
+        assert_eq!(single, max, "one task takes the widest column");
+        assert_eq!(five, max, "five tasks keep a readable header");
+        assert!(
+            five > twelve && twelve > many,
+            "columns shrink as tasks are added"
+        );
+        assert_eq!(many, min, "a column never narrows below one cell");
+        let gap = theme::scaled(MATRIX_GAP);
+        let columns = |tasks: usize| tasks as f32 * (matrix_column_width(tasks) + gap) - gap;
+        for tasks in 1..=19 {
+            let used = theme::scaled(2. * MATRIX_SIDE) + gap + columns(tasks);
+            assert!(
+                used <= theme::scaled(shell::READING_WIDTH),
+                "{tasks} tasks overflow the reading column: {used}"
+            );
+        }
+        for tasks in 1..=16 {
+            let label = theme::scaled(shell::READING_WIDTH)
+                - theme::scaled(2. * MATRIX_SIDE)
+                - gap
+                - columns(tasks);
+            assert!(
+                label >= theme::scaled(120.),
+                "{tasks} tasks leave the step label only {label}"
+            );
+        }
     }
 }

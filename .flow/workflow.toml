@@ -18,10 +18,12 @@
 # A gate is a step (ADR-0015): it carries its own command, folder and timeout,
 # so there is no second file to keep in step with this one.
 #
-# `review` may send the work back to `code` (ADR-0016): it writes a verdict in
-# its artifact's front matter, and `changes` makes the run walk back up to
-# `code` with `review`'s findings, at most `rework_max` times. When the budget
-# is spent the step fails and the run stops.
+# A step may declare back-edges (ADR-0023): `edges` is a list, each entry naming
+# the step the work goes back to, the trigger that sends it, and how many times
+# the edge may be taken. `review` sends the work back to `code` when its
+# artifact's front matter says `verdict: changes`; `test` sends it back when the
+# gate exits non-zero. When an edge's budget is spent the step fails and the run
+# stops, unless the edge says `on_exhausted = "continue"`.
 #
 # A merge may name the step that resolves its conflict (ADR-0020): the named
 # step is a per-task harness step declared after the merge, it runs inside the
@@ -40,7 +42,7 @@
 # because it is the only knob that should: the steps that decide and write get
 # `max`, and the ones that read and report get `high`. `bump` is a gate, and the
 # cleanup is not a session at all: both are declared below.
-schema = 2
+schema = 3
 name = "implement"
 revision = 1
 max_parallel = 2
@@ -84,8 +86,7 @@ kind = "harness"
 skill = "review"
 per_task = true
 produces = "review.md"
-rework_to = "code"
-rework_max = 3
+edges = [{ to = "code", when = "verdict_changes", max = 3 }]
 harness = "dsh"
 model = "opencode-go/deepseek-v4.1-flash"
 effort = "high"
@@ -126,6 +127,13 @@ cwd = "."
 timeout_secs = 1800
 per_task = true
 depends_on = ["clippy"]
+# A failing test sends the work back to `code` (ADR-0023). This is the loop the
+# old single `rework_to` could not express at all: a gate writes no artifact, so
+# there was no verdict for it to read. Its exit code is the trigger, and the
+# budget is what keeps a repository whose tests never pass from spending
+# sessions forever. `fmt` and `clippy` do not loop: a formatting failure is
+# mechanical, and a repair is the right vocabulary for it.
+edges = [{ to = "code", when = "gate_failed", max = 2 }]
 
 # The join. `bump` names nothing, so it waits for every step declared before it
 # — the whole task lane, every check included. It is not per task, so waiting

@@ -1,27 +1,26 @@
-//! The detail pane: the run's head, its four tabs and the strip under them, and
-//! the repository detail's head and two tabs.
+//! The detail pane: the run's head and its four tabs, and the repository
+//! detail's head.
 //!
 //! The run's head carries the title at 22/600, the state, the run's own actions
 //! and the ✕ that closes it; the tab strip is the shell's 42 with the 2 px accent
-//! underline; the 44 strip under it says state, step, attempts, counters and the
-//! age of the last update in one line. The tab bodies are the screens: the Run
-//! tab is [`crate::ui::run`]'s, and the other three are their own entities.
+//! underline. The tab bodies are the screens: the Run tab is
+//! [`crate::ui::run`]'s, and the other three are their own entities.
 
 use gpui::prelude::*;
 use gpui::{AnyElement, Context, FontWeight, SharedString, Window, div, px, relative};
 
-use warpui_kit_core::tooltip::tooltip_text;
 use warpui_kit_core::{A11y as _, controls, icon, shell};
 
 use crate::store::{self, Run};
 use crate::theme;
 use crate::ui::runs::{plural, state_hue, state_icon};
-use crate::ui::window::{FlowApp, RepoTab, RunTab};
+use crate::ui::screens::Screen;
+use crate::ui::window::{FlowApp, RunTab};
 
 impl FlowApp {
     // ---- the run ----------------------------------------------------------
 
-    /// The open run's pane: head, tabs, strip, and the open tab's body.
+    /// The open run's pane: head, tabs, and the open tab's body.
     pub(crate) fn render_run_pane(
         &mut self,
         window: &mut Window,
@@ -51,7 +50,6 @@ impl FlowApp {
             .min_h_0()
             .bg(theme::panel())
             .child(self.render_run_head(&run, tab, cx))
-            .child(self.render_run_strip(&run))
             .child(
                 div()
                     .flex()
@@ -111,20 +109,32 @@ impl FlowApp {
             .gap_0p5()
             .child(run_tab(
                 RunTab::Run,
-                Some(plural(run.attempts, "attempt")),
+                Some(format!(
+                    "{} {}",
+                    run.attempts,
+                    plural(run.attempts, "attempt")
+                )),
                 tab,
                 cx,
             ))
             .child(run_tab(
                 RunTab::TaskDiff,
-                Some(plural(run.tasks_total, "task")),
+                Some(format!(
+                    "{} {}",
+                    run.tasks_total,
+                    plural(run.tasks_total, "task")
+                )),
                 tab,
                 cx,
             ))
             .child(run_tab(RunTab::Artifacts, None, tab, cx))
             .child(run_tab(
                 RunTab::Workflow,
-                Some(plural(run.steps.len(), "step")),
+                Some(format!(
+                    "{} {}",
+                    run.steps.len(),
+                    plural(run.steps.len(), "step")
+                )),
                 tab,
                 cx,
             ));
@@ -195,80 +205,11 @@ impl FlowApp {
             .into_any_element()
     }
 
-    /// The 44 strip under the run's head: state, step and task, attempts, the
-    /// counters and the age of the last update, in one line.
-    fn render_run_strip(&self, run: &Run) -> AnyElement {
-        let hue = state_hue(run.column);
-        let step = if run.step.trim().is_empty() || run.step == "—" {
-            "No step yet".to_owned()
-        } else {
-            let task = run
-                .rows
-                .last()
-                .map(|row| row.task.clone())
-                .filter(|task| !task.trim().is_empty() && task != "-");
-            match task {
-                Some(task) => format!("Step {} · task {task}", run.step),
-                None => format!("Step {}", run.step),
-            }
-        };
-        div()
-            .debug_selector(|| "flow-run-strip".into())
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .flex_wrap()
-            .gap(px(12.))
-            .min_h(px(theme::scaled(theme::RUN_STRIP_HEIGHT)))
-            .py(px(4.))
-            .px(px(theme::scaled(shell::DETAIL_PADDING)))
-            .bg(theme::surface())
-            .border_b_1()
-            .border_color(theme::hairline())
-            .text_size(px(theme::font_meta()))
-            .text_color(theme::text_dim())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(5.))
-                    .text_color(hue)
-                    .child(icon(state_icon(run.column), px(theme::icon_small()), hue))
-                    .child(if run.column == store::Column::Running {
-                        motion_spinner()
-                    } else {
-                        div().child(run.column.state_word()).into_any_element()
-                    }),
-            )
-            .child(div().child(step))
-            .child(div().child(plural(run.attempts, "attempt")))
-            .child(div().text_color(theme::text_muted()).child(format!(
-                "{} steps · {} {}",
-                run.steps.len(),
-                run.tasks_total,
-                if run.tasks_total == 1 {
-                    "task"
-                } else {
-                    "tasks"
-                }
-            )))
-            .child(div().flex_1())
-            .child(
-                div()
-                    .text_color(theme::text_muted())
-                    .child(match run.age() {
-                        Some(age) if age == "now" => "Updated now".to_owned(),
-                        Some(age) => format!("Updated {age} ago"),
-                        None => "Updated —".to_owned(),
-                    }),
-            )
-            .into_any_element()
-    }
-
     // ---- the repository ---------------------------------------------------
 
-    /// The repository detail: the head, the Workflow tab, and the screen it
-    /// opens.
+    /// The repository detail: its head, then the one screen it opens — the
+    /// workflow template editor. It was a one-tab strip until the Gates screen
+    /// became a step (ADR-0015) and the tab stopped choosing anything.
     pub(crate) fn render_repo_detail(
         &mut self,
         _window: &mut Window,
@@ -277,9 +218,8 @@ impl FlowApp {
         let Some(repo) = self.repo_in_focus() else {
             return self.render_no_run();
         };
-        let tab = self.repo_tab().unwrap_or(RepoTab::Workflow);
         let name = crate::ui::window::repo_label(&repo);
-        let body = self.screens.render(tab.screen());
+        let body = self.screens.render(Screen::Workflow);
         div()
             .id("flow-repo-detail")
             .debug_selector(|| "flow-repo-detail".into())
@@ -356,14 +296,6 @@ impl FlowApp {
                                     .font_family(theme::code_font())
                                     .child(store::display_path(&repo)),
                             ),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(|| "flow-repo-tabs".into())
-                            .flex()
-                            .items_end()
-                            .gap_0p5()
-                            .child(repo_tab(RepoTab::Workflow, tab, cx)),
                     )
                     .child(div().h(px(1.)).w_full().bg(theme::hairline())),
             )
@@ -448,20 +380,4 @@ fn run_tab(
         );
     }
     element.into_any_element()
-}
-
-/// One repository tab.
-fn repo_tab(tab: RepoTab, open: RepoTab, cx: &mut Context<FlowApp>) -> AnyElement {
-    let selected = tab == open;
-    let selector = format!("flow-nav-{}", tab.key());
-    shell::detail_tab(SharedString::from(selector.clone()), tab.label(), selected)
-        .debug_selector(move || selector.clone())
-        .a11y_tab(tab.label(), selected)
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.open_repo_tab(tab, window, cx);
-        }))
-        .tooltip(tooltip_text(match tab {
-            RepoTab::Workflow => "The workflow template a run reads",
-        }))
-        .into_any_element()
 }

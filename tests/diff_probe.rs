@@ -146,6 +146,39 @@ fn run_git(dir: &Path, args: &[&str]) {
     );
 }
 
+/// The record a conflicted merge attempt leaves in `repairs/`: front matter
+/// naming the task and the outcome, then the `~~~` block of conflicting paths.
+fn write_conflicted_repair(repo: &Path) {
+    let repairs = repo.join(".scratch/demo/repairs");
+    fs::create_dir_all(&repairs).expect("repairs folder");
+    fs::write(
+        repairs.join("01.md"),
+        "---\nstep: merge\ntask: 01\nattempt: 1\nof: 3\noutcome: conflicted\n\
+         at: 2026-11-23T12:17:33Z\n---\n\n\
+         # Repair 01: merge (attempt 1 of 3)\n\n\
+         the merge conflicted in: src/lib.rs\n\n~~~\nsrc/lib.rs\n~~~\n",
+    )
+    .expect("conflicted repair");
+}
+
+/// What a landed merge leaves behind: the task is `resolved`, and no repair is
+/// written for the attempt that worked.
+fn resolve_first_task(repo: &Path) {
+    let path = repo.join(".scratch/demo/issues/01-demo.md");
+    let text = fs::read_to_string(&path).expect("task 01");
+    fs::write(
+        &path,
+        text.replace("**Status:** ready-for-agent", "**Status:** resolved"),
+    )
+    .expect("resolved task 01");
+}
+
+/// Show the screen the same run again, which reloads the selected task.
+fn reload(screen: &Entity<DiffScreen>, cx: &mut VisualTestContext, repo: &Path) {
+    cx.update(|_, cx| screen.update(cx, |screen, cx| screen.show(screen_run(repo), cx)));
+    settle(cx);
+}
+
 #[gpui_kit::gpui::test]
 fn the_selected_task_shows_branch_base_files_and_patch(cx: &mut TestAppContext) {
     let _guard = hold_home();
@@ -328,6 +361,86 @@ fn a_git_failure_is_one_readable_line(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("flow-diff-error").is_some(),
         "the failure is shown as a line"
+    );
+
+    cleanup(home);
+}
+
+/// The regression: a run whose merge eventually landed cleanly still showed the
+/// conflict for the rest of its life. The successful attempt writes no repair,
+/// so the last conflicted record stood — but a `resolved` task's work is in
+/// `main`, and no conflict can be current for it.
+#[gpui_kit::gpui::test]
+fn a_resolved_task_clears_the_conflict_a_retried_merge_recorded(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("resolved-conflict");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let repo = seed_repo(&home);
+    write_conflicted_repair(&repo);
+    resolve_first_task(&repo);
+
+    let (screen, cx) = open_screen(cx, screen_run(&repo));
+
+    assert!(
+        screen.read_with(cx, |screen, _| screen.diff_for_probe().is_some()),
+        "the resolved task's branch still loads, so this is not a failure path"
+    );
+    assert!(
+        cx.debug_bounds("flow-diff-conflict-bar").is_none(),
+        "a resolved task's work landed, so no conflict is current"
+    );
+    assert!(
+        cx.debug_bounds("flow-diff-group-conflicts").is_none(),
+        "the rail has no Conflicts group for a landed task"
+    );
+    assert!(
+        cx.debug_bounds("flow-diff-group-changed").is_some(),
+        "its branch is the ordinary changed list"
+    );
+    assert!(
+        cx.debug_bounds("flow-diff-patch").is_some(),
+        "the diff draws in the ordinary patch body, not a conflict block"
+    );
+
+    cleanup(home);
+}
+
+/// The other half of the rule: an open task still shows the conflict its newest
+/// repair records, and a later repair for that task is a retry that clears it.
+#[gpui_kit::gpui::test]
+fn an_open_task_keeps_its_record_until_a_later_repair_clears_it(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("open-conflict");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let repo = seed_repo(&home);
+    write_conflicted_repair(&repo);
+
+    let (screen, cx) = open_screen(cx, screen_run(&repo));
+
+    assert!(
+        cx.debug_bounds("flow-diff-conflict-bar").is_some(),
+        "the newest repair for an open task is still the run's state"
+    );
+    assert!(
+        cx.debug_bounds("flow-diff-group-conflicts").is_some(),
+        "the rail groups the recorded conflict first"
+    );
+
+    // A later repair for the same task records a retry that did not conflict.
+    fs::write(
+        repo.join(".scratch/demo/repairs/02.md"),
+        "---\nstep: merge\ntask: 01\nattempt: 2\nof: 3\noutcome: blocked\n\
+         at: 2026-11-23T12:20:00Z\n---\n\n\
+         # Repair 02: merge (attempt 2 of 3)\n\nthe merge was refused\n",
+    )
+    .expect("later repair");
+    reload(&screen, cx, &repo);
+
+    assert!(
+        cx.debug_bounds("flow-diff-conflict-bar").is_none(),
+        "a later repair for the task clears the conflict"
     );
 
     cleanup(home);

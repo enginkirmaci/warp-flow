@@ -6,8 +6,9 @@
 //! Each surface lives in its own module and renders through `impl FlowApp`:
 //! [`crate::ui::chrome`] (title bar and rail), [`crate::ui::repos`] (the list),
 //! [`crate::ui::runs`] (the run column) and [`crate::ui::detail`] (the run's head,
-//! tabs, strip and tab bodies). The run tab's own content is [`crate::ui::run`],
-//! and [`crate::ui::new_run`] is the form that writes a new issue folder.
+//! tabs and tab bodies). The run tab's own content is [`crate::ui::run`],
+//! [`crate::ui::about`] is the About page the Settings section carries, and
+//! [`crate::ui::new_run`] is the form that writes a new issue folder.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -33,11 +34,20 @@ use crate::theme;
 use crate::ui::screens::settings::SettingsGroup;
 use crate::ui::screens::{Screen, ScreenRepo, ScreenRun, Screens};
 
+gpui::actions!(
+    flow,
+    [
+        /// Folds the list pane away, or brings it back: the act the title bar's
+        /// toggle performs, and the one `Ctrl+\` promises.
+        ToggleList,
+    ]
+);
+
 /// The run column's page step: a page key moves five rows.
 pub(crate) const PAGE: usize = 5;
 
-/// The rail's sections. Settings and About are pinned to its bottom, the two
-/// work sections at its top.
+/// The rail's sections. Settings is pinned to its bottom, the two work sections
+/// at its top.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     /// The repositories on the left, the 320 run column and the open run on the
@@ -46,16 +56,14 @@ pub enum Section {
     /// The repositories on the left, the selected repository's gates and
     /// workflow on the right: the window a person edits.
     Repos,
-    /// The installed family, this app's build and the license. About sits above
-    /// Settings at the rail's foot, the same place every app carries it.
-    About,
-    /// This app's own settings.
+    /// This app's own settings, and the About page at the end of its group
+    /// list: the installed family, this build and the license.
     Settings,
 }
 
 impl Section {
-    /// The work sections, in rail order. About and Settings are pinned to the
-    /// foot and are rendered from their own pair of items.
+    /// The work sections, in rail order. Settings is pinned to the foot and is
+    /// rendered from its own item.
     pub const WORK: [Self; 2] = [Self::Runs, Self::Repos];
 
     /// A stable key for debug selectors and state.
@@ -63,7 +71,6 @@ impl Section {
         match self {
             Self::Runs => "runs",
             Self::Repos => "repos",
-            Self::About => "about",
             Self::Settings => "settings",
         }
     }
@@ -73,7 +80,6 @@ impl Section {
         match self {
             Self::Runs => "Runs",
             Self::Repos => "Repos",
-            Self::About => "About",
             Self::Settings => "Settings",
         }
     }
@@ -83,7 +89,6 @@ impl Section {
         match self {
             Self::Runs => "icons/icon-flow.svg",
             Self::Repos => "icons/icon-repos.svg",
-            Self::About => "icons/icon-info.svg",
             Self::Settings => "icons/icon-cog.svg",
         }
     }
@@ -93,7 +98,6 @@ impl Section {
         match self {
             Self::Runs => None,
             Self::Repos => Some(Screen::Workflow),
-            Self::About => None,
             Self::Settings => Some(Screen::Settings),
         }
     }
@@ -153,47 +157,6 @@ impl RunTab {
     }
 }
 
-/// The repository detail's one tab: the workflow template its runs read.
-///
-/// It was two — Gates and Workflow — until a gate became a step (ADR-0015):
-/// the gates are steps in the same graph, so there is one document and one
-/// screen to edit it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RepoTab {
-    Workflow,
-}
-
-impl RepoTab {
-    /// Every tab, in the strip's order.
-    pub const ALL: [Self; 1] = [Self::Workflow];
-
-    /// A stable key for debug selectors and state.
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Workflow => "workflow",
-        }
-    }
-
-    /// The tab's word.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Workflow => "Workflow",
-        }
-    }
-
-    /// The screen this tab renders.
-    pub fn screen(self) -> Screen {
-        match self {
-            Self::Workflow => Screen::Workflow,
-        }
-    }
-
-    /// The tab for `screen`, when `screen` is the repository's.
-    pub fn from_screen(screen: Screen) -> Option<Self> {
-        Self::ALL.into_iter().find(|tab| tab.screen() == screen)
-    }
-}
-
 /// One view of one document: the source it was built from, so a scan that
 /// changed it replaces the read-only editor instead of showing stale markdown.
 pub(crate) struct DocSlot {
@@ -234,8 +197,9 @@ pub struct FlowApp {
     pub(crate) list_width: f32,
     /// The settings group the section's list selected.
     pub(crate) settings_group: SettingsGroup,
-    /// Whether About's license dialog is up, and the document it shows: the
-    /// family's modal, opened by the Legal card's View license.
+    /// Whether the About page's license dialog is up, and the document it
+    /// shows: the family's modal, opened by the Legal card's View license in
+    /// Settings › About.
     pub(crate) about_license_open: bool,
     pub(crate) about_license: Option<Entity<LiveEditorState>>,
     /// The New run form, while it is open. It owns its two fields and the
@@ -265,8 +229,8 @@ pub struct FlowApp {
     pub(crate) card_bounds: CardBounds,
     pub(crate) rail_scroll: ScrollHandle,
     /// The screen the detail shows. `None` in the Runs section means no run is
-    /// open, so the run column has the whole pane; `None` in Repos and About
-    /// means the section's own first surface.
+    /// open, so the run column has the whole pane; Repos and Settings each show
+    /// their own screens.
     pub(crate) screen: Option<Screen>,
     /// Whether the window is maximized, read in `render` so the zoom button's
     /// glyph follows the compositor.
@@ -563,8 +527,9 @@ impl FlowApp {
     }
 
     /// Open one of the rail's sections. The section decides what the detail can
-    /// show: Runs keeps whatever run tab was open, Repos opens on the tab it was
-    /// last left on, About and Settings show their one page.
+    /// show: Runs keeps whatever run tab was open, Repos opens its one
+    /// repository screen, Settings shows its groups and the About page among
+    /// them.
     pub(crate) fn open_section(
         &mut self,
         section: Section,
@@ -572,19 +537,31 @@ impl FlowApp {
         cx: &mut Context<Self>,
     ) {
         if self.section == section {
+            // Settings' About page takes the section's whole width, so the
+            // group list it was opened from is not on screen; the rail's own
+            // Settings item is the way back to it.
+            if section == Section::Settings && self.settings_group == SettingsGroup::About {
+                self.settings_group = SettingsGroup::default();
+                cx.notify();
+            }
             window.focus(&self.board_focus, cx);
             return;
         }
         self.section = section;
+        if section == Section::Settings && self.settings_group == SettingsGroup::About {
+            // entering Settings from another section opens on its groups, not
+            // on the About page it was left on
+            self.settings_group = SettingsGroup::default();
+        }
         let screen = match section {
             Section::Runs => self
                 .screen
                 .and_then(RunTab::from_screen)
                 .or_else(|| self.selected_run.is_some().then_some(RunTab::Run))
                 .map(RunTab::screen),
-            Section::Repos => Some(self.repo_tab().map_or(Screen::Workflow, RepoTab::screen)),
-            Section::About => None,
-            Section::Settings => Some(Screen::Settings),
+            // The repository detail has one screen, so a section opens it
+            // directly instead of through a one-variant tab enum.
+            other => other.screen(),
         };
         self.open_screen(screen, window, cx);
     }
@@ -592,11 +569,6 @@ impl FlowApp {
     /// The run's open tab, when the Runs section is showing one.
     pub(crate) fn run_tab(&self) -> Option<RunTab> {
         self.screen.and_then(RunTab::from_screen)
-    }
-
-    /// The repository detail's open tab.
-    pub(crate) fn repo_tab(&self) -> Option<RepoTab> {
-        self.screen.and_then(RepoTab::from_screen)
     }
 
     /// Open one of the run's four tabs, opening the run itself when none is.
@@ -612,22 +584,17 @@ impl FlowApp {
         self.open_screen(Some(tab.screen()), window, cx);
     }
 
-    /// Open the repository detail's tab.
-    pub(crate) fn open_repo_tab(
-        &mut self,
-        tab: RepoTab,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.section = Section::Repos;
-        self.open_screen(Some(tab.screen()), window, cx);
-    }
-
     /// Fold the list pane away, or bring it back: the title bar's toggle and
     /// `Ctrl+\`.
     pub(crate) fn toggle_list(&mut self, cx: &mut Context<Self>) {
         self.list_hidden = !self.list_hidden;
         cx.notify();
+    }
+
+    /// The `Ctrl+\` binding's handler: the same act the title bar's toggle
+    /// takes, so the tooltip, the title bar and the key cannot disagree.
+    fn toggle_list_action(&mut self, _: &ToggleList, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_list(cx);
     }
 
     /// Star or unstar a repository. The Favorites band follows on the next
@@ -1269,16 +1236,19 @@ impl Render for FlowApp {
         let detail = match self.section {
             Section::Runs => self.render_runs_detail(window, cx),
             Section::Repos => self.render_repos_detail(window, cx),
-            Section::About => self.render_about_detail(window, cx),
             Section::Settings => self.render_settings_detail(window, cx),
         };
-        let list = (!self.list_hidden).then(|| match self.section {
-            Section::Runs | Section::Repos => self.render_list_pane(cx),
-            // About's list is the kit's installed family, and Settings has its
-            // own three groups: a repository list beside either would be noise
-            Section::About => div().into_any_element(),
-            Section::Settings => self.render_settings_list(cx),
-        });
+        let list = if self.list_hidden {
+            None
+        } else {
+            match self.section {
+                Section::Runs | Section::Repos => Some(self.render_list_pane(cx)),
+                // Settings' About page takes the section's whole width: its
+                // own installed-family list is the pane beside its detail.
+                Section::Settings if self.settings_group == SettingsGroup::About => None,
+                Section::Settings => Some(self.render_settings_list(cx)),
+            }
+        };
         let mut stage = shell::panes().debug_selector(|| "flow-panes".into());
         if let Some(list) = list {
             stage = stage.child(list);
@@ -1295,6 +1265,9 @@ impl Render for FlowApp {
             .flex_col()
             .bg(theme::surface())
             .text_color(theme::text())
+            // The window's own key: `Ctrl+\` folds the list pane away and back,
+            // wherever the focus sits in the window.
+            .on_action(cx.listener(Self::toggle_list_action))
             // A press anywhere but the armed row's Forget affordance leaves
             // that row alone; the affordance stops its own press, so it is the
             // one exception (ADR-0015: the list pane owns the lifecycle).
@@ -1405,22 +1378,25 @@ impl FlowApp {
         self.render_repo_detail(window, cx)
     }
 
-    /// The About section: the installed family, the build and the license.
-    fn render_about_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        self.render_about(window, cx)
-    }
-
-    /// The Settings section: this window's own knobs, one group at a time.
+    /// The Settings section: this window's own knobs, one group at a time. The
+    /// last group is the About page the rail used to carry, composed from
+    /// [`crate::ui::about`] rather than by the settings entity: the license
+    /// dialog is the window's, over the whole surface. The page carries its own
+    /// list (the installed family) and needs the section's whole width, so the
+    /// settings group list makes way for it.
     fn render_settings_detail(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if self.settings_group == SettingsGroup::About {
+            return self.render_about(window, cx);
+        }
         self.screens.show_settings(self.settings_group, cx);
         self.screens.render(Screen::Settings)
     }
 
-    /// The Settings section's list: its three groups, the selected one lifted.
+    /// The Settings section's list: its groups, the selected one lifted.
     fn render_settings_list(&self, cx: &mut Context<Self>) -> AnyElement {
         let width = shell::clamp_list_width(self.list_width);
         let mut rows = div()

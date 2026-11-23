@@ -53,7 +53,7 @@ fn seed_repo(home: &Path) -> PathBuf {
     .expect("run.md");
     std::fs::write(
         warp_flow_core::layout::pinned_workflow(&issue),
-        "schema = 2\nname = \"implement\"\nrevision = 1\n\n[[step]]\nid = \"code\"\n\
+        "schema = 3\nname = \"implement\"\nrevision = 1\n\n[[step]]\nid = \"code\"\n\
          kind = \"harness\"\nskill = \"code\"\nper_task = true\n",
     )
     .expect("workflow.toml");
@@ -107,20 +107,24 @@ fn the_shell_routes_its_sections_and_a_runs_tabs(cx: &mut TestAppContext) {
     let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
     settle(cx);
 
-    // the run column owns the detail until a run is picked, and the two work
-    // sections are the rail's items
+    // the run column owns the detail until a run is picked, and the rail is the
+    // two work sections and Settings at its foot: About is a Settings group now
     assert!(cx.debug_bounds("flow-board").is_some());
     assert!(
         cx.debug_bounds("flow-detail").is_none(),
         "no run is open before one is picked"
     );
-    for section in ["runs", "repos", "about", "settings"] {
+    for section in ["runs", "repos", "settings"] {
         assert!(
             cx.debug_bounds(selector(&format!("flow-rail-{section}")))
                 .is_some(),
             "{section} is a rail item"
         );
     }
+    assert!(
+        cx.debug_bounds("flow-rail-about").is_none(),
+        "About is not a rail item: it is the last Settings group"
+    );
 
     // picking a run opens its pane: the column stays, the four tabs appear
     click(cx, "flow-card-repo-a-demo-run");
@@ -152,14 +156,15 @@ fn the_shell_routes_its_sections_and_a_runs_tabs(cx: &mut TestAppContext) {
         "the Run tab is the run's own screen"
     );
 
-    // the repository section shows the repository detail, and About and
-    // Settings are pages, not runs
+    // the repository section shows the repository detail, and Settings is a
+    // page, not a run
     click(cx, "flow-rail-repos");
     assert!(cx.debug_bounds("flow-repo-detail").is_some());
     click(cx, "flow-rail-settings");
     assert!(cx.debug_bounds("flow-screen-settings").is_some());
     // the section's list picks one group, and the detail shows only that one
     assert!(cx.debug_bounds("flow-settings-appearance").is_some());
+    assert!(cx.debug_bounds("flow-settings-about").is_some());
     assert!(cx.debug_bounds("settings-row-text-size").is_some());
     assert!(
         cx.debug_bounds("settings-row-folder").is_none(),
@@ -171,8 +176,25 @@ fn the_shell_routes_its_sections_and_a_runs_tabs(cx: &mut TestAppContext) {
         cx.debug_bounds("settings-row-text-size").is_none(),
         "Appearance left with its group"
     );
-    click(cx, "flow-rail-about");
-    assert!(cx.debug_bounds("flow-about").is_some());
+    // the About page is the last Settings group: the installed family, this
+    // build and the license, still the kit's own screen
+    click(cx, "flow-settings-about");
+    assert!(
+        cx.debug_bounds("flow-about").is_some(),
+        "the About group shows the family's page"
+    );
+    assert!(
+        cx.debug_bounds("flow-screen-settings").is_none(),
+        "the settings rows leave when About takes the detail"
+    );
+    assert!(
+        cx.debug_bounds("flow-list").is_none(),
+        "the group list makes way for the About page's own family list"
+    );
+    assert!(
+        cx.debug_bounds("about-list").is_some(),
+        "the About page brings the installed family with it"
+    );
     // the Legal card's View license opens the family's modal, not a browser tab
     click(cx, "about-link-license");
     assert!(
@@ -184,6 +206,14 @@ fn the_shell_routes_its_sections_and_a_runs_tabs(cx: &mut TestAppContext) {
         cx.debug_bounds("about-license-dialog").is_none(),
         "closing it takes it away"
     );
+    // the rail's Settings item is the way back from the About page to the
+    // section's group list
+    click(cx, "flow-rail-settings");
+    assert!(
+        cx.debug_bounds("flow-settings-appearance").is_some(),
+        "a second press on Settings returns to its groups"
+    );
+    assert!(cx.debug_bounds("flow-about").is_none());
 
     // and Runs brings the column back with the run still open
     click(cx, "flow-rail-runs");
@@ -213,6 +243,59 @@ fn entering_a_run_still_opens_the_run_screen(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("flow-run-workflow").is_some(),
         "the detail pane's Open run still opens the run screen"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `Ctrl+\` is the title bar's list toggle from the keyboard. It is bound in
+/// the app's bootstrap ([`warp_flow::app::bind_keys`]), so the probe installs
+/// the same table and presses the real keystroke rather than dispatching the
+/// action by hand: the binding and the handler are what the tooltip promises.
+#[gpui_kit::gpui::test]
+fn ctrl_backslash_folds_the_list_away_and_back(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("list-key");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    // the app's bootstrap installs these keys; this probe builds the window
+    // itself, so it binds the same table instead of reaching the action
+    cx.update(warp_flow::app::bind_keys);
+    let repo = seed_repo(&home);
+
+    let handle = open_app(cx, vec![repo]);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    cx.update(|window, _| window.activate_window());
+    settle(cx);
+
+    assert!(
+        cx.debug_bounds("flow-list").is_some(),
+        "the list starts open on Runs"
+    );
+
+    cx.simulate_keystrokes("ctrl-\\");
+    settle(cx);
+    assert!(
+        cx.debug_bounds("flow-list").is_none(),
+        "Ctrl+\\ folds the list pane away"
+    );
+    assert!(
+        cx.debug_bounds("flow-board").is_some(),
+        "the run column takes the width the list leaves"
+    );
+
+    cx.simulate_keystrokes("ctrl-\\");
+    settle(cx);
+    assert!(
+        cx.debug_bounds("flow-list").is_some(),
+        "the same key brings the pane back"
+    );
+
+    // the title bar's toggle is the one act, so the two cannot drift
+    click(cx, "flow-list-toggle");
+    assert!(
+        cx.debug_bounds("flow-list").is_none(),
+        "the title bar's toggle still folds the pane"
     );
 
     let _ = std::fs::remove_dir_all(&home);

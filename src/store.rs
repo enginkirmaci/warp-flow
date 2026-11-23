@@ -1826,7 +1826,7 @@ mod tests {
         fs::write(
             layout::pinned_workflow(&dir),
             r#"
-schema = 2
+schema = 3
 name = "implement"
 revision = 2
 
@@ -1892,7 +1892,7 @@ depends_on = []
         fs::create_dir_all(layout::dir(&dir)).expect("the .flow folder");
         fs::write(
             layout::workflow_file(&dir),
-            "schema = 2\nname = \"implement\"\nrevision = 1\n\n\
+            "schema = 3\nname = \"implement\"\nrevision = 1\n\n\
              [[step]]\nid = \"fmt\"\nkind = \"gate\"\ncommand = \"cargo fmt --check\"\n\n\
              [[step]]\nid = \"test\"\nkind = \"gate\"\ncommand = \"cargo test\"\n",
         )
@@ -1998,8 +1998,7 @@ depends_on = []
             timeout_secs: None,
             depends_on: Some(Vec::new()),
             produces: None,
-            rework_to: None,
-            rework_max: None,
+            edges: Vec::new(),
             per_task: false,
             mode: None,
             push: false,
@@ -2107,8 +2106,7 @@ depends_on = []
             timeout_secs: None,
             depends_on: Some(Vec::new()),
             produces: None,
-            rework_to: None,
-            rework_max: None,
+            edges: Vec::new(),
             per_task: true,
             mode: None,
             push: false,

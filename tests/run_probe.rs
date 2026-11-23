@@ -85,7 +85,7 @@ fn seed_workflow(repo: &Path, id: &str, steps: &str) {
     let dir = issue_dir(repo, id);
     std::fs::write(
         warp_flow_core::layout::pinned_workflow(&dir),
-        format!("schema = 2\nname = \"implement\"\nrevision = 3\n\n{steps}"),
+        format!("schema = 3\nname = \"implement\"\nrevision = 3\n\n{steps}"),
     )
     .expect("workflow.toml");
 }
@@ -295,7 +295,7 @@ fn the_run_screen_shows_the_harness_sessions_newest_last(cx: &mut TestAppContext
 }
 
 #[gpui_kit::gpui::test]
-fn the_run_screen_has_a_band_per_step_and_a_lane_per_task(cx: &mut TestAppContext) {
+fn the_run_screen_draws_a_step_row_and_a_lane_cell_per_task(cx: &mut TestAppContext) {
     let _guard = hold_home();
     let home = scratch_home("bands");
     cx.update(gpui_kit::init);
@@ -383,6 +383,377 @@ fn the_run_screen_has_a_band_per_step_and_a_lane_per_task(cx: &mut TestAppContex
             "the run screen keeps its key"
         );
     });
+
+    cleanup(home);
+}
+
+/// The workflow card is one matrix: a header of task columns carried once and
+/// one compact row per step, where each `per_task` step used to hang a 36 px
+/// lane under its 44 px band for every task.
+#[gpui_kit::gpui::test]
+fn the_workflow_is_one_matrix_with_tasks_across_and_steps_down(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("matrix");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+
+    let repo = seed_repo(&home, "repo-a");
+    seed_spec(
+        &repo,
+        "run-matrix",
+        "ready-for-agent",
+        "One matrix",
+        "Body.",
+    );
+    seed_run(
+        &repo,
+        "run-matrix",
+        "running",
+        "review",
+        &[
+            ("analyze", "-", 1, "done"),
+            ("code", "01", 1, "done"),
+            ("review", "01", 1, "running"),
+        ],
+    );
+    seed_workflow(
+        &repo,
+        "run-matrix",
+        "[[step]]\nid = \"analyze\"\nkind = \"harness\"\nskill = \"analyze\"\nproduces = \"spec.md\"\n\n\
+         [[step]]\nid = \"code\"\nkind = \"harness\"\nskill = \"code\"\nper_task = true\ndepends_on = [\"analyze\"]\n\n\
+         [[step]]\nid = \"review\"\nkind = \"harness\"\nskill = \"review\"\nper_task = true\ndepends_on = [\"code\"]\n\n\
+         [[step]]\nid = \"test\"\nkind = \"gate\"\ncommand = \"cargo test\"\ndepends_on = [\"review\"]\n",
+    );
+    for number in 1..=3 {
+        seed_task(
+            &repo,
+            "run-matrix",
+            number,
+            &format!("Task {number:02}"),
+            "ready-for-agent",
+            "None",
+        );
+    }
+
+    let (handle, _page) = open_app(cx, vec![repo]);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+    click(cx, "flow-card-repo-a-run-matrix");
+
+    // The task header: one column per task, carrying the number once.
+    let head = bounds(cx, "flow-run-matrix-head");
+    for number in 1..=3 {
+        let name = format!("flow-run-matrix-task-{number:02}");
+        assert!(
+            cx.debug_bounds(selector(&name)).is_some(),
+            "task {number:02} has a header column"
+        );
+    }
+
+    // One compact row per step, stacked in workflow order under the header.
+    let analyze = bounds(cx, "flow-run-step-analyze");
+    let code = bounds(cx, "flow-run-step-code");
+    let review = bounds(cx, "flow-run-step-review");
+    let test = bounds(cx, "flow-run-step-test");
+    assert!(
+        head.origin.y + head.size.height <= analyze.origin.y + px(1.),
+        "the header sits over the first step row"
+    );
+    for (name, row) in [
+        ("analyze", analyze),
+        ("code", code),
+        ("review", review),
+        ("test", test),
+    ] {
+        assert!(
+            row.size.height <= px(theme::scaled(30.)),
+            "step {name}'s row is one compact line, not a band plus lanes: {:?}",
+            row.size.height
+        );
+    }
+    assert!(
+        analyze.origin.y + analyze.size.height <= code.origin.y + px(1.)
+            && code.origin.y + code.size.height <= review.origin.y + px(1.)
+            && review.origin.y + review.size.height <= test.origin.y + px(1.),
+        "the rows stack in workflow order"
+    );
+
+    // A per-task step carries one cell per task, aligned under its column; a
+    // step that runs once keeps its single state pill instead.
+    let code_01 = bounds(cx, "flow-run-lane-code-01");
+    let review_01 = bounds(cx, "flow-run-lane-review-01");
+    assert!(
+        (code_01.origin.x - review_01.origin.x).abs() <= px(1.),
+        "task 01 is one column across the steps"
+    );
+    assert!(
+        review_01.origin.y > code_01.origin.y,
+        "the later step's cell sits below the earlier one"
+    );
+    assert!(
+        code_01.size.width <= px(theme::scaled(28.)),
+        "a lane cell is a small square: {:?}",
+        code_01.size
+    );
+    assert!(
+        cx.debug_bounds("flow-run-state-code-01").is_some(),
+        "the cell carries its state element"
+    );
+    assert!(
+        cx.debug_bounds("flow-run-state-code").is_none(),
+        "a per-task step has cells, not an aggregate pill"
+    );
+    assert!(
+        cx.debug_bounds("flow-run-state-test").is_some(),
+        "a step that runs once keeps its state pill"
+    );
+    let card = bounds(cx, "flow-run-workflow");
+    let last = bounds(cx, "flow-run-lane-code-03");
+    assert!(
+        last.origin.x + last.size.width <= card.origin.x + card.size.width + px(1.),
+        "the last task's cell stays inside the workflow card"
+    );
+
+    cleanup(home);
+}
+
+/// A `per_task` step in a run whose plan has not written its task files yet:
+/// the row stays, the matrix has no columns, and one note says why.
+#[gpui_kit::gpui::test]
+fn a_per_task_step_with_no_task_files_has_no_matrix_columns(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("no-tasks");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+
+    let repo = seed_repo(&home, "repo-a");
+    seed_spec(
+        &repo,
+        "run-no-tasks",
+        "ready-for-agent",
+        "No tasks yet",
+        "Body.",
+    );
+    seed_run(
+        &repo,
+        "run-no-tasks",
+        "running",
+        "plan",
+        &[("plan", "-", 1, "running")],
+    );
+    seed_workflow(
+        &repo,
+        "run-no-tasks",
+        "[[step]]\nid = \"plan\"\nkind = \"harness\"\nskill = \"analyze\"\nproduces = \"tasks.md\"\n\n\
+         [[step]]\nid = \"code\"\nkind = \"harness\"\nskill = \"code\"\nper_task = true\ndepends_on = [\"plan\"]\n",
+    );
+
+    let (handle, _page) = open_app(cx, vec![repo]);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+    click(cx, "flow-card-repo-a-run-no-tasks");
+
+    assert!(
+        cx.debug_bounds("flow-run-step-plan").is_some()
+            && cx.debug_bounds("flow-run-step-code").is_some(),
+        "both step rows still draw"
+    );
+    assert!(
+        cx.debug_bounds("flow-run-matrix-head").is_none(),
+        "no tasks means no task columns"
+    );
+    assert!(
+        cx.debug_bounds("flow-run-matrix-note").is_some(),
+        "one note says why the per-task row carries no cells"
+    );
+    assert!(
+        cx.debug_bounds("flow-run-lane-code-01").is_none(),
+        "no cell is invented for a task that does not exist"
+    );
+
+    cleanup(home);
+}
+
+/// A run with more tasks than a titled column fits: the columns shrink to their
+/// floor and the cells stay inside the reading column, in task order, with no
+/// horizontal scroll to trap the wheel.
+#[gpui_kit::gpui::test]
+fn a_many_task_run_shrinks_the_columns_instead_of_overflowing(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("many-tasks");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+
+    let repo = seed_repo(&home, "repo-a");
+    seed_spec(&repo, "run-many", "ready-for-agent", "Many tasks", "Body.");
+    seed_run(&repo, "run-many", "running", "code", &[]);
+    seed_workflow(
+        &repo,
+        "run-many",
+        "[[step]]\nid = \"analyze\"\nkind = \"harness\"\nskill = \"analyze\"\nproduces = \"spec.md\"\n\n\
+         [[step]]\nid = \"code\"\nkind = \"harness\"\nskill = \"code\"\nper_task = true\ndepends_on = [\"analyze\"]\n",
+    );
+    for number in 1..=12 {
+        seed_task(
+            &repo,
+            "run-many",
+            number,
+            &format!("Task {number:02}"),
+            "ready-for-agent",
+            "None",
+        );
+    }
+
+    let (handle, _page) = open_app(cx, vec![repo]);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+    click(cx, "flow-card-repo-a-run-many");
+
+    let card = bounds(cx, "flow-run-workflow");
+    let mut previous: Option<gpui::Bounds<gpui::Pixels>> = None;
+    for number in 1..=12 {
+        let name = format!("flow-run-lane-code-{number:02}");
+        let cell = bounds(cx, selector(&name));
+        assert!(
+            cell.origin.x >= card.origin.x
+                && cell.origin.x + cell.size.width <= card.origin.x + card.size.width + px(1.),
+            "task {number:02}'s cell stays inside the workflow card"
+        );
+        if let Some(previous) = previous {
+            assert!(
+                previous.origin.x + previous.size.width <= cell.origin.x + px(1.),
+                "task {number:02}'s cell comes after task {:02}'s",
+                number - 1
+            );
+        }
+        previous = Some(cell);
+    }
+    assert!(
+        cx.debug_bounds("flow-run-matrix-task-12").is_some(),
+        "the twelfth task still has its header column"
+    );
+
+    cleanup(home);
+}
+
+/// The shipped template: twelve steps, seven of them per task, over five tasks.
+/// The matrix is one row per step — twelve rows and a header, about eight of the
+/// old 44 px band rows tall — where the bands and their 35 lane rows were forty.
+#[gpui_kit::gpui::test]
+fn twelve_steps_over_five_tasks_fit_in_about_eight_band_rows(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("twelve");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+
+    let repo = seed_repo(&home, "repo-a");
+    seed_spec(
+        &repo,
+        "run-twelve",
+        "ready-for-agent",
+        "Twelve steps",
+        "Body.",
+    );
+    seed_run(
+        &repo,
+        "run-twelve",
+        "running",
+        "code",
+        &[("analyze", "-", 1, "done"), ("code", "01", 1, "running")],
+    );
+    seed_workflow(
+        &repo,
+        "run-twelve",
+        "[[step]]\nid = \"analyze\"\nkind = \"harness\"\nskill = \"analyze\"\nproduces = \"spec.md\"\n\n\
+         [[step]]\nid = \"approve-plan\"\nkind = \"question\"\n\n\
+         [[step]]\nid = \"code\"\nkind = \"harness\"\nskill = \"code\"\nper_task = true\n\n\
+         [[step]]\nid = \"review\"\nkind = \"harness\"\nskill = \"review\"\nper_task = true\nproduces = \"review.md\"\n\n\
+         [[step]]\nid = \"fmt\"\nkind = \"gate\"\ncommand = \"cargo fmt --all --check\"\nper_task = true\n\n\
+         [[step]]\nid = \"clippy\"\nkind = \"gate\"\ncommand = \"cargo clippy --all-targets\"\nper_task = true\n\n\
+         [[step]]\nid = \"test\"\nkind = \"gate\"\ncommand = \"cargo test\"\nper_task = true\n\n\
+         [[step]]\nid = \"bump\"\nkind = \"gate\"\ncommand = \"python3 scripts/bump.py\"\nper_task = false\n\n\
+         [[step]]\nid = \"merge\"\nkind = \"merge\"\nper_task = true\n\n\
+         [[step]]\nid = \"resolve-conflict\"\nkind = \"harness\"\nskill = \"merge-conflict\"\nper_task = true\ndepends_on = [\"merge\"]\n\n\
+         [[step]]\nid = \"summary\"\nkind = \"harness\"\nskill = \"summary\"\nproduces = \"summary.md\"\ndepends_on = [\"merge\"]\n\n\
+         [[step]]\nid = \"cleanup\"\nkind = \"cleanup\"\nper_task = false\ndepends_on = [\"merge\"]\n",
+    );
+    for number in 1..=5 {
+        seed_task(
+            &repo,
+            "run-twelve",
+            number,
+            &format!("Task {number:02}"),
+            "ready-for-agent",
+            "None",
+        );
+    }
+
+    let (handle, _page) = open_app(cx, vec![repo]);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+    click(cx, "flow-card-repo-a-run-twelve");
+
+    // One row per step, in workflow order, with no lane row in between.
+    let mut previous: Option<gpui::Bounds<gpui::Pixels>> = None;
+    for step in [
+        "analyze",
+        "approve-plan",
+        "code",
+        "review",
+        "fmt",
+        "clippy",
+        "test",
+        "bump",
+        "merge",
+        "resolve-conflict",
+        "summary",
+        "cleanup",
+    ] {
+        let name = format!("flow-run-step-{step}");
+        let row = bounds(cx, selector(&name));
+        assert!(
+            row.size.height <= px(theme::scaled(30.)),
+            "step {step} is one compact row: {:?}",
+            row.size.height
+        );
+        if let Some(previous) = previous {
+            let gap = row.origin.y - (previous.origin.y + previous.size.height);
+            assert!(
+                gap.abs() <= px(1.),
+                "no lane rows sit between {step} and the step above it: {gap:?}"
+            );
+        }
+        previous = Some(row);
+    }
+
+    // Every task has its column once and a merge cell under it.
+    for number in 1..=5 {
+        let column = format!("flow-run-matrix-task-{number:02}");
+        assert!(
+            cx.debug_bounds(selector(&column)).is_some(),
+            "task {number:02} has its header column"
+        );
+        let cell = format!("flow-run-lane-merge-{number:02}");
+        assert!(
+            cx.debug_bounds(selector(&cell)).is_some(),
+            "task {number:02} has a merge cell"
+        );
+    }
+
+    // The matrix is a header plus twelve rows: about eight 44 px band rows.
+    let head = bounds(cx, "flow-run-matrix-head");
+    let last = previous.expect("twelve step rows were measured");
+    let matrix_height = last.origin.y + last.size.height - head.origin.y;
+    assert!(
+        matrix_height <= px(theme::scaled(44. * 8.)),
+        "twelve steps fit in about eight band rows, not forty: {matrix_height:?}"
+    );
+    let card = bounds(cx, "flow-run-workflow");
+    let last_cell = bounds(cx, "flow-run-lane-merge-05");
+    assert!(
+        last_cell.origin.x + last_cell.size.width <= card.origin.x + card.size.width + px(1.),
+        "the fifth task's cell stays inside the workflow card"
+    );
 
     cleanup(home);
 }

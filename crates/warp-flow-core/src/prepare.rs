@@ -353,7 +353,7 @@ mod tests {
     use crate::test_support::TempDir;
 
     const WORKFLOW: &str = r#"
-schema = 2
+schema = 3
 name = "implement"
 revision = 1
 
@@ -557,7 +557,7 @@ depends_on = ["check"]
         let (_root, issue) = fixture(&dir);
         fs::write(
             layout::pinned_workflow(&issue),
-            "schema = 2\nname = \"implement\"\nrevision = 1\n\n[[step]]\n\
+            "schema = 3\nname = \"implement\"\nrevision = 1\n\n[[step]]\n\
              id = \"check\"\nkind = \"gate\"\n",
         )
         .expect("workflow.toml");
@@ -571,7 +571,7 @@ depends_on = ["check"]
         let (_root, issue) = fixture(&dir);
         fs::write(
             layout::pinned_workflow(&issue),
-            "schema = 2\nname = \"implement\"\nrevision = 1\n\n[[step]]\n\
+            "schema = 3\nname = \"implement\"\nrevision = 1\n\n[[step]]\n\
              id = \"code\"\nkind = \"harness\"\nskill = \"code\"\nenabled = false\n",
         )
         .expect("workflow.toml");
@@ -587,7 +587,7 @@ depends_on = ["check"]
         let (_root, issue) = fixture(&dir);
         fs::write(
             layout::pinned_workflow(&issue),
-            "schema = 2\nname = \"implement\"\nrevision = 1\n\n[[step]]\n\
+            "schema = 3\nname = \"implement\"\nrevision = 1\n\n[[step]]\n\
              id = \"ghost\"\nkind = \"harness\"\nskill = \"not-shipped\"\nenabled = false\n\n\
              [[step]]\nid = \"code\"\nkind = \"harness\"\nskill = \"code\"\n",
         )
@@ -603,7 +603,7 @@ depends_on = ["check"]
         let (_root, issue) = fixture(&dir);
         fs::write(
             layout::pinned_workflow(&issue),
-            "schema = 2\nname = \"implement\"\nrevision = 1\n\n[[step]]\n\
+            "schema = 3\nname = \"implement\"\nrevision = 1\n\n[[step]]\n\
              id = \"one\"\nkind = \"harness\"\nskill = \"code\"\ndepends_on = [\"two\"]\n\n\
              [[step]]\nid = \"two\"\nkind = \"harness\"\nskill = \"code\"\n\
              depends_on = [\"one\"]\n",

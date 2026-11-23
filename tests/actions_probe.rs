@@ -72,7 +72,7 @@ fn seed_repo(home: &Path, name: &str, with_workflow: bool) -> (PathBuf, PathBuf)
     if with_workflow {
         fs::write(
             warp_flow_core::layout::pinned_workflow(&issue),
-            "schema = 2\nname = \"probe\"\nrevision = 1\n\n[[step]]\n\
+            "schema = 3\nname = \"probe\"\nrevision = 1\n\n[[step]]\n\
              id = \"work\"\nkind = \"harness\"\nskill = \"code\"\n",
         )
         .expect("workflow.toml");

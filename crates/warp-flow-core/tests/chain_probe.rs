@@ -26,7 +26,7 @@ use warp_flow_core::run::{MemoryLog, RunStatus, Runner, RunnerConfig};
 use warp_flow_core::worktree::{Repo, TaskWorktree};
 
 const WORKFLOW: &str = r#"
-schema = 2
+schema = 3
 name = "chain"
 revision = 1
 
@@ -64,7 +64,7 @@ depends_on = ["test"]
 /// nothing so it joins the whole lane, and a `merge` that names nothing so it
 /// waits for the join as well.
 const WORKFLOW_WITH_JOIN: &str = r#"
-schema = 2
+schema = 3
 name = "chain"
 revision = 1
 

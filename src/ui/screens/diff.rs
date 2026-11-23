@@ -1215,7 +1215,9 @@ impl DiffScreen {
                     .pt(px(8.))
                     .text_size(px(theme::font_meta()))
                     .text_color(theme::text_muted())
-                    .child("Read-only here. Run once and Run all live in Repos › Gates."),
+                    .child(
+                        "Read-only here. The commands live on the gate steps in Repos › Workflow.",
+                    ),
             );
         }
         card(head, body.into_any_element())
@@ -1804,6 +1806,13 @@ fn load_task(
             conflicts.paths.push(file.path.clone());
         }
     }
+    // A `resolved` task's work has landed, so no conflict can be current: not
+    // the newest repair's, because the attempt that merged writes no repair of
+    // its own to outrank the conflicted one, and not an unmerged file's, because
+    // work already in the base branch leaves no merge in progress.
+    if task.status.is_resolved() {
+        conflicts = ConflictRead::default();
+    }
     conflicts.paths.sort();
     conflicts.paths.dedup();
     let gates = read_gate_views(&repo.root, &run);
@@ -1835,7 +1844,9 @@ fn task_body(path: &Path) -> Option<String> {
 
 /// The run's conflict record for `task`: the newest `repairs/NN.md` that names
 /// it, when the engine recorded a conflict there. A later repair for the task
-/// means the conflict was retried and is no longer the run's state.
+/// means the conflict was retried and is no longer the run's state. A `resolved`
+/// task outranks the whole record — see `load_task`, because the merge that
+/// lands the work writes no repair.
 fn read_conflicts(issue: &Path, task: u32) -> ConflictRead {
     let dir = issue.join("repairs");
     let Ok(entries) = fs::read_dir(&dir) else {

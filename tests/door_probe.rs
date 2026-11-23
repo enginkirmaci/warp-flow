@@ -73,7 +73,7 @@ impl Drop for ScratchDir {
 }
 
 const WORKFLOW: &str = r#"
-schema = 2
+schema = 3
 name = "probe"
 revision = 1
 
@@ -92,7 +92,7 @@ depends_on = ["work"]
 "#;
 
 const QUESTION_WORKFLOW: &str = r#"
-schema = 2
+schema = 3
 name = "probe"
 revision = 1
 

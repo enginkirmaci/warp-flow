@@ -40,14 +40,18 @@ rules that still matter move into `README.md` or this file.
 - `src/bin/warp-flow-cli.rs` — the headless driver (`run`, `status`, `answer`)
   over `core::prepare`, the same preparation the app uses. Keep it building and
   keep its argument tests.
-- `src/ui/` — the family's one shell: `chrome.rs` (the 46 title bar and the 76
-  rail), `repos.rs` (the 432 repository list), `runs.rs` (the 320 run column,
-  the board read downwards: lane bands, run rows, the keyboard cursor and its
-  reveal) and `detail.rs` (the run's head, its four tabs — Run, Task & diff,
-  Artifacts, Workflow — and the 44 strip under them). `window.rs` holds the
-  state, the scan and host adoption, selection and the render composition;
-  `run.rs` is the Run tab's body (workflow step bands, task chips, the
-  question card, attempt history, sessions and the engine log). The shell is
+- `src/ui/` — the family's one shell: `chrome.rs` (the 46 title bar — whose
+  list toggle is also `Ctrl+\` — and the 76 rail), `repos.rs` (the 432
+  repository list: the board's filter on Runs, the repository picker on Repos),
+  `runs.rs` (the 320 run column, the board read downwards: lane bands, run
+  rows, the keyboard cursor and its reveal) and `detail.rs` (the run's head and
+  its four tabs — Run, Task & diff, Artifacts, Workflow — and the repository
+  detail's head over its one screen). `window.rs` holds the state, the scan and
+  host adoption, selection and the render composition; `run.rs` is the Run
+  tab's body (the workflow matrix — steps down, tasks across, one cell per
+  crossing — the task chips, the question card, attempt history, sessions and
+  the engine log); `about.rs` is the family's About page
+  (the installed family, this build and the license). The shell is
   `warpui_kit_core::shell`: rail 76, list 432 (320–560), detail padding 24,
   reading 760, control 34, field 36, tab 42. Keep the state grouping: a lane
   band per non-empty `store::Column`, Waiting on you in `CHANGES`, Blocked in
@@ -59,14 +63,21 @@ rules that still matter move into `README.md` or this file.
   vocabulary, the `ScreenRun` a screen is handed, and the two rules they all
   follow: `edit_permission` (the engine owns the folder while it drives) and
   `write_artifact`/`write_atomic_raw` (the only writers). The Gates screen is
-  gone: a gate is a step, so `workflow.rs` edits it (ADR-0015).
-- Sections and tabs are state, not routes: `Section` (Runs, Repos, About,
-  Settings) picks the rail's page, `RunTab` the open run's four screens and
-  `RepoTab` the repository's one tab, Workflow. The run's Workflow tab is
-  `ScreenRun::read_only` — a reading of the revision the run uses — and the
-  template is edited in Repos › Workflow, so a running run never reads a file
-  that changes under it. Repositories are added and forgotten from the list
-  pane's `+` popover, which is why the window owns those settings.
+  gone: a gate is a step, so `workflow.rs` edits it (ADR-0015). It draws the
+  graph through `graph.rs`: a layered node-link picture read top to bottom, with
+  each back-edge looped on the right — not an indented tree.
+- Sections and tabs are state, not routes: `Section` (Runs, Repos, Settings)
+  picks the rail's page and `RunTab` the open run's four screens. The
+  repository detail has one screen, `Screen::Workflow`, so it has no tab enum.
+  The run's Workflow tab is `ScreenRun::read_only` — a reading of the revision
+  the run uses — and the template is edited in Repos › Workflow, so a running
+  run never reads a file that changes under it. Settings is a list of groups
+  (Appearance, Engine, Files, About); its About group is the family's About page
+  (`ui::about`), which needs the section's whole width and so takes the place of
+  the group list — a second press on the rail's Settings item returns to the
+  groups. The rail is three items and the license dialog stays the window's.
+  Repositories are added and forgotten from the list pane's `+` popover, which
+  is why the window owns those settings.
 - `app.toml`, `version.toml`, `rust-toolchain.toml`, `scripts/version.py` and
   `.githooks/pre-commit` follow the family's rules; do not hand-edit a version.
 
@@ -88,11 +99,15 @@ withdraws the door and asks a blocking engine to stop.
   harness it would have preferred (ADR-0017). The prompt is the skill
   document plus the step's inputs; a step's time budget is a silence window
   that progress resets, not a cap on the whole turn. The one place a step's
-  judgement moves a run is a **rework edge** (ADR-0016): a step that declares
-  `rework_to` writes its `produces` artifact and the engine reads *that file's
-  front matter* — `verdict: ready` or `verdict: changes` — never the session's
-  prose and never its transcript. The judgement is a declared file with a
-  stated shape, which is why it may be read where prose may not.
+  judgement moves a run is an **edge** (ADR-0023): a step declares a list of
+  back-edges, each with a trigger the engine reads from a *file or an exit
+  code* — a harness step's `produces` front matter (`verdict: ready` /
+  `verdict: changes`), a gate's exit code, a question's `answer:` — never the
+  session's prose and never its transcript. The judgement is a declared file
+  with a stated shape, which is why it may be read where prose may not. An
+  edge's rounds are the `sent-back:<to>:<trigger>` rows in `run.md`; the target
+  may be any step, and `Workflow::edge_span` is the one place that says which
+  steps a round re-runs.
 - **A gate may act.** A gate command may act, not only check: the bump moves
   the version and commits it on `main`, and its exit code is still all the
   engine reads. An acting gate is not idempotent, so the merge queue re-runs
@@ -157,7 +172,7 @@ withdraws the door and asks a blocking engine to stop.
 - **The file is read downwards.** `depends_on` has three states (ADR-0018):
   omitted is every step declared before it, `[]` is a root, a list is exactly
   those. `Workflow::dependencies` is the one resolver — the scheduler, the cycle
-  check, the rework targets, the merge's gate ancestors and the drawn tree all
+  check, the edge spans, the merge's gate ancestors and the drawn graph all
   go through it, so they cannot disagree. Never read `step.depends_on` directly
   to answer "what does this wait for"; `named_dependencies()` is only for what
   the file spells out.
@@ -166,6 +181,12 @@ withdraws the door and asks a blocking engine to stop.
 
 Unit tests live beside the module; end-to-end runs use a fake harness so the
 whole engine can be exercised in a temp directory with no model and no network.
+
+> **`cargo test --locked` at this root runs the app's probes only.**
+> `warp-flow-core` is a path dependency, not a workspace member (there is no
+> `[workspace]` in `Cargo.toml`), so the engine's 241 tests only run with
+> `cargo test --locked -p warp-flow-core`. Always run both; a green
+> `cargo test --locked` says nothing about the engine.
 
 ### Build output
 

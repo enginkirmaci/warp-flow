@@ -1,6 +1,7 @@
-//! The About section: the installed family in the list, the selected member in
-//! the detail. The screen itself is `warpui_kit_core::about`; this module keeps
-//! the one piece of state it needs and the effects behind its verbs.
+//! The About group of Settings: the installed family in the list, the selected
+//! member in the detail. The screen itself is `warpui_kit_core::about`; this
+//! module keeps the one piece of state it needs and the effects behind its
+//! verbs.
 //!
 //! `FlowApp` has no About fields and `window.rs` is not this module's to edit,
 //! so the selection and the scanned members live in a small `Entity` created on
@@ -73,7 +74,7 @@ fn start_scan(state: Entity<AboutState>, cx: &mut Context<FlowApp>) {
 }
 
 impl FlowApp {
-    /// The About section: the installed members in the list (this app seeded
+    /// The About group: the installed members in the list (this app seeded
     /// from the build facts, the siblings from the one background scan), the
     /// selected one's identity, Build and Legal cards in the detail. It opens
     /// on Flow, the app you are in.

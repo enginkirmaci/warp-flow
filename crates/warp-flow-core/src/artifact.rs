@@ -586,7 +586,21 @@ impl Issue {
         self.tasks.iter().find(|task| task.number == number)
     }
 
-    /// The tasks that can start now: not resolved, and every blocker resolved.
+    /// The tasks that can start now: `ready-for-agent`, with every blocker
+    /// resolved.
+    ///
+    /// The status filter is the whole point. A task is a person's decision as
+    /// much as a unit of work, and only one of the tracker's labels means "an
+    /// agent may pick this up":
+    ///
+    /// - `ready-for-agent` — the only one that starts.
+    /// - `needs-triage`, `needs-info` — a person has not finished deciding.
+    /// - `ready-for-human` — deliberately reserved for a person.
+    /// - `wontfix` — deliberately not being done.
+    /// - `resolved` — already landed.
+    ///
+    /// Starting any of the others would open a session, run the gates and merge
+    /// a branch for work a person explicitly held back.
     ///
     /// The order is task number order, because a lane runs blockers first.
     pub fn ready_tasks(&self) -> Vec<&Task> {
@@ -599,7 +613,7 @@ impl Issue {
         self.tasks
             .iter()
             .filter(|task| {
-                !task.status.is_resolved()
+                task.status == Status::ReadyForAgent
                     && task
                         .blocked_by
                         .iter()
@@ -839,6 +853,36 @@ mod tests {
         let issue = Issue::open(&folder).expect("open");
         assert!(issue.tasks().is_empty());
         assert!(issue.ready_tasks().is_empty());
+    }
+
+    #[test]
+    fn only_ready_for_agent_tasks_are_ready_to_start() {
+        // The regression this guards: the filter used to be `!is_resolved()`,
+        // so a task a person marked `wontfix` (or reserved for a human, or had
+        // not triaged yet) still got a session, a gate run and a merge.
+        let (_dir, path) = issue_with(&[
+            (1, "needs-triage", "None"),
+            (2, "needs-info", "None"),
+            (3, "ready-for-agent", "None"),
+            (4, "ready-for-human", "None"),
+            (5, "wontfix", "None"),
+            (6, "resolved", "None"),
+        ]);
+        let issue = Issue::open(&path).expect("open");
+        assert_eq!(
+            issue
+                .ready_tasks()
+                .iter()
+                .map(|task| task.number)
+                .collect::<Vec<_>>(),
+            vec![3],
+            "only `ready-for-agent` means an agent may start it"
+        );
+        assert_eq!(
+            issue.tasks().len(),
+            6,
+            "the other five are still in the folder, they just do not start"
+        );
     }
 
     #[test]

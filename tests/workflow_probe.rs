@@ -37,7 +37,7 @@ fn scratch_home(name: &str) -> PathBuf {
 }
 
 const WORKFLOW: &str = r#"
-schema = 2
+schema = 3
 name = "implement"
 revision = 4
 
@@ -61,42 +61,10 @@ command = "cargo test"
 depends_on = ["code"]
 "#;
 
-/// A graph whose declaration order is not its tree order: `test` is declared
-/// second, waits for `review` first, and joins back to `analyze`.
-const TREE: &str = r#"
-schema = 2
-name = "tree"
-revision = 2
-max_parallel = 2
-
-[[step]]
-id = "analyze"
-kind = "harness"
-skill = "analyze"
-
-[[step]]
-id = "test"
-kind = "gate"
-command = "cargo test"
-depends_on = ["review", "analyze"]
-
-[[step]]
-id = "code"
-kind = "harness"
-skill = "code"
-depends_on = ["analyze"]
-
-[[step]]
-id = "review"
-kind = "harness"
-skill = "review"
-depends_on = ["code"]
-"#;
-
 /// Two roots, and two children of the first: a step's siblings are the steps
 /// with the same parent, and nothing else.
 const SIBLINGS: &str = r#"
-schema = 2
+schema = 3
 name = "siblings"
 revision = 3
 max_parallel = 2
@@ -131,7 +99,7 @@ depends_on = ["first"]
 /// one, and the run's cleanup: the merge form's field, and a kind whose shape
 /// the schema refuses to carry fields.
 const CONFLICT: &str = r#"
-schema = 2
+schema = 3
 name = "conflict"
 revision = 2
 max_parallel = 2
@@ -158,119 +126,6 @@ id = "cleanup"
 kind = "cleanup"
 per_task = false
 depends_on = ["merge"]
-"#;
-
-/// A straight pipeline: each step waits for the one before it, nothing forks.
-/// The list is a chain, and the whole of it must be drawn flat.
-const CHAIN: &str = r#"
-schema = 2
-name = "chain"
-revision = 1
-
-[[step]]
-id = "a"
-kind = "harness"
-skill = "code"
-
-[[step]]
-id = "b"
-kind = "harness"
-skill = "code"
-depends_on = ["a"]
-
-[[step]]
-id = "c"
-kind = "harness"
-skill = "code"
-depends_on = ["b"]
-
-[[step]]
-id = "d"
-kind = "harness"
-skill = "code"
-depends_on = ["c"]
-"#;
-
-/// A fork and a join: `root` starts two branches and `join` waits for both, so
-/// the branches indent and the join comes back out to the fork.
-const FORK_JOIN: &str = r#"
-schema = 2
-name = "fork-join"
-revision = 1
-
-[[step]]
-id = "root"
-kind = "harness"
-skill = "code"
-
-[[step]]
-id = "a1"
-kind = "harness"
-skill = "code"
-depends_on = ["root"]
-
-[[step]]
-id = "a2"
-kind = "harness"
-skill = "code"
-depends_on = ["a1"]
-
-[[step]]
-id = "b1"
-kind = "harness"
-skill = "code"
-depends_on = ["root"]
-
-[[step]]
-id = "b2"
-kind = "harness"
-skill = "code"
-depends_on = ["b1"]
-
-[[step]]
-id = "join"
-kind = "harness"
-skill = "code"
-depends_on = ["a2", "b2"]
-"#;
-
-/// The mixed shape: `review` forks into `fmt` and `test`, `fmt` chains into
-/// `clippy`, and `bump` joins all three. Every check indents once, and the
-/// join lands back on `review`.
-const MIXED: &str = r#"
-schema = 2
-name = "mixed"
-revision = 1
-
-[[step]]
-id = "review"
-kind = "harness"
-skill = "review"
-produces = "review.md"
-
-[[step]]
-id = "fmt"
-kind = "gate"
-command = "cargo fmt --all --check"
-depends_on = ["review"]
-
-[[step]]
-id = "clippy"
-kind = "gate"
-command = "cargo clippy --all-targets"
-depends_on = ["fmt"]
-
-[[step]]
-id = "test"
-kind = "gate"
-command = "cargo test"
-depends_on = ["review"]
-
-[[step]]
-id = "bump"
-kind = "harness"
-skill = "bump"
-depends_on = ["fmt", "clippy", "test"]
 "#;
 
 /// A committed throwaway repository with one issue folder.
@@ -354,20 +209,12 @@ fn set_field(cx: &mut VisualTestContext, name: &str, value: &str) {
     settle(cx);
 }
 
-/// A row's left edge in window pixels: its indent in the list's tree.
+/// A node's left edge in window pixels: where the diagram draws it.
 fn indent_of(cx: &mut VisualTestContext, index: usize) -> f32 {
     let bounds = cx
-        .debug_bounds(selector(&format!("flow-workflow-indent-{index}")))
-        .unwrap_or_else(|| panic!("row {index} has an indent selector"));
-    f32::from(bounds.origin.x)
-}
-
-/// A row's top edge in window pixels: where the tree draws it.
-fn row_top(cx: &mut VisualTestContext, index: usize) -> f32 {
-    let bounds = cx
         .debug_bounds(selector(&format!("flow-workflow-step-{index}")))
-        .unwrap_or_else(|| panic!("step {index} is a row in the list"));
-    f32::from(bounds.origin.y)
+        .unwrap_or_else(|| panic!("step {index} is a node in the diagram"));
+    f32::from(bounds.origin.x)
 }
 
 /// The graph's step ids in declaration order, for a probe that reorders them.
@@ -417,11 +264,23 @@ fn open_template(
     repo: &Path,
     template: &str,
 ) -> gpui::WindowHandle<ScreenHost> {
+    open_template_sized(cx, repo, template, 1200., 860.)
+}
+
+/// The same, at a chosen window size: the diagram shows the whole picture at a
+/// wide window and scrolls sideways at a narrow one.
+fn open_template_sized(
+    cx: &mut TestAppContext,
+    repo: &Path,
+    template: &str,
+    width: f32,
+    height: f32,
+) -> gpui::WindowHandle<ScreenHost> {
     std::fs::write(warp_flow_core::layout::workflow_file(repo), template)
         .expect("the repository template");
     let host = Arc::new(Host::new());
     let repo = repo.to_path_buf();
-    cx.open_window(size(px(1200.), px(860.)), |_window, cx| {
+    cx.open_window(size(px(width), px(height)), |_window, cx| {
         let screen = cx.new(|cx| WorkflowScreen::new(Arc::clone(&host), cx));
         screen.update(cx, |screen, cx| {
             screen.show_repository(repo.clone(), cx);
@@ -804,14 +663,14 @@ fn dependencies_are_chips_picked_from_the_graph(cx: &mut TestAppContext) {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A rework edge is edited on the step: the picker offers only the steps this
-/// one waits for, pressing one sets `rework_to`, pressing "none" clears it, the
-/// loop is named on the row without selecting it, and a merge step — which
-/// either lands or fails — offers nothing at all.
+/// A step's back-edges are edited on the step: pressing a target adds an edge,
+/// the trigger chips pick what sends the work back, the budget chips pick how
+/// many rounds, and the cross takes the edge away. A merge — which either lands
+/// or fails — offers no target at all.
 #[gpui_kit::gpui::test]
-fn a_rework_edge_is_edited_on_the_step(cx: &mut TestAppContext) {
+fn an_edge_is_edited_on_the_step(cx: &mut TestAppContext) {
     let _guard = hold_home();
-    let home = scratch_home("rework-edge");
+    let home = scratch_home("edge-edit");
     cx.update(gpui_kit::init);
     cx.update(theme::apply_kit_theme);
     let (repo, _issue) = seed_repo(&home, None);
@@ -820,120 +679,46 @@ fn a_rework_edge_is_edited_on_the_step(cx: &mut TestAppContext) {
     let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
     settle(cx);
 
-    // `left` waits for `first` and nothing else, so `first` is the only step it
-    // may send the work back to; `second` and `right` are not upstream of it
+    // The step has no loop yet: every other step is offered as a target.
     select(&handle, cx, 2);
-    assert!(cx.debug_bounds("flow-step-rework-to").is_some());
-    assert!(
-        cx.debug_bounds("flow-step-rework-to-first").is_some(),
-        "the step it waits for is the target it may pick"
-    );
-    assert!(
-        cx.debug_bounds("flow-step-rework-to-second").is_none(),
-        "a step it does not wait for is not a target"
-    );
-    assert!(
-        cx.debug_bounds("flow-step-rework-to-right").is_none(),
-        "a cousin is not a target either"
-    );
-    assert!(
-        cx.debug_bounds("flow-step-rework-to-clear").is_some(),
-        "the picker has a way to clear the edge"
-    );
+    assert!(cx.debug_bounds("flow-step-edges").is_some());
+    assert!(cx.debug_bounds("flow-step-edge-add-first").is_some());
 
-    // picking a target sets the edge, marks the graph dirty, and names it on
-    // the row so the loop is visible without selecting the step
-    click(cx, "flow-step-rework-to-first");
+    // Pressing a target adds the edge with the natural trigger for the kind.
+    click(cx, "flow-step-edge-add-first");
     let graph = graph_of(&handle, cx);
-    assert_eq!(graph.steps[2].rework_to.as_deref(), Some("first"));
+    assert_eq!(graph.steps[2].edges.len(), 1);
+    assert_eq!(graph.steps[2].edges[0].to, "first");
+    assert_eq!(
+        graph.steps[2].edges[0].when,
+        warp_flow_core::graph::Trigger::VerdictChanges,
+        "a harness step loops back on a changes verdict"
+    );
     assert!(
         cx.debug_bounds("flow-workflow-dirty").is_some(),
-        "editing the rework edge is an unsaved change"
+        "editing an edge is an unsaved change"
     );
     let meta = meta_of(&handle, cx, 2);
     assert!(meta.contains("returns to first"), "{meta}");
 
-    // clearing it takes the edge away again, and the row stops naming it
-    click(cx, "flow-step-rework-to-clear");
+    // The budget belongs to the edge.
+    click(cx, "flow-step-edge-0-max-3");
     let graph = graph_of(&handle, cx);
-    assert_eq!(graph.steps[2].rework_to, None, "the edge is cleared");
+    assert_eq!(graph.steps[2].edges[0].budget(), 3);
+
+    // Removing it takes the whole edge away.
+    click(cx, "flow-step-edge-0-remove");
+    let graph = graph_of(&handle, cx);
+    assert!(graph.steps[2].edges.is_empty(), "the edge is removed");
     let meta = meta_of(&handle, cx, 2);
     assert!(!meta.contains("returns to"), "{meta}");
 
-    // a merge step has no rework: validation refuses a reworking merge, so the
-    // row stays on screen with nothing to press
+    // A merge either lands or fails, so it offers nothing to press.
     click(cx, "flow-step-kind-merge");
+    assert!(cx.debug_bounds("flow-step-edges").is_some());
     assert!(
-        cx.debug_bounds("flow-step-rework-to").is_some(),
-        "the row is still on screen, switched off"
-    );
-    assert!(
-        cx.debug_bounds("flow-step-rework-to-first").is_none(),
-        "a merge either lands or fails, so it offers no target"
-    );
-    assert!(
-        cx.debug_bounds("flow-step-rework-to-clear").is_none(),
-        "and there is nothing to clear"
-    );
-    assert_eq!(
-        graph_of(&handle, cx).steps[2].kind,
-        StepKind::Merge,
-        "the step is a merge"
-    );
-
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-/// The rework budget belongs to the edge: it is off until a target is picked,
-/// it writes `rework_max`, and it goes away with the target because a budget
-/// with no target is a graph `validate` refuses.
-#[gpui_kit::gpui::test]
-fn a_rework_budget_follows_its_target(cx: &mut TestAppContext) {
-    let _guard = hold_home();
-    let home = scratch_home("rework-budget");
-    cx.update(gpui_kit::init);
-    cx.update(theme::apply_kit_theme);
-    let (repo, _issue) = seed_repo(&home, Some(WORKFLOW));
-
-    let handle = open_template(cx, &repo, WORKFLOW);
-    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
-    settle(cx);
-
-    // `check` waits for `code` and `analyze`: with no target there is no budget
-    // to type into, only the row saying so
-    select(&handle, cx, 2);
-    assert!(cx.debug_bounds("flow-step-rework-max").is_some());
-    assert!(
-        cx.debug_bounds("flow-field-rework-max").is_none(),
-        "the budget is off until the edge names a target"
-    );
-
-    // picking a target turns it on, and the field writes `rework_max`
-    click(cx, "flow-step-rework-to-code");
-    assert!(
-        cx.debug_bounds("flow-field-rework-max").is_some(),
-        "a target turns the budget on"
-    );
-    set_field(cx, "flow-field-rework-max", "3");
-    let graph = graph_of(&handle, cx);
-    assert_eq!(graph.steps[2].rework_max, Some(3));
-    assert!(
-        cx.debug_bounds("flow-workflow-dirty").is_some(),
-        "the budget is an unsaved change"
-    );
-
-    // clearing the target clears the budget with it: leaving a budget behind
-    // would be a graph the engine refuses
-    click(cx, "flow-step-rework-to-clear");
-    let graph = graph_of(&handle, cx);
-    assert_eq!(graph.steps[2].rework_to, None);
-    assert_eq!(
-        graph.steps[2].rework_max, None,
-        "the budget followed its target"
-    );
-    assert!(
-        cx.debug_bounds("flow-field-rework-max").is_none(),
-        "and the field is off again"
+        cx.debug_bounds("flow-step-edge-add-first").is_none(),
+        "a merge offers no target"
     );
 
     let _ = std::fs::remove_dir_all(&home);
@@ -1012,8 +797,7 @@ fn a_merge_names_its_conflict_step_and_a_cleanup_carries_nothing(cx: &mut TestAp
         ("mode", graph.steps[1].mode.is_some()),
         ("push", graph.steps[1].push),
         ("produces", graph.steps[1].produces.is_some()),
-        ("rework_to", graph.steps[1].rework_to.is_some()),
-        ("rework_max", graph.steps[1].rework_max.is_some()),
+        ("edges", !graph.steps[1].edges.is_empty()),
         ("on_conflict", graph.steps[1].on_conflict.is_some()),
     ] {
         assert!(!carried, "a cleanup step carries no {field}");
@@ -1100,7 +884,7 @@ fn a_broken_template_is_not_overwritten(cx: &mut TestAppContext) {
     cx.update(theme::apply_kit_theme);
     let (repo, _issue) = seed_repo(&home, Some(WORKFLOW));
     let path = warp_flow_core::layout::workflow_file(&repo);
-    let broken = "schema = 2\nname = \"implement\"\nrevision = 4\n\n[[step]]\nid = \"a\"\n\
+    let broken = "schema = 3\nname = \"implement\"\nrevision = 4\n\n[[step]]\nid = \"a\"\n\
                   kind = \"nonsense\"\n";
     std::fs::write(&path, broken).expect("a broken template");
 
@@ -1128,191 +912,6 @@ fn a_broken_template_is_not_overwritten(cx: &mut TestAppContext) {
     // and the file is byte-for-byte what it was
     let after = std::fs::read_to_string(&path).expect("the file is still there");
     assert_eq!(after, broken, "the file was never touched");
-
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-/// The step list is the graph drawn depth first: a step hangs under the
-/// dependency it names first, so a join is drawn where it belongs and its other
-/// dependencies are chips on its row. The diamond here is analyze → code →
-/// review with test joining review and analyze, so the second arm of the fork
-/// is itself the join: the arm is a link, not a branch, and the whole list is
-/// drawn flat. Where a branch really indents is
-/// `a_chain_is_drawn_flat_and_a_join_comes_back_out`'s job.
-#[gpui_kit::gpui::test]
-fn the_step_list_is_an_indented_tree(cx: &mut TestAppContext) {
-    let _guard = hold_home();
-    let home = scratch_home("tree");
-    cx.update(gpui_kit::init);
-    cx.update(theme::apply_kit_theme);
-    let (repo, _issue) = seed_repo(&home, Some(WORKFLOW));
-    std::fs::write(warp_flow_core::layout::workflow_file(&repo), TREE)
-        .expect("the repository template");
-
-    let host = Arc::new(Host::new());
-    let handle = cx.open_window(size(px(1200.), px(860.)), |_window, cx| {
-        let screen = cx.new(|cx| WorkflowScreen::new(Arc::clone(&host), cx));
-        screen.update(cx, |screen, cx| {
-            screen.show_repository(repo.clone(), cx);
-        });
-        ScreenHost(screen)
-    });
-    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
-    settle(cx);
-
-    // the tree hangs each step under the dependency it names first:
-    // analyze(0) → code(2) → review(3) → test(1), so the declaration order and
-    // the drawing order differ on purpose. review is only code's link, so it
-    // stays at code's level; test joins both arms, so it comes back out to
-    // analyze. code is a link too: the fork's second arm is the join itself,
-    // and a join closes a branch rather than starting one.
-    let root = indent_of(cx, 0);
-    let child = indent_of(cx, 2);
-    let link = indent_of(cx, 3);
-    let join = indent_of(cx, 1);
-    assert!(
-        (child - root).abs() < 0.5,
-        "code is a link in this shape, not a branch: {root} vs {child}"
-    );
-    assert!(
-        (link - child).abs() < 0.5,
-        "review only continues code's branch, so the chain stays flat: {child} vs {link}"
-    );
-    assert!(
-        (join - root).abs() < 0.5,
-        "the join lands back on analyze, the step both branches share: {root} vs {join}"
-    );
-
-    // and the rows are drawn depth first, not in declaration order
-    assert!(row_top(cx, 0) < row_top(cx, 2));
-    assert!(row_top(cx, 2) < row_top(cx, 3));
-    assert!(
-        row_top(cx, 3) < row_top(cx, 1),
-        "the join is drawn last even though it is declared second"
-    );
-    assert!(
-        cx.debug_bounds("flow-workflow-step-4").is_none(),
-        "every step is drawn exactly once"
-    );
-
-    // the extra dependency is a chip, and a step with one dependency has none
-    let chip = cx
-        .debug_bounds("flow-workflow-join-1-analyze")
-        .expect("the join's second dependency is a chip on its row");
-    let join_row = cx
-        .debug_bounds("flow-workflow-step-1")
-        .expect("the join's row is drawn");
-    assert!(
-        chip.origin.x >= join_row.origin.x
-            && chip.origin.x + chip.size.width <= join_row.origin.x + join_row.size.width,
-        "the chip is inside the row, so a join is visible without the inspector"
-    );
-    assert!(
-        cx.debug_bounds("flow-workflow-join-2-analyze").is_none(),
-        "code waits for analyze only, so it carries no chip"
-    );
-
-    // selecting a row at depth 3 works, and its mark stays at the row's edge
-    click(cx, "flow-workflow-step-1");
-    let selected = handle
-        .read_with(cx, |host, cx| host.0.read(cx).selected_for_probe())
-        .expect("the window is open");
-    assert_eq!(selected, 1, "clicking a deep row selects it");
-    let mark = cx
-        .debug_bounds("flow-workflow-selected-1")
-        .expect("the selected row carries its mark");
-    let row = cx
-        .debug_bounds("flow-workflow-step-1")
-        .expect("the row is drawn");
-    assert_eq!(
-        mark.origin.x, row.origin.x,
-        "the mark sits at the row's edge"
-    );
-    assert_eq!(mark.origin.y, row.origin.y);
-
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-/// The indent says where the graph branches, not how long its chain is: a
-/// straight pipeline is drawn flat, a fork's children indent one level, and a
-/// join comes back out to the step its branches share. The shipped chain went
-/// eleven levels deep and truncated every meta line, which is the bug.
-#[gpui_kit::gpui::test]
-fn a_chain_is_drawn_flat_and_a_join_comes_back_out(cx: &mut TestAppContext) {
-    let _guard = hold_home();
-    let home = scratch_home("levels");
-    cx.update(gpui_kit::init);
-    cx.update(theme::apply_kit_theme);
-    let (repo, _issue) = seed_repo(&home, None);
-    let app = cx;
-
-    // a -> b -> c -> d: a link is not a branch, so every step is at level 0
-    let window = open_template(app, &repo, CHAIN);
-    let chain = VisualTestContext::from_window(window.into(), &*app).into_mut();
-    settle(chain);
-    let base = indent_of(chain, 0);
-    for index in 1..4 {
-        let indent = indent_of(chain, index);
-        assert!(
-            (indent - base).abs() < 0.5,
-            "step {index} is a link in a chain, not a branch: {base} vs {indent}"
-        );
-    }
-
-    // root -> [a1 -> a2, b1 -> b2] -> join: the two branches indent once, each
-    // branch's second step stays flat, and the join lands back on the root
-    let window = open_template(&mut *app, &repo, FORK_JOIN);
-    let fork = VisualTestContext::from_window(window.into(), &*app).into_mut();
-    settle(fork);
-    let root = indent_of(fork, 0);
-    let a1 = indent_of(fork, 1);
-    let a2 = indent_of(fork, 2);
-    let b1 = indent_of(fork, 3);
-    let b2 = indent_of(fork, 4);
-    let join = indent_of(fork, 5);
-    let level = a1 - root;
-    assert!(
-        level > 8. && level < 48.,
-        "one level is a readable step, not a hairline and not half the column: {level}"
-    );
-    for (id, indent) in [("a1", a1), ("a2", a2), ("b1", b1), ("b2", b2)] {
-        assert!(
-            (indent - a1).abs() < 0.5,
-            "{id} is inside a branch, so it sits one level in: {a1} vs {indent}"
-        );
-    }
-    assert!(
-        (join - root).abs() < 0.5,
-        "the join lands back on the root its branches share: {root} vs {join}"
-    );
-
-    // review -> [fmt -> clippy, test] -> bump: each check indents once, the
-    // chain inside the first branch stays flat, and bump comes back to review
-    let window = open_template(&mut *app, &repo, MIXED);
-    let mixed = VisualTestContext::from_window(window.into(), &*app).into_mut();
-    settle(mixed);
-    let review = indent_of(mixed, 0);
-    let fmt = indent_of(mixed, 1);
-    let clippy = indent_of(mixed, 2);
-    let test = indent_of(mixed, 3);
-    let bump = indent_of(mixed, 4);
-    let level = fmt - review;
-    assert!(
-        level > 8. && level < 48.,
-        "one level is a readable step, not a hairline and not half the column: {level}"
-    );
-    assert!(
-        (test - fmt).abs() < 0.5,
-        "review's second check is its own branch, at the same level as fmt"
-    );
-    assert!(
-        (clippy - fmt).abs() < 0.5,
-        "fmt -> clippy is a link, so the chain inside the branch stays flat"
-    );
-    assert!(
-        (bump - review).abs() < 0.5,
-        "the join comes back out to review: {review} vs {bump}"
-    );
 
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -1390,10 +989,10 @@ fn the_arrows_move_a_step_only_among_its_siblings(cx: &mut TestAppContext) {
         .debug_bounds("flow-workflow-selected-0")
         .expect("the mark follows the step")
         .origin
-        .y;
+        .x;
     assert!(
-        f32::from(after) < f32::from(before),
-        "the row moved up the list: {before:?} -> {after:?}"
+        f32::from(after) != f32::from(before),
+        "the node moved in its row: {before:?} -> {after:?}"
     );
 
     // ↓ on a child trades it with its next sibling, never with a step in
@@ -1423,309 +1022,6 @@ fn the_arrows_move_a_step_only_among_its_siblings(cx: &mut TestAppContext) {
         order,
         "↑ stays inside the sibling group"
     );
-
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-/// A folder with no `workflow.toml` gets the known pipeline, every step off: a
-/// person enables what the repository has instead of deleting what it does not,
-/// and the document is still one the engine accepts.
-#[gpui_kit::gpui::test]
-fn the_default_document_has_every_step_disabled(cx: &mut TestAppContext) {
-    let _guard = hold_home();
-    let home = scratch_home("default");
-    cx.update(gpui_kit::init);
-    cx.update(theme::apply_kit_theme);
-    let (repo, _issue) = seed_repo(&home, None);
-    let run = screen_run(&repo);
-
-    let handle = open(cx, run);
-    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
-    settle(cx);
-
-    let graph = handle
-        .read_with(cx, |host, cx| host.0.read(cx).graph_for_probe().cloned())
-        .expect("the window is open")
-        .expect("a graph is offered");
-    assert_eq!(
-        graph
-            .steps
-            .iter()
-            .map(|step| step.id.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            "analyze",
-            "approve-plan",
-            "code",
-            "review",
-            "fmt",
-            "clippy",
-            "test",
-            "bump",
-            "merge",
-            "resolve-conflict",
-            "summary",
-            "cleanup",
-        ],
-        "the default document is the known pipeline"
-    );
-    assert!(
-        graph.steps.iter().all(|step| !step.enabled),
-        "every step arrives off; these were on: {:?}",
-        graph
-            .steps
-            .iter()
-            .filter(|step| step.enabled)
-            .map(|step| step.id.as_str())
-            .collect::<Vec<_>>()
-    );
-
-    // the gates carry the commands this repository runs, so the document is a
-    // valid graph even with everything switched off
-    let command = |id: &str| {
-        graph
-            .step(id)
-            .and_then(|step| step.command.clone())
-            .unwrap_or_default()
-    };
-    assert_eq!(command("fmt"), "cargo fmt --all --check");
-    assert_eq!(
-        command("clippy"),
-        "cargo clippy --locked --all-targets -- -D warnings"
-    );
-    assert_eq!(command("test"), "cargo test --locked");
-    for id in ["fmt", "clippy", "test"] {
-        let gate = graph.step(id).expect("the gate is in the document");
-        assert_eq!(gate.cwd.as_deref(), Some("."));
-        assert!(gate.timeout_secs.is_some_and(|secs| secs > 0));
-        assert!(gate.per_task, "a gate measures every task");
-    }
-    // The bump is a gate too: the script does the mechanical work, so the
-    // default document offers no session for it, and it runs once for the run
-    // instead of once per task.
-    let bump = graph.step("bump").expect("the bump is in the document");
-    assert_eq!(bump.kind, StepKind::Gate);
-    assert_eq!(command("bump"), "python3 scripts/bump.py");
-    assert_eq!(bump.cwd.as_deref(), Some("."));
-    assert_eq!(bump.timeout_secs, Some(300));
-    assert!(!bump.per_task, "the bump runs once, not once per task");
-    assert_eq!(bump.depends_on, Some(Vec::new()), "the join names nothing");
-    for (field, value) in [
-        ("skill", &bump.skill),
-        ("harness", &bump.harness),
-        ("model", &bump.model),
-        ("effort", &bump.effort),
-    ] {
-        assert!(value.is_none(), "the bump gate names no {field}");
-    }
-    let merge = graph.step("merge").expect("the merge step");
-    assert_eq!(merge.kind, StepKind::Merge);
-    assert_eq!(merge.mode.as_deref(), Some("local"));
-    assert!(merge.per_task);
-    assert!(!merge.push);
-    // A merge may name its conflict step (ADR-0020), but the menu's names none:
-    // a named step must be enabled, and this document arrives with every step
-    // off, so naming it here would be a graph Save refuses. The step is
-    // offered, and the form names it when the pair is switched on.
-    assert_eq!(merge.on_conflict, None);
-    let resolve = graph
-        .step("resolve-conflict")
-        .expect("the conflict step is offered");
-    assert_eq!(resolve.kind, StepKind::Harness);
-    assert_eq!(resolve.skill.as_deref(), Some("merge-conflict"));
-    assert!(resolve.per_task, "a conflict belongs to one task's branch");
-    assert_eq!(
-        resolve.depends_on,
-        Some(vec!["merge".to_owned()]),
-        "the conflict step is declared under the merge it serves"
-    );
-    // The run closes with two siblings after the merge (ADR-0021): the summary
-    // writes the report and the cleanup removes what the queue left behind.
-    let summary = graph.step("summary").expect("the summary step");
-    assert_eq!(summary.depends_on, Some(vec!["merge".to_owned()]));
-    let cleanup = graph.step("cleanup").expect("the cleanup step");
-    assert_eq!(cleanup.kind, StepKind::Cleanup);
-    assert!(!cleanup.per_task, "one cleanup belongs to the run");
-    assert_eq!(cleanup.depends_on, Some(vec!["merge".to_owned()]));
-    assert!(
-        cleanup.command.is_none() && cleanup.skill.is_none(),
-        "the cleanup is engine work, not a command or a session"
-    );
-    // a harness step never names a skill this build does not ship
-    for step in graph
-        .steps
-        .iter()
-        .filter(|step| step.kind == StepKind::Harness)
-    {
-        let skill = step.skill.as_deref().expect("a harness step names a skill");
-        assert!(
-            warp_flow_core::skill::NAMES.contains(&skill),
-            "the default document ships {skill}"
-        );
-    }
-    graph
-        .validate()
-        .expect("the default document is a graph the engine accepts");
-
-    // the list draws the whole graph, and it is still the graph while every
-    // step is off: the shape belongs to the graph, not to today's run
-    assert!(
-        cx.debug_bounds("flow-workflow-step-11").is_some(),
-        "twelve rows"
-    );
-    assert!(cx.debug_bounds("flow-workflow-step-12").is_none());
-    // The shipped document is a pipeline with one fork: `fmt` and `clippy`
-    // leave `review` together, `test` follows `clippy`, and `bump` joins them.
-    // So the trunk is flat, the two branches sit one level in, and the join
-    // comes back out. The merge then fans out to its resolver, the summary and
-    // the cleanup, so those three sit one level in — the level rule, on the
-    // document a new repository gets.
-    let trunk = indent_of(cx, 0);
-    let index = |id: &str| {
-        graph
-            .steps
-            .iter()
-            .position(|step| step.id == id)
-            .expect("the step is in the document")
-    };
-    for id in ["analyze", "approve-plan", "code", "review"] {
-        let indent = indent_of(cx, index(id));
-        assert!(
-            (indent - trunk).abs() < 0.5,
-            "`{id}` is on the trunk: {trunk} vs {indent}"
-        );
-    }
-    let branch = indent_of(cx, index("fmt"));
-    assert!(
-        branch > trunk + 8. && branch < trunk + 48.,
-        "`fmt` starts a branch, so it sits one level in: {trunk} vs {branch}"
-    );
-    for id in ["fmt", "clippy", "test"] {
-        let indent = indent_of(cx, index(id));
-        assert!(
-            (indent - branch).abs() < 1.5,
-            "`{id}` is inside the branch: {branch} vs {indent}"
-        );
-    }
-    for id in ["bump", "merge"] {
-        let indent = indent_of(cx, index(id));
-        assert!(
-            (indent - trunk).abs() < 0.5,
-            "`{id}` is after the join, so it comes back out: {trunk} vs {indent}"
-        );
-    }
-    let fan = indent_of(cx, index("resolve-conflict"));
-    assert!(
-        fan > trunk + 8. && fan < trunk + 48.,
-        "the merge fans out, so its steps sit one level in: {trunk} vs {fan}"
-    );
-    for id in ["resolve-conflict", "summary", "cleanup"] {
-        let indent = indent_of(cx, index(id));
-        assert!(
-            (indent - fan).abs() < 0.5,
-            "`{id}` hangs under the merge: {fan} vs {indent}"
-        );
-    }
-
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-/// The template this repository ships for itself is a fork that joins, and the
-/// list has to draw it as one: both branches are indented, and the join is
-/// drawn after *both* of them — not after the first one to finish.
-#[gpui_kit::gpui::test]
-fn the_shipped_template_draws_its_fork_and_its_join(cx: &mut TestAppContext) {
-    let _guard = hold_home();
-    let home = scratch_home("shipped-shape");
-    cx.update(gpui_kit::init);
-    cx.update(theme::apply_kit_theme);
-    let (repo, _issue) = seed_repo(&home, None);
-    let text =
-        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(".flow/workflow.toml"))
-            .expect("the repository's own template");
-    let window = open_template(cx, &repo, &text);
-    let view = VisualTestContext::from_window(window.into(), &*cx).into_mut();
-    settle(view);
-
-    // The file's own order, which is also the row index.
-    let ids = [
-        "analyze",
-        "approve-plan",
-        "code",
-        "review",
-        "fmt",
-        "clippy",
-        "test",
-        "bump",
-        "merge",
-        "resolve-conflict",
-        "summary",
-        "cleanup",
-    ];
-    let index = |id: &str| ids.iter().position(|known| *known == id).expect(id);
-
-    // A row is drawn below everything it waits for. `bump` waits for `fmt` AND
-    // `test`, so it must sit below both — that is what a join means.
-    for (later, earlier) in [
-        ("bump", "fmt"),
-        ("bump", "test"),
-        ("merge", "bump"),
-        ("resolve-conflict", "merge"),
-        ("summary", "merge"),
-        ("cleanup", "merge"),
-        ("clippy", "fmt"),
-        ("test", "clippy"),
-    ] {
-        let below = row_top(view, index(later));
-        let above = row_top(view, index(earlier));
-        assert!(
-            below > above,
-            "`{later}` waits for `{earlier}`, so it is drawn below it: {above} vs {below}"
-        );
-    }
-
-    // The two branches are indented; the fork's own steps and the join are not.
-    let root = indent_of(view, index("analyze"));
-    for id in ["analyze", "approve-plan", "code", "review"] {
-        let indent = indent_of(view, index(id));
-        assert!(
-            (indent - root).abs() < 0.5,
-            "`{id}` is on the trunk, so it is not indented: {root} vs {indent}"
-        );
-    }
-    let branch = indent_of(view, index("fmt")) - root;
-    assert!(
-        branch > 8. && branch < 48.,
-        "one level is a readable step: {branch}"
-    );
-    for id in ["fmt", "clippy", "test"] {
-        let indent = indent_of(view, index(id));
-        assert!(
-            (indent - root - branch).abs() < 1.5,
-            "`{id}` is inside a branch, so it sits one level in: {root} vs {indent}"
-        );
-    }
-    for id in ["bump", "merge"] {
-        let indent = indent_of(view, index(id));
-        assert!(
-            (indent - root).abs() < 0.5,
-            "`{id}` is after the join, so it comes back out: {root} vs {indent}"
-        );
-    }
-    // The merge fans out to its conflict step and the run's two closing steps,
-    // so they hang one level under it.
-    let fan = indent_of(view, index("resolve-conflict")) - root;
-    assert!(
-        fan > 8. && fan < 48.,
-        "the merge's steps sit one level in: {fan}"
-    );
-    for id in ["resolve-conflict", "summary", "cleanup"] {
-        let indent = indent_of(view, index(id));
-        assert!(
-            (indent - root - fan).abs() < 1.5,
-            "`{id}` hangs under the merge: {root} vs {indent}"
-        );
-    }
 
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -1766,7 +1062,7 @@ fn seed_catalog() {
 
 /// A step that already names a harness the catalog does not publish.
 const GHOST: &str = r#"
-schema = 2
+schema = 3
 name = "ghost"
 revision = 3
 
@@ -2054,6 +1350,272 @@ fn a_step_with_no_dependency_says_it_starts_with_the_run(cx: &mut TestAppContext
     // and "All above" puts the file's order back
     click(cx, "flow-step-depends-all");
     assert_eq!(graph_of(&handle, cx).steps[0].depends_on, None);
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ---- the diagram -----------------------------------------------------------
+
+/// The shipped pipeline's shape: a three-wide tail and two loops, which is the
+/// picture the column has to hold without clipping.
+const PIPELINE: &str = r#"
+schema = 3
+name = "implement"
+revision = 1
+max_parallel = 2
+
+[[step]]
+id = "analyze"
+kind = "harness"
+skill = "analyze"
+produces = "spec.md"
+
+[[step]]
+id = "approve-plan"
+kind = "question"
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+per_task = true
+
+[[step]]
+id = "review"
+kind = "harness"
+skill = "review"
+per_task = true
+produces = "review.md"
+edges = [{ to = "code", when = "verdict_changes", max = 3 }]
+
+[[step]]
+id = "fmt"
+kind = "gate"
+command = "true"
+per_task = true
+depends_on = ["review"]
+
+[[step]]
+id = "clippy"
+kind = "gate"
+command = "true"
+per_task = true
+depends_on = ["review"]
+
+[[step]]
+id = "test"
+kind = "gate"
+command = "true"
+per_task = true
+depends_on = ["clippy"]
+edges = [{ to = "code", when = "gate_failed", max = 2 }]
+
+[[step]]
+id = "bump"
+kind = "gate"
+command = "true"
+per_task = false
+
+[[step]]
+id = "merge"
+kind = "merge"
+per_task = true
+mode = "local"
+
+[[step]]
+id = "resolve-conflict"
+kind = "harness"
+skill = "merge-conflict"
+per_task = true
+depends_on = ["merge"]
+
+[[step]]
+id = "summary"
+kind = "harness"
+skill = "summary"
+produces = "summary.md"
+depends_on = ["merge"]
+
+[[step]]
+id = "cleanup"
+kind = "cleanup"
+per_task = false
+depends_on = ["merge"]
+"#;
+
+/// At a window wide enough for the picture, the column grows to it: the whole
+/// graph sits inside the pane, with nothing clipped at its right edge and the
+/// selected node's mark drawn on the node.
+#[gpui_kit::gpui::test]
+fn the_diagram_column_grows_to_the_picture(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("diagram-wide");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let (repo, _issue) = seed_repo(&home, Some(PIPELINE));
+
+    let handle = open_template_sized(cx, &repo, PIPELINE, 2600., 1000.);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    let graph = graph_of(&handle, cx);
+    let layout = warp_flow::ui::graph::layout(&graph);
+    assert!(
+        layout.column_width() > 520.,
+        "the shipped shape is wider than the fixed column it used to get: {}",
+        layout.column_width()
+    );
+
+    let column = cx
+        .debug_bounds("flow-workflow-column")
+        .expect("the diagram column is drawn");
+    assert!(
+        (f32::from(column.size.width) - layout.column_width()).abs() < 1.5,
+        "the column is the picture's width: {} vs {}",
+        f32::from(column.size.width),
+        layout.column_width()
+    );
+
+    let steps = cx
+        .debug_bounds("flow-workflow-steps")
+        .expect("the scroller is drawn");
+    let diagram = cx
+        .debug_bounds("flow-workflow-diagram")
+        .expect("the picture is drawn");
+    assert!(
+        f32::from(diagram.right()) <= f32::from(steps.right()) + 0.5
+            && f32::from(diagram.left()) >= f32::from(steps.left()) - 0.5,
+        "the whole picture fits the column"
+    );
+
+    // every node is inside the viewport: the cleanup at the tail and the
+    // loops beside it are not cut off
+    for index in 0..graph.steps.len() {
+        let node = cx
+            .debug_bounds(selector(&format!("flow-workflow-step-{index}")))
+            .unwrap_or_else(|| panic!("step {index} is a node in the diagram"));
+        assert!(
+            f32::from(node.left()) >= f32::from(steps.left()) - 0.5
+                && f32::from(node.right()) <= f32::from(steps.right()) + 0.5,
+            "step {index} is reachable across the column"
+        );
+        assert!(
+            f32::from(node.top()) >= f32::from(steps.top()) - 0.5
+                && f32::from(node.bottom()) <= f32::from(steps.bottom()) + 0.5,
+            "step {index} is not cut off at the bottom"
+        );
+    }
+
+    // the selected node carries its accent mark, drawn inside the node and
+    // after the canvas, so the picture cannot cover it
+    let first = cx
+        .debug_bounds("flow-workflow-step-0")
+        .expect("the first node");
+    let mark = cx
+        .debug_bounds("flow-workflow-selected-0")
+        .expect("the selected node carries its mark");
+    assert!(
+        f32::from(mark.left()) >= f32::from(first.left())
+            && f32::from(mark.right()) <= f32::from(first.right())
+            && f32::from(mark.top()) >= f32::from(first.top())
+            && f32::from(mark.bottom()) <= f32::from(first.bottom()),
+        "the mark is drawn on the node, not beside or under it"
+    );
+    assert!(
+        f32::from(mark.size.height) >= f32::from(first.size.height) - 2.5,
+        "the mark runs the node's height"
+    );
+
+    // and at the detail width of the app's default window (1500 wide, less the
+    // 76 rail and the ~326 list the app remembers) the picture still fits
+    // whole: this is the scene a person opens, not only the wide one
+    cx.simulate_resize(size(px(1100.), px(960.)));
+    settle(cx);
+    let column = cx
+        .debug_bounds("flow-workflow-column")
+        .expect("the diagram column is drawn after the resize");
+    assert!(
+        (f32::from(column.size.width) - layout.column_width()).abs() < 1.5,
+        "the default window shows the whole picture: {} vs {}",
+        f32::from(column.size.width),
+        layout.column_width()
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A graph wider than the window is still reachable: the column is clamped so
+/// the inspector keeps its form, and the scroller moves sideways to the rest.
+#[gpui_kit::gpui::test]
+fn a_graph_wider_than_the_window_scrolls_sideways(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("diagram-narrow");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let (repo, _issue) = seed_repo(&home, Some(PIPELINE));
+
+    let handle = open_template_sized(cx, &repo, PIPELINE, 900., 800.);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+
+    let graph = graph_of(&handle, cx);
+    let layout = warp_flow::ui::graph::layout(&graph);
+    let column = cx
+        .debug_bounds("flow-workflow-column")
+        .expect("the diagram column is drawn");
+    assert!(
+        // the screen keeps the inspector a third of the pane at this width
+        f32::from(column.size.width) <= 900. * 0.68 + 1.5,
+        "the column gives the inspector its share of the pane"
+    );
+    assert!(
+        f32::from(column.size.width) < layout.column_width(),
+        "and the picture is wider than the column it gets"
+    );
+
+    let steps = cx
+        .debug_bounds("flow-workflow-steps")
+        .expect("the scroller is drawn");
+    let diagram = cx
+        .debug_bounds("flow-workflow-diagram")
+        .expect("the picture is drawn");
+    assert!(
+        f32::from(diagram.size.width) > f32::from(steps.size.width),
+        "the picture overflows the column sideways"
+    );
+
+    // the tail starts beyond the right edge...
+    let tail = selector(&format!("flow-workflow-step-{}", graph.steps.len() - 1));
+    let tail = cx.debug_bounds(tail).expect("the tail is a node");
+    let before = f32::from(tail.left());
+    assert!(
+        f32::from(tail.right()) > f32::from(steps.right()) + 1.,
+        "the picture's tail is off the edge before a scroll"
+    );
+
+    // ...and one sideways scroll brings it into reach
+    cx.simulate_event(gpui::ScrollEvent {
+        position: steps.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(px(-150.), px(0.))),
+        modifiers: Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+        source: gpui::ScrollSource::Pointer,
+    });
+    settle(cx);
+    let tail = cx
+        .debug_bounds(selector(&format!(
+            "flow-workflow-step-{}",
+            graph.steps.len() - 1
+        )))
+        .expect("the tail is a node");
+    assert!(
+        f32::from(tail.left()) < before - 1.,
+        "the scroll moved the picture sideways"
+    );
+    assert!(
+        f32::from(tail.right()) <= f32::from(steps.right()) + 0.5,
+        "and the tail is now reachable inside the column"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }

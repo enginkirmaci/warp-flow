@@ -25,7 +25,7 @@ use gpui::{
     SharedString, Window, div, px, relative,
 };
 use gpui_kit::component::input::{InputEvent, InputState};
-use warp_flow_core::graph::{Step, StepKind, Workflow};
+use warp_flow_core::graph::{Edge, Step, StepKind, Trigger, Workflow};
 use warp_flow_core::layout;
 use warpui_kit_core::A11y;
 use warpui_kit_core::controls::{self, BtnKind};
@@ -106,23 +106,21 @@ const CATALOG_FIELDS: [CatalogField; 3] = [
 const NO_CATALOG: &str = "warp-agent has published no catalog yet. Start it and reopen this tab.";
 
 /// The schema every workflow file this editor writes carries.
-const SCHEMA: u32 = 2;
+const SCHEMA: u32 = 3;
 
-/// The step list's width: the design's 320.
-const LIST_WIDTH: f32 = 320.;
+/// The diagram column's floor: wide enough for the step head's three actions
+/// and for one node beside its loop lane.
+const DIAGRAM_MIN_WIDTH: f32 = 360.;
 
-/// One step row in the list.
-const STEP_ROW_HEIGHT: f32 = 58.;
-
-/// One level of the list's tree: what a row adds to its left padding per depth.
-const INDENT_STEP: f32 = 22.;
-
-/// A row's own left padding, before the tree's indent.
-const ROW_PADDING: f32 = 13.;
+/// The share of the detail body the diagram column may take. The picture is
+/// drawn at its own size, so the column grows to it; past this share the
+/// inspector beside it would stop being a form, and the diagram scrolls
+/// sideways instead. The shipped pipeline is 732 wide with its lanes, a third
+/// of the default window's detail, so the second third is what the form can
+/// spare.
+const DIAGRAM_MAX_SHARE: f32 = 0.68;
 
 /// One extra dependency's quiet chip on a row: small enough for the meta line.
-const JOIN_CHIP_HEIGHT: f32 = 16.;
-
 /// The list's head: the step count and the revision.
 const LIST_HEAD_HEIGHT: f32 = 40.;
 
@@ -171,9 +169,6 @@ struct StepFacts {
     /// What the file says: the steps this one names, or `None` when it names
     /// nothing and waits for every step declared before it (ADR-0018).
     depends_on: Option<Vec<String>>,
-    /// What the run waits for, resolved: the named set, or every row above
-    /// this one. This is what the list's tree is drawn from.
-    waits_for: Vec<String>,
     per_task: bool,
     /// Whether the step runs. A disabled step stays in the list, dimmed.
     enabled: bool,
@@ -193,10 +188,6 @@ struct Fields {
     /// The step a merge hands its conflicted branch to (ADR-0020); empty names
     /// none, which is a merge that blocks on a conflict instead.
     on_conflict: Entity<InputState>,
-    /// How many times the step may send the work back: the rework budget. The
-    /// picker beside it is stateless (it reads the selection), so only the
-    /// budget is an input that has to be carried between selections.
-    rework_max: Entity<InputState>,
 }
 
 /// The workflow editor: the 320 step list and the selected step's editor.
@@ -492,8 +483,7 @@ impl WorkflowScreen {
             return graph
                 .steps
                 .iter()
-                .enumerate()
-                .map(|(index, step)| StepFacts {
+                .map(|step| StepFacts {
                     id: step.id.clone(),
                     kind: step.kind,
                     meta: step_meta(step),
@@ -502,14 +492,6 @@ impl WorkflowScreen {
                     command: step.command.clone(),
                     produces: step.produces.clone(),
                     depends_on: step.depends_on.clone(),
-                    // an omitted set is every step declared before this one
-                    waits_for: match &step.depends_on {
-                        Some(named) => named.clone(),
-                        None => graph.steps[..index]
-                            .iter()
-                            .map(|other| other.id.clone())
-                            .collect(),
-                    },
                     per_task: step.per_task,
                     enabled: step.enabled,
                 })
@@ -532,7 +514,6 @@ impl WorkflowScreen {
                 command: None,
                 produces: None,
                 depends_on: None,
-                waits_for: Vec::new(),
                 per_task: step.per_task,
                 enabled: true,
             })
@@ -607,14 +588,6 @@ impl WorkflowScreen {
             step.on_conflict.clone().unwrap_or_default(),
             "the step that resolves a conflicted merge; empty names none",
         );
-        let rework_max = make(
-            window,
-            cx,
-            step.rework_max
-                .map(|max| max.to_string())
-                .unwrap_or_default(),
-            "how many times the step may send the work back; empty is 1",
-        );
         let watched: Vec<(Entity<InputState>, Field)> = vec![
             (id.clone(), Field::Id),
             (skill.clone(), Field::Skill),
@@ -623,7 +596,6 @@ impl WorkflowScreen {
             (timeout.clone(), Field::Timeout),
             (produces.clone(), Field::Produces),
             (on_conflict.clone(), Field::OnConflict),
-            (rework_max.clone(), Field::ReworkMax),
         ];
         for (input, which) in watched {
             let watched = input.clone();
@@ -643,11 +615,6 @@ impl WorkflowScreen {
                     }
                     Field::Produces => step.produces = (!text.is_empty()).then_some(text),
                     Field::OnConflict => step.on_conflict = (!text.is_empty()).then_some(text),
-                    // `validate` refuses a budget of 0, and an empty field is
-                    // "unset", which means one.
-                    Field::ReworkMax => {
-                        step.rework_max = text.parse::<u32>().ok().filter(|max| *max > 0)
-                    }
                 });
             })
             .detach();
@@ -660,7 +627,6 @@ impl WorkflowScreen {
             timeout,
             produces,
             on_conflict,
-            rework_max,
         };
         self.fields = Some(fields.clone());
         Some(fields)
@@ -696,12 +662,6 @@ impl WorkflowScreen {
                 fields.on_conflict.clone(),
                 step.on_conflict.clone().unwrap_or_default(),
             ),
-            (
-                fields.rework_max.clone(),
-                step.rework_max
-                    .map(|max| max.to_string())
-                    .unwrap_or_default(),
-            ),
         ];
         for (input, value) in values {
             input.update(cx, |state, cx| {
@@ -736,8 +696,7 @@ impl WorkflowScreen {
                 // A merge either lands or fails: `validate` refuses a reworking
                 // merge, and the rework row is off for one, so the edge goes
                 // with the rest of the step's fixed shape.
-                step.rework_to = None;
-                step.rework_max = None;
+                step.edges.clear();
             }
             if kind == StepKind::Cleanup {
                 // A cleanup is the engine's own housekeeping (ADR-0021): it
@@ -752,8 +711,7 @@ impl WorkflowScreen {
                 step.mode = None;
                 step.push = false;
                 step.produces = None;
-                step.rework_to = None;
-                step.rework_max = None;
+                step.edges.clear();
                 step.on_conflict = None;
             }
         });
@@ -795,8 +753,7 @@ impl WorkflowScreen {
             timeout_secs: None,
             depends_on,
             produces: None,
-            rework_to: None,
-            rework_max: None,
+            edges: Vec::new(),
             per_task: false,
             mode: None,
             push: false,
@@ -927,7 +884,6 @@ impl WorkflowScreen {
 
     /// The 320 step list, in document order.
     fn render_list(&self, facts: &[StepFacts], cx: &mut Context<Self>) -> AnyElement {
-        let revision = self.graph.as_ref().map(|graph| graph.revision).unwrap_or(0);
         // The read-only head names the revision the run uses; when the folder
         // no longer carries it, `run.md`'s own record is the only name there is.
         let version = match &self.graph {
@@ -989,179 +945,193 @@ impl WorkflowScreen {
                 ));
         }
 
-        let mut rows = div()
-            .id("flow-workflow-steps")
-            .debug_selector(|| "flow-workflow-steps".into())
-            .role(gpui::Role::List)
-            .track_focus(&self.focus)
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.list_scroll);
-        if facts.is_empty() {
-            rows = rows.child(empty_state(
-                "icons/icon-flow.svg",
-                "No steps",
-                "A workflow needs one harness step to run anything.",
-            ));
-        }
-        // The list is an indented tree read depth first, but the indent is the
-        // graph's branching, not the walk's depth: a chain is flat, a fork's
-        // children sit one level in, and a join comes back out to its fork.
-        for (index, level) in tree_order(facts) {
-            rows = rows.child(self.render_step_row(index, level, &facts[index], revision, cx));
-        }
+        // The picture decides the column's width: a fork the file draws must
+        // not be clipped by a number chosen for the shipped pipeline. The
+        // inspector keeps the rest of the pane, and a graph wider than that
+        // share scrolls sideways rather than squeezing the form beside it.
+        let (diagram, diagram_width) = match &self.graph {
+            Some(graph) => {
+                let layout = crate::ui::graph::layout(graph);
+                let width = layout.column_width();
+                (self.render_diagram(&layout, cx), width)
+            }
+            None => (
+                empty_state(
+                    "icons/icon-flow.svg",
+                    "No graph",
+                    "The file could not be read, so there is no picture to draw.",
+                ),
+                DIAGRAM_MIN_WIDTH,
+            ),
+        };
         div()
             .id("flow-workflow-column")
             .debug_selector(|| "flow-workflow-column".into())
             .flex()
             .flex_col()
             .flex_shrink_0()
-            .w(px(theme::scaled(LIST_WIDTH)))
+            .w(px(theme::scaled(diagram_width)))
+            .min_w(px(theme::scaled(DIAGRAM_MIN_WIDTH)))
+            .max_w(relative(DIAGRAM_MAX_SHARE))
             .h_full()
             .min_h_0()
             .bg(theme::surface())
             .border_r_1()
             .border_color(theme::hairline())
             .child(head)
-            .child(rows)
+            .child(
+                div()
+                    .id("flow-workflow-steps")
+                    .debug_selector(|| "flow-workflow-steps".into())
+                    .role(gpui::Role::List)
+                    .track_focus(&self.focus)
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .overflow_x_scroll()
+                    .track_scroll(&self.list_scroll)
+                    .px(px(crate::ui::graph::DIAGRAM_PADDING))
+                    .py(px(crate::ui::graph::DIAGRAM_PADDING))
+                    .child(diagram),
+            )
             .into_any_element()
     }
 
-    /// One row: the step's glyph, its name and meta, and the tree's indent.
+    /// The graph as a picture: a node per step, an arrow per dependency, and a
+    /// loop per edge.
     ///
-    /// `level` is what [`step_levels`] measured, not the walk's depth, so the
-    /// left padding says where the graph branches; the row's height and the
-    /// selection mark (pinned to the row's own edge) never move with it.
-    fn render_step_row(
+    /// The picture is the editor's list. A node is the row: pressing it selects
+    /// the step and the inspector beside it becomes that step's fields. A
+    /// disabled step is drawn muted, and a loop is drawn in the accent colour
+    /// because it is the one thing the node's position does not say.
+    fn render_diagram(
         &self,
-        index: usize,
-        level: usize,
-        facts: &StepFacts,
-        revision: u32,
+        layout: &crate::ui::graph::Layout,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let selected = index == self.selected;
-        let selector = format!("flow-workflow-step-{index}");
-        let mark_selector = format!("flow-workflow-selected-{index}");
-        let indent_selector = format!("flow-workflow-indent-{index}");
-        // A join is named on the row itself: the step's parent is the row it is
-        // drawn under, and `depends_on[1..]` are the other parents it waits for.
-        // A step that names nothing waits for every row above it (ADR-0018), so
-        // there is nothing to list — its meta line says that instead.
-        let named = facts.depends_on.as_deref().unwrap_or_default();
-        let joins = if named.len() > 1 {
-            format!(", also after {}", named[1..].join(", "))
-        } else {
-            String::new()
-        };
-        let mut row = div()
-            .id(SharedString::from(selector.clone()))
-            .debug_selector(move || selector.clone())
-            .a11y_option(
-                format!(
-                    "Step {}, {}{joins}{}",
-                    facts.id,
-                    facts.meta,
-                    if facts.enabled { "" } else { ", disabled" }
-                ),
-                selected,
-            )
+        let mut stage = div()
+            .debug_selector(|| "flow-workflow-diagram".into())
             .relative()
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .gap(px(10.))
-            .h(px(theme::scaled(STEP_ROW_HEIGHT)))
-            // The step's level is the row's left padding, so the height and the
-            // selection mark (pinned to the row's own edge) never move with it.
-            .pl(px(ROW_PADDING + level as f32 * INDENT_STEP))
-            .pr(px(12.))
-            .cursor_pointer()
-            .when(selected, |row| row.bg(theme::raised()))
-            .when(!selected, |row| row.hover(|style| style.bg(theme::panel())))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.selected = index;
-                this.error = None;
-                this.refill_fields(window, cx);
-                cx.notify();
+            .w(px(layout.width))
+            .h(px(layout.height))
+            .child(crate::ui::graph::paint(layout.clone(), (0., 0.), |link| {
+                if link.back {
+                    theme::accent().into()
+                } else {
+                    theme::line_strong().into()
+                }
             }));
-        if selected {
-            row = row.child(
-                div()
-                    .debug_selector(move || mark_selector.clone())
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .bottom_0()
-                    .w(px(theme::ROW_MARK))
-                    .bg(theme::accent()),
+        for node in &layout.nodes {
+            let index = node.index;
+            let selected = index == self.selected;
+            let enabled = node.enabled;
+            let state = self
+                .run
+                .as_ref()
+                .and_then(|run| run.run.steps.iter().find(|step| step.id == node.id))
+                .map(|step| step.state);
+            let selector = format!("flow-workflow-step-{index}");
+            let label = format!(
+                "Step {}, {}{}",
+                node.id,
+                kind_word(node.kind),
+                if enabled { "" } else { ", disabled" }
             );
-        }
-        // The level is readable as one selector per row: its x is the row's
-        // content edge, which moves exactly one `INDENT_STEP` per level.
-        row = row.child(
-            div()
-                .debug_selector(move || indent_selector.clone())
-                .flex_shrink_0()
-                .child(icon(
-                    kind_glyph(facts.kind),
-                    px(theme::icon_small()),
-                    theme::text_muted(),
-                )),
-        );
-        let mut meta = div().flex().items_center().gap(px(6.)).min_w_0().child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .text_size(px(theme::font_meta()))
-                .text_color(theme::text_dim())
-                .child(facts.meta.clone()),
-        );
-        for dependency in named.iter().skip(1) {
-            meta = meta.child(join_chip(index, dependency));
-        }
-        row.child(
-            div()
-                .flex_1()
-                .min_w_0()
+            let mut card = div()
+                .id(SharedString::from(selector.clone()))
+                .debug_selector(move || selector.clone())
+                .a11y_option(label, selected)
+                .absolute()
+                .left(px(node.x))
+                .top(px(node.y))
+                .w(px(crate::ui::graph::NODE_W))
+                .h(px(crate::ui::graph::NODE_H))
+                .px(px(crate::ui::graph::NODE_PADDING))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(if selected {
+                    theme::accent()
+                } else {
+                    theme::hairline()
+                })
+                .bg(if selected {
+                    theme::raised()
+                } else {
+                    theme::surface()
+                })
+                .cursor_pointer()
                 .flex()
                 .flex_col()
+                .justify_center()
                 .gap(px(2.))
-                .child(
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.selected = index;
+                    this.error = None;
+                    this.refill_fields(window, cx);
+                    cx.notify();
+                }));
+            card = card.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(icon(
+                        kind_glyph(node.kind),
+                        px(theme::icon_tiny()),
+                        theme::text_muted(),
+                    ))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(theme::font_meta()))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if enabled {
+                                theme::text()
+                            } else {
+                                theme::text_muted()
+                            })
+                            .child(node.id.clone()),
+                    ),
+            );
+            if let Some(state) = state {
+                card = card.child(
                     div()
-                        .truncate()
-                        .text_size(px(theme::font_name()))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(if facts.enabled {
-                            theme::text()
-                        } else {
-                            theme::text_muted()
-                        })
-                        .child(facts.id.clone()),
-                )
-                .child(meta),
-        )
-        .child(if self.read_only {
-            facts
-                .state
-                .map(|state| state_pill(state, &facts.id))
-                .unwrap_or_else(|| quiet_word("missing"))
-        } else if facts.enabled {
-            div()
-                .flex_shrink_0()
-                .font_family(theme::code_font())
-                .text_size(px(theme::font_meta()))
-                .text_color(theme::text_muted())
-                .child(format!("@{revision}"))
-                .into_any_element()
-        } else {
-            quiet_word("off")
-        })
-        .into_any_element()
+                        .text_size(px(theme::font_micro()))
+                        .text_color(crate::ui::run::state_color_public(state))
+                        .child(state.label()),
+                );
+            } else {
+                // The compact vocabulary the box fits: one word of kind, and at
+                // most one marker. The long sentence the list rows use is
+                // truncated at this width, and an ellipsis is not a label.
+                card = card.child(
+                    div()
+                        .text_size(px(theme::font_micro()))
+                        .text_color(theme::text_muted())
+                        .child(node.meta()),
+                );
+            }
+            // The selection mark is the last child, so it paints over the
+            // canvas, over the node's border and over its text.
+            if selected {
+                card = card.child(
+                    div()
+                        .debug_selector(move || format!("flow-workflow-selected-{index}"))
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left_0()
+                        .w(px(theme::ROW_MARK))
+                        .rounded_l(px(8.))
+                        .bg(theme::accent()),
+                );
+            }
+            stage = stage.child(card);
+        }
+        stage.into_any_element()
     }
 
     /// The editable editor: the selected step's fields and the Revisions card.
@@ -1226,7 +1196,6 @@ impl WorkflowScreen {
                 .into_any_element();
         };
         let fields = self.ensure_fields(window, cx);
-        let revision = self.graph.as_ref().map(|graph| graph.revision).unwrap_or(0);
         let path = self
             .path()
             .map(|path| store::display_path(&path))
@@ -1321,7 +1290,10 @@ impl WorkflowScreen {
                     .font_family(theme::code_font())
                     .text_size(px(theme::font_micro()))
                     .text_color(theme::text_muted())
-                    .child(format!("unsaved · revision {revision} in the file")),
+                    .child(format!(
+                        "unsaved · revision {} in the file",
+                        self.graph.as_ref().map(|graph| graph.revision).unwrap_or(0)
+                    )),
             );
         }
 
@@ -1430,13 +1402,7 @@ impl WorkflowScreen {
         // a dependency, so it lives beside them and never in the list's shape.
         // Its target is a step this one waits for, and the budget says how many
         // times the run may walk back before the step fails.
-        body = body.child(self.rework_to_row(&step, cx));
-        body = body.child(self.rework_max_row(
-            &step,
-            fields.as_ref().map(|fields| fields.rework_max.clone()),
-            window,
-            cx,
-        ));
+        body = body.child(self.edges_row(&step, cx));
         if let Some(error) = &self.error {
             body = body.child(
                 div()
@@ -2341,132 +2307,218 @@ impl WorkflowScreen {
         row.child(chips).into_any_element()
     }
 
-    /// The step's rework edge: the earlier step it sends the work back to.
+    /// The step's back-edges: one row per edge, then the row that adds one.
     ///
-    /// A rework edge is not a dependency (ADR-0016): it never moves a step in
-    /// the list, so it is picked beside the dependency chips rather than drawn
-    /// as one. The run walks back only to a step this one already waits for —
-    /// `validate` refuses anything else — so the picker offers the transitive
-    /// ancestors, plus a way to clear the edge. A merge step has no rework:
-    /// a merge either lands or fails, and `validate` refuses a reworking one.
-    fn rework_to_row(&self, step: &Step, cx: &mut Context<Self>) -> AnyElement {
-        let row = rework_row("flow-step-rework-to", "Rework to", true)
-            .debug_selector(|| "flow-step-rework-to".into());
-        let mut chips = div()
+    /// An edge is not a dependency (ADR-0023): it never moves a step in the
+    /// list, so it is edited beside the dependency chips rather than drawn as
+    /// one. Each edge names the step the work returns to, the trigger that
+    /// sends it, and how many rounds it may take.
+    fn edges_row(&self, step: &Step, cx: &mut Context<Self>) -> AnyElement {
+        if step.kind == StepKind::Merge {
+            return rework_row("flow-step-edges", "Loops back", true)
+                .debug_selector(|| "flow-step-edges".into())
+                .child(quiet_word("A merge either lands or fails."))
+                .into_any_element();
+        }
+        if step.kind == StepKind::Cleanup {
+            return rework_row("flow-step-edges", "Loops back", true)
+                .debug_selector(|| "flow-step-edges".into())
+                .child(quiet_word(
+                    "The run's housekeeping runs once, at the close.",
+                ))
+                .into_any_element();
+        }
+        let mut body = div()
+            .debug_selector(|| "flow-step-edges".into())
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .flex_1()
+            .min_w_0();
+        for (index, edge) in step.edges.iter().enumerate() {
+            body = body.child(self.one_edge_row(step, index, edge, cx));
+        }
+        body = body.child(self.add_edge_row(step, cx));
+        rework_row("flow-step-edges-label", "Loops back", true)
+            .child(body)
+            .into_any_element()
+    }
+
+    /// One declared edge: where it goes, what sends it, how many rounds.
+    fn one_edge_row(
+        &self,
+        step: &Step,
+        index: usize,
+        edge: &Edge,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut row = div()
             .flex()
             .flex_wrap()
             .items_center()
             .gap(px(6.))
-            .flex_1()
-            .min_w_0();
-        if step.kind == StepKind::Merge {
-            chips = chips.child(quiet_word("A merge either lands or fails."));
-            return row.child(chips).into_any_element();
-        }
-        let targets = self.rework_targets(step);
-        if targets.is_empty() {
-            chips = chips.child(quiet_word(
-                "It waits for nothing yet, so there is nowhere to go back to.",
-            ));
-            return row.child(chips).into_any_element();
-        }
-        let cleared = step.rework_to.is_none();
-        chips = chips.child(rework_chip(
-            "flow-step-rework-to-clear".to_owned(),
-            "none".to_owned(),
-            "Does not send the work back".to_owned(),
-            cleared,
-            cx.listener(|this, _, window, cx| this.set_rework_to(None, window, cx)),
-        ));
-        for id in targets {
-            let selected = step.rework_to.as_deref() == Some(id.as_str());
-            let selector = format!("flow-step-rework-to-{id}");
-            let accessible = if selected {
-                format!("Returns the work to {id}; press to stop returning it")
-            } else {
-                format!("Returns the work to {id}; press to send the work back to it")
-            };
-            let value = id.clone();
-            chips = chips.child(rework_chip(
+            .w_full()
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .font_family(theme::code_font())
+                    .text_size(px(theme::font_micro()))
+                    .text_color(theme::text_dim())
+                    .child(format!("\u{2192} {}", edge.to)),
+            );
+        for trigger in Trigger::ALL
+            .into_iter()
+            .filter(|trigger| trigger.fits(step.kind))
+        {
+            let selected = edge.when == trigger;
+            let selector = format!("flow-step-edge-{index}-{}", trigger.as_str());
+            let accessible = format!(
+                "Sends the work back when {}; {}",
+                trigger.as_str(),
+                if selected {
+                    "already the trigger"
+                } else {
+                    "press to use it"
+                }
+            );
+            row = row.child(rework_chip(
                 selector,
-                id,
+                trigger.as_str().to_owned(),
                 accessible,
                 selected,
                 cx.listener(move |this, _, window, cx| {
-                    this.set_rework_to(Some(value.clone()), window, cx);
+                    this.set_edge_trigger(index, trigger, window, cx);
                 }),
             ));
         }
-        row.child(chips).into_any_element()
-    }
-
-    /// The rework budget: how many times the step may send the work back.
-    ///
-    /// It belongs to the edge, so it is off until the edge names a target: a
-    /// budget with no target is a graph `validate` refuses. Unset means one
-    /// ([`warp_flow_core::graph::DEFAULT_REWORK_MAX`]).
-    fn rework_max_row(
-        &self,
-        step: &Step,
-        input: Option<Entity<InputState>>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let row = rework_row("flow-step-rework-max", "Rework budget", false)
-            .debug_selector(|| "flow-step-rework-max".into());
-        if step.kind == StepKind::Merge {
-            return row
-                .child(quiet_word("A merge either lands or fails."))
-                .into_any_element();
+        row = row.child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(theme::font_micro()))
+                .text_color(theme::text_muted())
+                .child("max"),
+        );
+        for budget in [1u32, 2, 3, 5] {
+            let selected = edge.budget() == budget;
+            let selector = format!("flow-step-edge-{index}-max-{budget}");
+            row = row.child(rework_chip(
+                selector,
+                budget.to_string(),
+                format!("{budget} rounds"),
+                selected,
+                cx.listener(move |this, _, window, cx| {
+                    this.set_edge_budget(index, budget, window, cx);
+                }),
+            ));
         }
-        let input = input.filter(|_| step.rework_to.is_some());
-        let Some(input) = input else {
-            return row
-                .child(quiet_word("Pick a target first."))
-                .into_any_element();
-        };
-        row.child(div().flex_1().min_w_0().child(field::custom(
-            "flow-field-rework-max",
-            &input,
-            window,
-            cx,
-            |input| input.aria_label("Rework budget"),
-        )))
-        .into_any_element()
+        row = row.child(rework_chip(
+            format!("flow-step-edge-{index}-remove"),
+            "\u{00d7}".to_owned(),
+            format!("Remove the loop back to {}", edge.to),
+            false,
+            cx.listener(move |this, _, window, cx| {
+                this.remove_edge(index, window, cx);
+            }),
+        ));
+        row.into_any_element()
     }
 
-    /// The steps the selected step waits for, transitively: the only targets
-    /// its rework edge may name. The graph's own order is kept, so the chips do
-    /// not move when one is pressed.
-    fn rework_targets(&self, step: &Step) -> Vec<String> {
+    /// The row that adds an edge: every step that is not already a target.
+    fn add_edge_row(&self, step: &Step, cx: &mut Context<Self>) -> AnyElement {
         let Some(graph) = self.graph.as_ref() else {
-            return Vec::new();
+            return quiet_word("No graph loaded.");
         };
-        let mut reached = std::collections::BTreeSet::new();
-        collect_ancestors(graph, step, &mut reached);
-        graph
+        let candidates: Vec<String> = graph
             .steps
             .iter()
-            .filter(|candidate| reached.contains(candidate.id.as_str()))
+            .filter(|candidate| candidate.id != step.id)
+            .filter(|candidate| !step.edges.iter().any(|edge| edge.to == candidate.id))
             .map(|candidate| candidate.id.clone())
-            .collect()
+            .collect();
+        if candidates.is_empty() {
+            return quiet_word("Every other step is already a target.");
+        }
+        let mut chips = div().flex().flex_wrap().items_center().gap(px(6.));
+        chips = chips.child(quiet_word("send the work back to"));
+        for id in candidates {
+            let selector = format!("flow-step-edge-add-{id}");
+            let value = id.clone();
+            let label = id.clone();
+            chips = chips.child(rework_chip(
+                selector,
+                label,
+                format!("Add a loop back to {id}"),
+                false,
+                cx.listener(move |this, _, window, cx| {
+                    this.add_edge(value.clone(), window, cx);
+                }),
+            ));
+        }
+        chips.into_any_element()
     }
 
-    /// Point the selected step's rework edge at `target`, or clear it.
+    /// Add an edge from the selected step back to `target`.
     ///
-    /// Clearing drops the budget with it: a budget and no target is a graph
-    /// `validate` refuses, and a person who takes the loop away means the whole
-    /// of it, not the target alone.
-    fn set_rework_to(
+    /// The trigger defaults to the natural one for the step's kind, because a
+    /// person adding a loop already knows what sends it back: a gate loops on
+    /// its exit code, a question on a no, a harness step on a changes verdict.
+    fn add_edge(&mut self, target: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_step(cx, |step| {
+            let when = match step.kind {
+                StepKind::Gate => Trigger::GateFailed,
+                StepKind::Question => Trigger::AnswerNo,
+                _ => Trigger::VerdictChanges,
+            };
+            step.edges.push(Edge {
+                to: target,
+                when,
+                max: None,
+                on_exhausted: None,
+            });
+        });
+        self.refill_fields(window, cx);
+        cx.notify();
+    }
+
+    /// Point edge `index` at a different trigger.
+    fn set_edge_trigger(
         &mut self,
-        target: Option<String>,
+        index: usize,
+        trigger: Trigger,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.edit_step(cx, |step| {
-            step.rework_to = target;
-            if step.rework_to.is_none() {
-                step.rework_max = None;
+            if let Some(edge) = step.edges.get_mut(index) {
+                edge.when = trigger;
+            }
+        });
+        self.refill_fields(window, cx);
+        cx.notify();
+    }
+
+    /// Set edge `index`'s round budget.
+    fn set_edge_budget(
+        &mut self,
+        index: usize,
+        budget: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.edit_step(cx, |step| {
+            if let Some(edge) = step.edges.get_mut(index) {
+                edge.max = Some(budget);
+            }
+        });
+        self.refill_fields(window, cx);
+        cx.notify();
+    }
+
+    /// Remove edge `index`.
+    fn remove_edge(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_step(cx, |step| {
+            if index < step.edges.len() {
+                step.edges.remove(index);
             }
         });
         self.refill_fields(window, cx);
@@ -2681,7 +2733,6 @@ enum Field {
     Timeout,
     Produces,
     OnConflict,
-    ReworkMax,
 }
 
 /// The step's value as a row of its list: the value itself is offered when the
@@ -2750,13 +2801,7 @@ fn settle_catalog_fields(step: &mut Step, catalog: &[store::CatalogEntry]) {
 
 /// The word a step kind shows.
 fn kind_word(kind: StepKind) -> &'static str {
-    match kind {
-        StepKind::Harness => "harness",
-        StepKind::Gate => "gate",
-        StepKind::Question => "question",
-        StepKind::Merge => "merge",
-        StepKind::Cleanup => "cleanup",
-    }
+    crate::ui::graph::kind_word(kind)
 }
 
 /// The glyph a step kind draws: a terminal for harness, the gate, the question
@@ -2768,214 +2813,6 @@ fn kind_glyph(kind: StepKind) -> &'static str {
         StepKind::Question => "icons/icon-help.svg",
         StepKind::Merge => "icons/icon-merge.svg",
         StepKind::Cleanup => "icons/icon-trash.svg",
-    }
-}
-
-/// The list's rows in the order the indented tree draws them: `(row, level)`.
-///
-/// A step's parent is the first dependency the graph knows — `depends_on[0]`,
-/// not the deepest one — so the list is the graph's shape: roots in declaration
-/// order, each step's children directly after it, and a step reached only as a
-/// later dependency still appearing exactly once. The tree is the graph's, not
-/// today's run: a disabled step is still a node, so switching one off never
-/// moves the rows around it.
-///
-/// The indent is not the tree's depth. Depth staircases a straight pipeline one
-/// level per step — an eleven-step chain was eleven levels wide and truncated
-/// every meta line — so the indent says where the graph *branches* instead
-/// ([`step_levels`]): a chain is drawn flat, a fork indents, and a join comes
-/// back out.
-///
-/// `seen` is the cycle guard: `validate` refuses a cycle, but the list is drawn
-/// while a person is midway through an edit. A step the walk cannot reach is
-/// drawn after the rest, at the root, rather than dropped.
-fn tree_order(facts: &[StepFacts]) -> Vec<(usize, usize)> {
-    let index_of: std::collections::BTreeMap<&str, usize> = facts
-        .iter()
-        .enumerate()
-        .map(|(index, fact)| (fact.id.as_str(), index))
-        .collect();
-    let dependencies = known_dependencies(facts, &index_of);
-    let levels = step_levels(&dependencies);
-    let mut rows = Vec::with_capacity(facts.len());
-    let mut drawn = vec![false; facts.len()];
-    // Topological, not depth first: a row must come after every row it waits
-    // for, so a join is drawn once its branches are both done and not when the
-    // first of them finishes. Declaration order breaks ties, which keeps the
-    // list steady while a person edits.
-    while rows.len() < facts.len() {
-        let next = (0..facts.len()).find(|index| {
-            !drawn[*index]
-                && dependencies[*index]
-                    .iter()
-                    .all(|dependency| *dependency == *index || drawn[*dependency])
-        });
-        let Some(index) = next else {
-            break;
-        };
-        drawn[index] = true;
-        rows.push((index, levels[index]));
-    }
-    // A cycle the editor is halfway through making has no order to trust. It is
-    // drawn last, in declaration order, instead of vanishing.
-    for (index, level) in levels.iter().enumerate() {
-        if !drawn[index] {
-            rows.push((index, *level));
-        }
-    }
-    rows
-}
-
-/// Each step's dependencies, as row indices the list actually draws.
-///
-/// This is [`StepFacts::waits_for`] — the same set the engine resolves, so an
-/// omitted `depends_on` draws as the join it is. An id the graph does not know
-/// is one a person is still typing, and a step naming the same dependency twice
-/// waits for it once.
-fn known_dependencies(
-    facts: &[StepFacts],
-    index_of: &std::collections::BTreeMap<&str, usize>,
-) -> Vec<Vec<usize>> {
-    let mut dependencies: Vec<Vec<usize>> = vec![Vec::new(); facts.len()];
-    for (index, fact) in facts.iter().enumerate() {
-        for id in &fact.waits_for {
-            let Some(&dependency) = index_of.get(id.as_str()) else {
-                continue;
-            };
-            if dependency == index || dependencies[index].contains(&dependency) {
-                continue;
-            }
-            dependencies[index].push(dependency);
-        }
-    }
-    dependencies
-}
-
-/// How far each step is indented in the list: the branches, not the chain.
-///
-/// The accepted rule is "a branch indents, a link does not, and a join comes
-/// back out":
-///
-/// - a step with no dependencies is level 0;
-/// - a step with exactly one dependency takes that dependency's level, and one
-///   more only when the dependency has more than one child — a step a fork
-///   starts is a branch, a step in a plain chain is the chain continuing;
-/// - a step with more than one dependency is a join, and its level is the level
-///   of the deepest step its dependencies have in common (a dependency counts
-///   as its own ancestor), so the join lands back at the fork and the branch
-///   closes.
-///
-/// A child here is a step that names the step *and takes it as its only*
-/// dependency: the step that carries the branch on. A join also names its
-/// parents, but it names them to close the branches they opened, not to start
-/// one — counting it would indent the chain a later join happens to name. The
-/// mixed shape is what pins this down: `review` forks into `fmt` and `test`,
-/// `fmt` chains into `clippy`, and `bump` joins all three. Under a literal "a
-/// child is a step naming it" the join would make `fmt` a fork of `clippy`, and
-/// `clippy` — a link in `fmt`'s branch — would indent again; with the branch
-/// child counted, `fmt`, `clippy` and `test` all sit one level in and `bump`
-/// comes back out.
-///
-/// The levels are computed in dependency order by [`level_of`], which memoises
-/// and recurses; the graph is acyclic (`validate` guarantees it), and the walk
-/// is guarded anyway because the list is drawn mid-edit.
-fn step_levels(dependencies: &[Vec<usize>]) -> Vec<usize> {
-    let count = dependencies.len();
-    // A fork is a step that more than one branch leaves, so only a step that
-    // waits for this one and nothing else is counted: the link that carries
-    // the branch on. A join is the branch closing, not a new one.
-    let mut children = vec![0usize; count];
-    for edges in dependencies {
-        if let [only] = edges.as_slice() {
-            children[*only] += 1;
-        }
-    }
-    let mut levels: Vec<Option<usize>> = vec![None; count];
-    let mut visiting = vec![false; count];
-    for index in 0..count {
-        level_of(index, dependencies, &children, &mut levels, &mut visiting);
-    }
-    levels.into_iter().map(|level| level.unwrap_or(0)).collect()
-}
-
-/// One step's level, with every level it depends on resolved first.
-fn level_of(
-    index: usize,
-    dependencies: &[Vec<usize>],
-    children: &[usize],
-    levels: &mut [Option<usize>],
-    visiting: &mut [bool],
-) -> usize {
-    if let Some(level) = levels[index] {
-        return level;
-    }
-    // `validate` refuses a cycle; a step already on the walk's stack has no
-    // level to trust, so a graph mid-edit counts it as a root.
-    if std::mem::replace(&mut visiting[index], true) {
-        return 0;
-    }
-    let level = match dependencies[index].as_slice() {
-        [] => 0,
-        [only] => {
-            let parent = level_of(*only, dependencies, children, levels, visiting);
-            if children[*only] > 1 {
-                parent + 1
-            } else {
-                parent
-            }
-        }
-        join => join_level(join, dependencies, children, levels, visiting),
-    };
-    visiting[index] = false;
-    levels[index] = Some(level);
-    level
-}
-
-/// A join's level: the deepest step every one of its dependencies reaches.
-///
-/// A dependency is its own ancestor, so a join of two steps on one chain lands
-/// where that chain is, and a join of two branches lands at the fork that
-/// started them. An empty intersection has no common step to land on and is
-/// drawn at the root.
-fn join_level(
-    dependencies: &[usize],
-    edges: &[Vec<usize>],
-    children: &[usize],
-    levels: &mut [Option<usize>],
-    visiting: &mut [bool],
-) -> usize {
-    let mut common: Option<std::collections::BTreeSet<usize>> = None;
-    for dependency in dependencies {
-        let mut ancestors = std::collections::BTreeSet::new();
-        let mut seen = std::collections::BTreeSet::new();
-        seen.insert(*dependency);
-        ancestors.insert(*dependency);
-        collect_step_ancestors(*dependency, edges, &mut ancestors, &mut seen);
-        common = Some(match common {
-            None => ancestors,
-            Some(common) => common.intersection(&ancestors).copied().collect(),
-        });
-    }
-    common
-        .into_iter()
-        .flatten()
-        .map(|ancestor| level_of(ancestor, edges, children, levels, visiting))
-        .max()
-        .unwrap_or(0)
-}
-
-/// Collect `index`'s dependencies, and everything those wait for, into `out`.
-fn collect_step_ancestors(
-    index: usize,
-    edges: &[Vec<usize>],
-    out: &mut std::collections::BTreeSet<usize>,
-    seen: &mut std::collections::BTreeSet<usize>,
-) {
-    for dependency in &edges[index] {
-        if seen.insert(*dependency) {
-            out.insert(*dependency);
-            collect_step_ancestors(*dependency, edges, out, seen);
-        }
     }
 }
 
@@ -3049,26 +2886,6 @@ fn mode_chip(
         .into_any_element()
 }
 
-/// One extra dependency on a row: the other parent of a join, quiet beside the
-/// meta and small enough to fit inside the 320 column at any depth.
-fn join_chip(index: usize, dependency: &str) -> AnyElement {
-    let selector = format!("flow-workflow-join-{index}-{dependency}");
-    div()
-        .debug_selector(move || selector.clone())
-        .flex_shrink_0()
-        .max_w(px(88.))
-        .truncate()
-        .h(px(theme::scaled(JOIN_CHIP_HEIGHT)))
-        .px(px(5.))
-        .rounded(px(999.))
-        .bg(theme::raised())
-        .font_family(theme::code_font())
-        .text_size(px(theme::font_micro()))
-        .text_color(theme::text_muted())
-        .child(format!("+{dependency}"))
-        .into_any_element()
-}
-
 /// One rework row's label column: the field's 112-wide label, so the picker
 /// lines up with every other field.
 fn rework_row(id: &'static str, label: &'static str, chips: bool) -> gpui::Stateful<gpui::Div> {
@@ -3135,27 +2952,6 @@ fn rework_chip(
         .into_any_element()
 }
 
-/// Every step `step` waits for, and everything those wait for, by id.
-///
-/// The set comes from [`Workflow::dependencies`], so an omitted `depends_on` —
-/// every step declared before it — is included, which is exactly what the engine
-/// will do. `reached` is also the cycle guard: `validate` refuses a cycle, but
-/// the inspector is drawn while a person is midway through an edit.
-fn collect_ancestors<'a>(
-    graph: &'a Workflow,
-    step: &Step,
-    reached: &mut std::collections::BTreeSet<&'a str>,
-) {
-    for id in graph.dependencies(step) {
-        let Some(dependency) = graph.step(&id) else {
-            continue;
-        };
-        if reached.insert(dependency.id.as_str()) {
-            collect_ancestors(graph, dependency, reached);
-        }
-    }
-}
-
 /// A step's list meta: `harness · once per task · after code`.
 ///
 /// The dependency it names is the step's parent in the tree; any others are
@@ -3178,11 +2974,19 @@ fn step_meta(step: &Step) -> String {
             None => "first".to_owned(),
         },
     };
-    let rework = match &step.rework_to {
-        Some(target) => format!("returns to {target} · "),
-        None => String::new(),
+    // Every edge is named, because a loop is the one thing the row's position
+    // in the list does not already say.
+    let loops = if step.edges.is_empty() {
+        String::new()
+    } else {
+        let targets: Vec<String> = step
+            .edges
+            .iter()
+            .map(|edge| format!("returns to {}", edge.to))
+            .collect();
+        format!("{} · ", targets.join(" · "))
     };
-    format!("{} · {rework}{cadence} · {after}", kind_word(step.kind))
+    format!("{} · {loops}{cadence} · {after}", kind_word(step.kind))
 }
 
 /// A log step's list meta, when the file that named it is gone.
@@ -3218,8 +3022,7 @@ fn new_step(id: &str, kind: StepKind, depends_on: &[&str]) -> Step {
         timeout_secs: None,
         depends_on: Some(depends_on.iter().map(|id| (*id).to_owned()).collect()),
         produces: None,
-        rework_to: None,
-        rework_max: None,
+        edges: Vec::new(),
         per_task: false,
         mode: None,
         push: false,

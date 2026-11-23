@@ -2,6 +2,13 @@
 
 _Status: accepted. 2026-11-23._
 
+_Superseded in one respect by [ADR-0023](0023-a-graph-may-loop.md) on
+2026-11-23: the edge is no longer one field with one trigger. A step declares
+a list of `edges`, each with its own trigger and budget, and a gate or a
+question may take one. The reasoning below — that a bounded loop is not a
+cycle, that the judgement must be a declared file, that taking the edge is not
+a spent attempt — stands._
+
 A step may declare a rework edge: `rework_to` names an earlier step it already
 waits for, and `rework_max` — 1 when the file does not say — is how many times
 the edge may be taken. A step with a rework edge must also declare `produces`,

@@ -3,8 +3,8 @@
 //! The title bar is the family's 46: this app's mark and name, the two sibling
 //! windows it can open, the one activity chip, the list toggle, the shared text
 //! size and palette controls, and the window buttons. The rail is the design's
-//! 76: the two work sections at the top, About and Settings pinned to the foot,
-//! and the one pip that says how many runs wait on a person.
+//! 76: the two work sections at the top, Settings pinned to the foot, and the
+//! one pip that says how many runs wait on a person.
 
 use gpui::prelude::*;
 use gpui::{
@@ -150,10 +150,13 @@ impl FlowApp {
     /// The list toggle: the pane the shell folds away, and the one `Ctrl+\`
     /// presses.
     fn list_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
+        // The label names the shortcut: the title bar is where a person looks
+        // for a pane's toggle, and `Ctrl+\` is otherwise only in their head
+        // once they have read the docs.
         let (icon_path, label) = if self.list_hidden {
-            ("icons/icon-panel-left-off.svg", "Show the list")
+            ("icons/icon-panel-left-off.svg", "Show the list (Ctrl+\\)")
         } else {
-            ("icons/icon-panel-left-on.svg", "Hide the list")
+            ("icons/icon-panel-left-on.svg", "Hide the list (Ctrl+\\)")
         };
         title_icon("flow-list-toggle", label, icon_path)
             .debug_selector(|| "flow-list-toggle".into())
@@ -161,7 +164,8 @@ impl FlowApp {
             .into_any_element()
     }
 
-    /// The rail: the two work sections, then About and Settings at the foot.
+    /// The rail: the two work sections, then Settings at the foot. The About
+    /// page is Settings' last group, so the rail never grows a fourth item.
     pub(crate) fn render_rail(&self, cx: &mut Context<Self>) -> AnyElement {
         let waiting = self.snapshot.need_you_count(None);
         let mut rail = shell::rail().debug_selector(|| "flow-rail".into());
@@ -169,7 +173,6 @@ impl FlowApp {
             rail = rail.child(self.rail_item(section, waiting, cx));
         }
         rail.child(div().flex_1())
-            .child(self.rail_item(Section::About, 0, cx))
             .child(self.rail_item(Section::Settings, 0, cx))
             .into_any_element()
     }

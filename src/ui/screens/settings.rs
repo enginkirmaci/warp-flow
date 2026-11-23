@@ -1,5 +1,5 @@
-//! The settings screen: this app's own knobs, where its files live, and
-//! whether its door is up.
+//! The settings screen: this app's own knobs, where its files live, whether its
+//! door is up, and the About page the rail no longer carries.
 //!
 //! The design's settings page is a flat list of rows — label and description on
 //! the left, the control on the right, a hairline between them, no cards — so
@@ -8,6 +8,11 @@
 //! switch here is the shared motion choice. What belongs to a *repository* —
 //! its gates and its workflow template — is the Repos section's, and the head
 //! says so on purpose.
+//!
+//! The About group is the exception: its page is the family's installed table,
+//! this build and the license, so the window composes it from
+//! [`crate::ui::about`] and this screen only owns the group's row. That keeps
+//! every rail destination a Settings group without a fourth rail item.
 
 use gpui::prelude::*;
 use gpui::{
@@ -35,11 +40,14 @@ pub enum SettingsGroup {
     Engine,
     /// Where the app keeps its files, and this build.
     Files,
+    /// The installed family, this build and the license. Its page is
+    /// [`crate::ui::about`]'s, not this screen's: the window composes it.
+    About,
 }
 
 impl SettingsGroup {
     /// Every group, in the list's order.
-    pub const ALL: [Self; 3] = [Self::Appearance, Self::Engine, Self::Files];
+    pub const ALL: [Self; 4] = [Self::Appearance, Self::Engine, Self::Files, Self::About];
 
     /// A stable key for debug selectors and state.
     pub fn key(self) -> &'static str {
@@ -47,6 +55,7 @@ impl SettingsGroup {
             Self::Appearance => "appearance",
             Self::Engine => "engine",
             Self::Files => "files",
+            Self::About => "about",
         }
     }
 
@@ -56,6 +65,7 @@ impl SettingsGroup {
             Self::Appearance => "Appearance",
             Self::Engine => "Engine",
             Self::Files => "Files",
+            Self::About => "About",
         }
     }
 
@@ -65,6 +75,7 @@ impl SettingsGroup {
             Self::Appearance => "Text size, palette and motion.",
             Self::Engine => "The door warp-agent reads, and the runs this window drives.",
             Self::Files => "Where the settings and logs live, and this build.",
+            Self::About => "The installed family, this build and the license.",
         }
     }
 }

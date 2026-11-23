@@ -59,7 +59,7 @@ fn seed_repo(home: &Path) -> (PathBuf, PathBuf) {
     .expect("run.md");
     std::fs::write(
         warp_flow_core::layout::pinned_workflow(&issue),
-        "schema = 2\nname = \"implement\"\nrevision = 1\n\n[[step]]\nid = \"code\"\n\
+        "schema = 3\nname = \"implement\"\nrevision = 1\n\n[[step]]\nid = \"code\"\n\
          kind = \"harness\"\nskill = \"code\"\n",
     )
     .expect("workflow.toml");

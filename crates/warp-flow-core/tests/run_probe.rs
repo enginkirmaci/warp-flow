@@ -7,15 +7,17 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use warp_flow_core::artifact::{Document, Issue, Status};
 use warp_flow_core::control::{Control, Signal};
 use warp_flow_core::graph::Workflow;
-use warp_flow_core::harness::{FakeHarness, Scripted};
+use warp_flow_core::harness::{FakeHarness, Harness, Scripted, StepOutcome, StepRequest};
 use warp_flow_core::layout;
 use warp_flow_core::run::{MemoryLog, RunStatus, Runner, RunnerConfig};
+use warp_flow_core::worktree::Repo;
 
 /// A temp directory that removes itself. The engine has no dev-dependencies so
 /// that `cargo test -p warp-flow-core` works on the non-member path package.
@@ -91,9 +93,64 @@ impl World {
         Runner::new(config).expect("runner")
     }
 
+    /// Make the temp root a git repository with one commit, so a merge step has
+    /// a checkout to land a branch in.
+    ///
+    /// The commit includes the issue folder `World::new` wrote, so `main` starts
+    /// clean: anything dirty later is the test's own doing, not setup debris.
+    fn git_repo(&self) {
+        init_repository(&self.root);
+        run_git(&self.root, &["add", "-A"]);
+        run_git(&self.root, &["commit", "--quiet", "-m", "probe issue"]);
+    }
+
+    /// A runner whose repository is `repo_root`, with a log to read back.
+    fn repo_runner<H>(&self, repo_root: &Path, harness: H) -> (Runner<H>, MemoryLog)
+    where
+        H: Harness + Clone + Send + Sync + 'static,
+    {
+        let workflow =
+            Workflow::read(layout::pinned_workflow(&self.issue)).expect("workflow parses");
+        let mut config = RunnerConfig::new(&self.issue, workflow, harness);
+        config.workdir = repo_root.to_path_buf();
+        config.repo = Some(Repo::open(repo_root).expect("repo opens"));
+        let log = MemoryLog::new();
+        config.log = Box::new(log.clone());
+        (Runner::new(config).expect("runner"), log)
+    }
+
     fn run_md(&self) -> Document {
         Document::read(self.issue.join("run.md")).expect("run.md parses")
     }
+}
+
+/// Run one git command and return its stdout, failing the test on error.
+fn run_git(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("git runs");
+    assert!(
+        output.status.success(),
+        "git {args:?} in {} failed: {}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Make `root` a git repository with one commit and a local identity.
+fn init_repository(root: &Path) {
+    fs::create_dir_all(root).expect("repository directory");
+    run_git(root, &["init", "--initial-branch=main", "--quiet"]);
+    run_git(root, &["config", "user.email", "probe@example.com"]);
+    run_git(root, &["config", "user.name", "Run Probe"]);
+    run_git(root, &["config", "commit.gpgsign", "false"]);
+    fs::write(root.join("readme.md"), "probe\n").expect("readme");
+    run_git(root, &["add", "readme.md"]);
+    run_git(root, &["commit", "--quiet", "-m", "first"]);
 }
 
 fn task_text(number: u32, title: &str, blocked_by: &str) -> String {
@@ -119,7 +176,7 @@ fn position(body: &str, row: &str) -> usize {
 
 /// A task lane: a gate per task after coding, then a merge that resolves it.
 const LANE: &str = r#"
-schema = 2
+schema = 3
 name = "implement"
 revision = 1
 
@@ -237,7 +294,7 @@ fn a_task_never_starts_while_its_blocker_is_unresolved() {
 fn a_failing_gate_writes_repairs_and_blocks_after_the_limit() {
     let world = World::new(
         r#"
-schema = 2
+schema = 3
 name = "implement"
 revision = 1
 
@@ -310,7 +367,7 @@ per_task = true
 
 /// The workflow a waiting run leaves behind: one harness step, then a question.
 const WAITING_WORKFLOW: &str = r#"
-schema = 2
+schema = 3
 name = "implement"
 revision = 1
 
@@ -387,7 +444,7 @@ impl Control for AlreadyAbandoning {
 fn a_question_pauses_the_run_and_writes_the_file() {
     let world = World::new(
         r#"
-schema = 2
+schema = 3
 name = "implement"
 revision = 1
 
@@ -448,4 +505,166 @@ depends_on = ["analyze"]
 
     let issue = Issue::open(&world.issue).expect("issue reopens");
     assert!(issue.tasks().is_empty(), "no tasks were split yet");
+}
+
+/// A task lane that ends in a merge: the code step writes the branch, the merge
+/// lands it. The repository is the temp root, made one by `World::git_repo`.
+const MERGE_LANE: &str = r#"
+schema = 3
+name = "implement"
+revision = 1
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+per_task = true
+
+[[step]]
+id = "merge"
+kind = "merge"
+per_task = true
+mode = "local"
+"#;
+
+/// A harness that acts like a coding session: it commits in the task's
+/// worktree, so the branch has something for the merge to land.
+#[derive(Clone, Default)]
+struct CommittingHarness;
+
+impl Harness for CommittingHarness {
+    fn run(&mut self, request: &StepRequest) -> warp_flow_core::Result<StepOutcome> {
+        if request.step.per_task {
+            fs::write(request.workdir.join("feature.txt"), "done\n").expect("feature file");
+            run_git(&request.workdir, &["add", "feature.txt"]);
+            run_git(&request.workdir, &["commit", "--quiet", "-m", "task work"]);
+        }
+        Ok(StepOutcome::Done {
+            wrote: Vec::new(),
+            text: "done".to_owned(),
+        })
+    }
+}
+
+#[test]
+fn a_dirty_main_checkout_writes_a_repair_naming_the_dirty_path() {
+    let world = World::new(MERGE_LANE);
+    world.task(1, "Dirty main", "None");
+    world.git_repo();
+    fs::write(world.root.join("someone-elses.txt"), "unsaved\n").expect("dirty file");
+
+    let root = world.root.clone();
+    let (mut runner, _log) = world.repo_runner(&root, CommittingHarness);
+    assert_eq!(runner.run().expect("run"), RunStatus::Blocked);
+
+    // Every other refusal leaves a person a repair; this one used to leave a
+    // red run and nothing else.
+    let repair = Document::read(world.issue.join("repairs/01.md")).expect("repair written");
+    assert_eq!(repair.front.get("step"), Some("merge"));
+    assert_eq!(repair.front.get("task"), Some("01"));
+    assert_eq!(repair.front.get("attempt"), Some("1"));
+    assert_eq!(repair.front.get("outcome"), Some("dirty"));
+    assert!(
+        repair.body.contains("someone-elses.txt"),
+        "the repair names the dirty path:\n{}",
+        repair.body
+    );
+
+    let run = world.run_md();
+    assert!(
+        run.body.contains("| merge | 01 | 1 | dirty |"),
+        "{}",
+        run.body
+    );
+    assert!(
+        !world.issue.join("repairs/02.md").exists(),
+        "a dirty checkout is refused once, not retried into the budget"
+    );
+}
+
+#[test]
+fn an_empty_task_branch_fails_the_attempt_once_and_keeps_the_budget() {
+    let world = World::new(MERGE_LANE);
+    world.task(1, "Empty branch", "None");
+    world.git_repo();
+
+    // The code step commits nothing, so the branch is still at `main`: a
+    // retried merge has nothing new to land.
+    let mut harness = FakeHarness::new();
+    harness.script(
+        "code",
+        Scripted::Done {
+            files: Vec::new(),
+            text: "coded nothing".to_owned(),
+        },
+    );
+
+    let root = world.root.clone();
+    let (mut runner, _log) = world.repo_runner(&root, harness);
+    assert_eq!(runner.run().expect("run"), RunStatus::Blocked);
+
+    let run = world.run_md();
+    assert_eq!(
+        run.body.matches("| merge | 01 |").count(),
+        1,
+        "an empty branch cannot merge on retry, so one attempt fails it:\n{}",
+        run.body
+    );
+    assert!(
+        run.body.contains("| merge | 01 | 1 | empty |"),
+        "{}",
+        run.body
+    );
+
+    let repair = Document::read(world.issue.join("repairs/01.md")).expect("repair written");
+    assert_eq!(repair.front.get("outcome"), Some("empty"));
+    assert_eq!(repair.front.get("attempt"), Some("1"));
+    assert_eq!(
+        repair.front.get("of"),
+        Some("3"),
+        "the merge's budget is intact, not spent on the identical retry"
+    );
+    assert!(
+        repair.body.contains("has no commits to merge"),
+        "the repair says the branch is empty:\n{}",
+        repair.body
+    );
+    assert!(
+        repair.body.contains(&root.display().to_string()),
+        "the repair names the repository the queue measured:\n{}",
+        repair.body
+    );
+    assert!(
+        !world.issue.join("repairs/02.md").exists(),
+        "one failed attempt, not a spent budget"
+    );
+}
+
+#[test]
+fn a_run_whose_issue_folder_is_outside_the_repository_says_so() {
+    let world = World::new(MERGE_LANE);
+    world.task(1, "Outside the checkout", "None");
+    // The repository is a sibling of the issue folder, not its parent: git
+    // cannot stage a path outside its own worktree, and the engine used to
+    // report the commit it could not make as if it had made it.
+    let repo_root = world.root.join("repo");
+    init_repository(&repo_root);
+
+    let (mut runner, log) = world.repo_runner(&repo_root, CommittingHarness);
+    assert_eq!(runner.run().expect("run"), RunStatus::Done);
+
+    assert!(
+        log.lines()
+            .iter()
+            .any(|line| line.contains("outside the repository")),
+        "the engine log says the record was not committed: {:?}",
+        log.lines()
+    );
+    let run = world.run_md();
+    assert!(
+        run.body.contains("**Record:**"),
+        "the run record carries the fact:\n{}",
+        run.body
+    );
+    assert!(run.body.contains("outside the repository"), "{}", run.body);
 }

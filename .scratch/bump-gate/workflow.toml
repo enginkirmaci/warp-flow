@@ -1,4 +1,4 @@
-schema = 2
+schema = 3
 name = "implement"
 revision = 1
 max_parallel = 2
@@ -53,8 +53,7 @@ harness = "dsh"
 model = "opencode-go/deepseek-v4.1-flash"
 effort = "high"
 produces = "review.md"
-rework_to = "code"
-rework_max = 3
+edges = [{ to = "code", when = "verdict_changes", max = 3 }]
 per_task = true
 push = false
 

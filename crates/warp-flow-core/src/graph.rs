@@ -23,7 +23,14 @@ use crate::{Error, Result};
 /// (ADR-0015). A schema-1 file is refused rather than upgraded, because its
 /// gate steps carry only a name and the command that name referred to lived in
 /// a `flow.toml` that no longer exists.
-const SCHEMA: u32 = 2;
+///
+/// Schema 3 replaced the single `rework_to` field with a list of [`Edge`]s
+/// (ADR-0023): a step may declare any number of back-edges, each with its own
+/// trigger and budget, and a gate may take one. A schema-2 file is refused
+/// rather than upgraded, because its `rework_to` names a target without saying
+/// what triggers the return, and guessing the trigger is exactly what the
+/// engine must not do.
+const SCHEMA: u32 = 3;
 
 /// The steps a run may have in flight at once when the file does not say.
 const DEFAULT_MAX_PARALLEL: u32 = 2;
@@ -34,8 +41,8 @@ const DEFAULT_CWD: &str = ".";
 /// The timeout a gate step gets when it does not name one.
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
 
-/// How many times a rework edge may be taken when the file does not say.
-pub const DEFAULT_REWORK_MAX: u32 = 1;
+/// How many times an edge may be taken when the file does not say.
+pub const DEFAULT_EDGE_MAX: u32 = 1;
 
 /// What a step does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,21 +131,15 @@ pub struct Step {
     /// The artifact the step writes, relative to the issue folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub produces: Option<String>,
-    /// The step this one sends the work back to when it asks for changes.
+    /// The back-edges this step may take, each with its own trigger and budget.
     ///
-    /// A rework edge is not a dependency. It never moves a step in the graph
+    /// An edge is not a dependency. It never moves a step in the graph
     /// (ADR-0014, ADR-0018) and [`Workflow::check_acyclic`] never walks it,
     /// which is what lets a workflow describe a bounded loop and stay acyclic.
-    /// What travels back is this step's own `produces`: the target reads it as
-    /// its findings.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rework_to: Option<String>,
-    /// How many times `rework_to` may be taken before this step fails.
-    ///
-    /// Unset means [`DEFAULT_REWORK_MAX`]: a step that names a target but no
-    /// budget still sends the work back once.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rework_max: Option<u32>,
+    /// A step may declare any number of them, and the target may be any step —
+    /// not only one this step waits for (ADR-0023).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edges: Vec<Edge>,
     /// Whether the step runs once per ready task rather than once per run.
     #[serde(default)]
     pub per_task: bool,
@@ -156,6 +157,144 @@ pub struct Step {
     /// makes that safe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_conflict: Option<String>,
+}
+
+/// What makes a step take one of its back-edges.
+///
+/// Every trigger is something the engine already reads from a file or an exit
+/// code — never a model's opinion of itself (ADR-0008). The vocabulary is
+/// closed: a word this engine does not know is refused when the workflow is
+/// validated, not guessed at when a run reaches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Trigger {
+    /// The step's `produces` artifact carries `verdict: changes` in its front
+    /// matter. The one trigger a harness step can raise (ADR-0016).
+    VerdictChanges,
+    /// The step's `produces` artifact carries `verdict: ready`. Rarely useful
+    /// on its own — it is the ordinary path — but it lets a graph say "when
+    /// this is ready, go back and redo that" without a second step.
+    VerdictReady,
+    /// A gate step's command exited non-zero. This is the trigger that makes
+    /// "the tests failed, go back to the code" expressible (ADR-0023).
+    GateFailed,
+    /// A gate step's command exited zero.
+    GatePassed,
+    /// The question this step asked was answered with `no` — or with any
+    /// answer that is not `yes`, which is what an approval means.
+    AnswerNo,
+    /// The question this step asked was answered with `yes`.
+    AnswerYes,
+    /// The step reported `blocked` — its own session could not finish.
+    Blocked,
+}
+
+impl Trigger {
+    /// The word the file writes, for an error a person reads.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::VerdictChanges => "verdict_changes",
+            Self::VerdictReady => "verdict_ready",
+            Self::GateFailed => "gate_failed",
+            Self::GatePassed => "gate_passed",
+            Self::AnswerNo => "answer_no",
+            Self::AnswerYes => "answer_yes",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    /// Every trigger, in the order the editor offers them.
+    pub const ALL: [Self; 7] = [
+        Self::VerdictChanges,
+        Self::VerdictReady,
+        Self::GateFailed,
+        Self::GatePassed,
+        Self::AnswerNo,
+        Self::AnswerYes,
+        Self::Blocked,
+    ];
+
+    /// Whether a step of `kind` can raise this trigger at all.
+    ///
+    /// A gate cannot write an artifact, so it can never raise a verdict; a
+    /// harness step has no exit code, so it can never raise `gate_failed`. The
+    /// check exists so a graph that names an impossible trigger is refused
+    /// before the run starts rather than silently never firing.
+    pub fn fits(self, kind: StepKind) -> bool {
+        match self {
+            Self::VerdictChanges | Self::VerdictReady => kind == StepKind::Harness,
+            Self::GateFailed | Self::GatePassed => kind == StepKind::Gate,
+            Self::AnswerNo | Self::AnswerYes => kind == StepKind::Question,
+            Self::Blocked => matches!(kind, StepKind::Harness | StepKind::Gate),
+        }
+    }
+}
+
+/// What happens when an edge's budget is spent with no round taking the other
+/// path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnExhausted {
+    /// Stop the run: the loop ran its course and the work is not ready. The
+    /// default, and the safe one — a loop that cannot converge is a run that
+    /// should not keep spending sessions.
+    Block,
+    /// Let the run walk on as if the edge had not fired. For a loop whose
+    /// failure is tolerable — a review that never clears still lets the run
+    /// finish and report.
+    Continue,
+}
+
+impl OnExhausted {
+    /// The word the file writes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Continue => "continue",
+        }
+    }
+}
+
+/// One back-edge: where the work goes, what makes it go, and how often.
+///
+/// A step declares these in its `edges` list. The target may be any step in the
+/// graph — an ancestor, a sibling branch, or a step that only becomes reachable
+/// through the edge itself — because the engine does not walk the graph to take
+/// an edge; it un-completes the steps between the target and the sender and
+/// lets the ordinary scheduler walk forward again (ADR-0023).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Edge {
+    /// The step the work goes back to.
+    pub to: String,
+    /// What makes this step take the edge.
+    pub when: Trigger,
+    /// How many times the edge may be taken before [`Edge::on_exhausted`]
+    /// applies. Unset means [`DEFAULT_EDGE_MAX`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<u32>,
+    /// What happens when the budget is spent. Unset means
+    /// [`OnExhausted::Block`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_exhausted: Option<OnExhausted>,
+}
+
+impl Edge {
+    /// How many times this edge may be taken.
+    pub fn budget(&self) -> u32 {
+        self.max.unwrap_or(DEFAULT_EDGE_MAX)
+    }
+
+    /// What happens when the budget is spent.
+    pub fn exhausted(&self) -> OnExhausted {
+        self.on_exhausted.unwrap_or(OnExhausted::Block)
+    }
+
+    /// The edge as the log records it: `to:trigger`, which is what makes two
+    /// edges on one step distinguishable in `run.md`'s rows.
+    pub fn key(&self) -> String {
+        format!("{}:{}", self.to, self.when.as_str())
+    }
 }
 
 /// The default for a field that is on unless the file says otherwise.
@@ -410,8 +549,7 @@ impl Workflow {
                     ("mode", step.mode.is_some()),
                     ("push", step.push),
                     ("produces", step.produces.is_some()),
-                    ("rework_to", step.rework_to.is_some()),
-                    ("rework_max", step.rework_max.is_some()),
+                    ("edges", !step.edges.is_empty()),
                     ("on_conflict", step.on_conflict.is_some()),
                 ];
                 if let Some((field, _)) = carried.iter().find(|(_, carried)| *carried) {
@@ -586,52 +724,79 @@ impl Workflow {
             }
         }
 
-        // A rework edge is not a dependency, so `check_acyclic` cannot see it.
-        // Everything it could get wrong is caught here instead.
+        // A back-edge is not a dependency, so `check_acyclic` cannot see it.
+        // Everything it could get wrong is caught here instead (ADR-0023).
         for step in &self.steps {
-            let Some(target) = &step.rework_to else {
-                if step.rework_max.is_some() {
+            for edge in &step.edges {
+                if edge.to == step.id {
                     return Err(Error::Workflow(format!(
-                        "step `{}` sets a rework budget but no `rework_to`",
+                        "step `{}` has an edge back to itself",
                         step.id
                     )));
                 }
-                continue;
-            };
-            if target == &step.id {
-                return Err(Error::Workflow(format!(
-                    "step `{}` sends work back to itself",
-                    step.id
-                )));
+                if self.step(&edge.to).is_none() {
+                    return Err(Error::Workflow(format!(
+                        "step `{}` has an edge to `{}`, which is not in the graph",
+                        step.id, edge.to
+                    )));
+                }
+                if step.kind == StepKind::Merge {
+                    return Err(Error::Workflow(format!(
+                        "merge step `{}` has an edge to `{}`; a merge either lands or fails",
+                        step.id, edge.to
+                    )));
+                }
+                if step.kind == StepKind::Cleanup {
+                    return Err(Error::Workflow(format!(
+                        "cleanup step `{}` has an edge to `{}`; the run's housekeeping runs \
+                         once, at the close",
+                        step.id, edge.to
+                    )));
+                }
+                if edge.max == Some(0) {
+                    return Err(Error::Workflow(format!(
+                        "step `{}` has an edge to `{}` with a budget of 0; an edge needs a \
+                         budget of at least 1",
+                        step.id, edge.to
+                    )));
+                }
+                // A trigger the sender cannot raise would never fire, and a
+                // graph that says "when the gate fails" on a harness step is a
+                // graph whose author meant something else.
+                if !edge.when.fits(step.kind) {
+                    return Err(Error::Workflow(format!(
+                        "step `{}` is a {} step, so it can never raise `{}`; that trigger \
+                         belongs to a {} step",
+                        step.id,
+                        kind_word(step.kind),
+                        edge.when.as_str(),
+                        trigger_owner(edge.when)
+                    )));
+                }
+                // A verdict trigger reads the step's own artifact, so a step
+                // that writes none can never raise one.
+                if matches!(edge.when, Trigger::VerdictChanges | Trigger::VerdictReady)
+                    && step.produces.is_none()
+                {
+                    return Err(Error::Workflow(format!(
+                        "step `{}` has a `{}` edge but writes no artifact; the verdict travels \
+                         in the file it produces",
+                        step.id,
+                        edge.when.as_str()
+                    )));
+                }
             }
-            let Some(target_step) = self.step(target) else {
-                return Err(Error::Workflow(format!(
-                    "step `{}` reworks to `{target}`, which is not in the graph",
-                    step.id
-                )));
-            };
-            if step.kind == StepKind::Merge {
-                return Err(Error::Workflow(format!(
-                    "merge step `{}` reworks to `{target}`; a merge either lands or fails",
-                    step.id
-                )));
-            }
-            if step.rework_max == Some(0) {
-                return Err(Error::Workflow(format!(
-                    "step `{}` may rework 0 times; a rework edge needs a budget of at least 1",
-                    step.id
-                )));
-            }
-            // Going back only means something when the target is upstream:
-            // the run un-completes it and its dependents run again.
-            let mut ancestors = BTreeSet::new();
-            self.ancestors_into(step, &mut ancestors);
-            if !ancestors.contains(target_step.id.as_str()) {
-                return Err(Error::Workflow(format!(
-                    "step `{}` reworks to `{target}`, which is not a step it waits for; \
-                     a rework edge points back up the graph",
-                    step.id
-                )));
+            // Two edges to the same target with the same trigger are one edge
+            // written twice, and the log could not tell their rounds apart.
+            let mut seen = BTreeSet::new();
+            for edge in &step.edges {
+                if !seen.insert(edge.key()) {
+                    return Err(Error::Workflow(format!(
+                        "step `{}` declares the edge `{}` twice",
+                        step.id,
+                        edge.key()
+                    )));
+                }
             }
         }
 
@@ -664,13 +829,6 @@ impl Workflow {
                 return Err(Error::Workflow(format!(
                     "step `{}` names an effort but no model; an effort is one of a model's \
                      variants",
-                    step.id
-                )));
-            }
-            if step.rework_to.is_some() && step.produces.is_none() {
-                return Err(Error::Workflow(format!(
-                    "step `{}` reworks another step but writes no artifact; the findings \
-                     travel in the file it produces",
                     step.id
                 )));
             }
@@ -789,18 +947,68 @@ impl Workflow {
         })
     }
 
-    /// The step `step` sends the work back to, when it has a rework edge.
-    ///
-    /// The target is always a step `step` waits for
-    /// ([`Workflow::validate`] refuses anything else), so taking the edge means
-    /// un-completing an ancestor and letting the run walk up to it again.
-    pub fn rework_target(&self, step: &Step) -> Option<&Step> {
-        step.rework_to.as_deref().and_then(|id| self.step(id))
+    /// The step an edge points at, when the graph carries it.
+    pub fn edge_target(&self, edge: &Edge) -> Option<&Step> {
+        self.step(&edge.to)
     }
 
-    /// How many times `step` may take its rework edge before it fails.
-    pub fn rework_budget(step: &Step) -> u32 {
-        step.rework_max.unwrap_or(DEFAULT_REWORK_MAX)
+    /// Every edge in the graph, as `(sender, edge)` pairs in declaration order.
+    ///
+    /// The drawn graph and the editor both need the whole set, and neither may
+    /// walk `step.edges` on its own: this is the one place that says what the
+    /// file's edges are.
+    pub fn edges(&self) -> Vec<(&Step, &Edge)> {
+        self.steps
+            .iter()
+            .flat_map(|step| step.edges.iter().map(move |edge| (step, edge)))
+            .collect()
+    }
+
+    /// The steps between `target` and `sender` that taking an edge re-runs.
+    ///
+    /// This is the target, every step on a path from it down to the sender, and
+    /// the sender itself. What sits beside that path is left alone — it never
+    /// saw the work — and so is what sits below the sender, which has not run
+    /// yet.
+    ///
+    /// A target that is not an ancestor of the sender (a sibling branch, or a
+    /// step reachable only through the edge) has no such path. The span is then
+    /// the target alone: the work goes back to it, and the ordinary scheduler
+    /// walks forward from there, re-running whatever the target's own
+    /// dependents are.
+    pub fn edge_span(&self, sender: &str, target: &str) -> Vec<String> {
+        let upstream = self.upstream_of(sender);
+        if !upstream.contains(target) {
+            return vec![target.to_owned()];
+        }
+        // Declaration order, so the span reads the way the file does and a
+        // resumed run replays it in the same order it was first cleared.
+        let mut span: Vec<String> = upstream
+            .into_iter()
+            .filter(|id| self.upstream_of(id).contains(target))
+            .collect();
+        span.sort_by_key(|id| {
+            self.steps
+                .iter()
+                .position(|step| &step.id == id)
+                .unwrap_or(usize::MAX)
+        });
+        span
+    }
+
+    /// Every step `id` waits for, transitively, `id` itself included.
+    fn upstream_of(&self, id: &str) -> BTreeSet<String> {
+        let mut reached = BTreeSet::new();
+        let mut pending = vec![id.to_owned()];
+        while let Some(id) = pending.pop() {
+            if !reached.insert(id.clone()) {
+                continue;
+            }
+            if let Some(step) = self.step(&id) {
+                pending.extend(self.dependencies(step));
+            }
+        }
+        reached
     }
 
     /// Collect every step `step` depends on, transitively, into `reached`.
@@ -974,6 +1182,27 @@ fn cycle_error(stack: &[String], id: &str) -> Error {
     Error::Workflow(format!("cycle in the graph: {}", cycle.join(" -> ")))
 }
 
+/// A step kind's word, for an error a person reads.
+fn kind_word(kind: StepKind) -> &'static str {
+    match kind {
+        StepKind::Harness => "harness",
+        StepKind::Gate => "gate",
+        StepKind::Merge => "merge",
+        StepKind::Question => "question",
+        StepKind::Cleanup => "cleanup",
+    }
+}
+
+/// The kind of step a trigger belongs to, for an error a person reads.
+fn trigger_owner(trigger: Trigger) -> &'static str {
+    match trigger {
+        Trigger::VerdictChanges | Trigger::VerdictReady => "harness",
+        Trigger::GateFailed | Trigger::GatePassed => "gate",
+        Trigger::AnswerNo | Trigger::AnswerYes => "question",
+        Trigger::Blocked => "harness or gate",
+    }
+}
+
 /// The refusal for a file this engine does not read, naming what a person does.
 ///
 /// Schema 1 kept a gate's command in `.flow/flow.toml` and named it from the
@@ -984,12 +1213,22 @@ fn cycle_error(stack: &[String], id: &str) -> Error {
 /// as the guard for a graph assembled in memory.
 fn schema_refusal(schema: u32) -> Error {
     if schema < SCHEMA {
-        Error::Workflow(format!(
-            "schema {schema} is older than this engine's schema {SCHEMA}: a gate step now \
-             carries its own command, so the file is rewritten rather than upgraded; to \
-             migrate, move each gate's command onto the gate step that named it, and delete \
-             `.flow/flow.toml`"
-        ))
+        if schema == 2 {
+            Error::Workflow(format!(
+                "schema {schema} is older than this engine's schema {SCHEMA}: a step's single \
+                 `rework_to`/`rework_max` pair is now a list of `edges`, each with its own \
+                 `when` trigger and `max` budget; to migrate, replace `rework_to = \"x\"` with \
+                 `edges = [{{ to = \"x\", when = \"verdict_changes\" }}]` and `rework_max = n` \
+                 with `max = n` on that edge"
+            ))
+        } else {
+            Error::Workflow(format!(
+                "schema {schema} is older than this engine's schema {SCHEMA}: a gate step now \
+                 carries its own command, so the file is rewritten rather than upgraded; to \
+                 migrate, move each gate's command onto the gate step that named it, and delete \
+                 `.flow/flow.toml`"
+            ))
+        }
     } else {
         Error::Workflow(format!(
             "schema {schema} is not supported; this engine understands schema {SCHEMA}"
@@ -1023,8 +1262,7 @@ mod tests {
             timeout_secs: None,
             depends_on: Some(depends_on.iter().map(|dep| (*dep).to_owned()).collect()),
             produces: None,
-            rework_to: None,
-            rework_max: None,
+            edges: Vec::new(),
             per_task: false,
             mode: None,
             push: false,
@@ -1054,7 +1292,7 @@ mod tests {
     fn a_valid_graph_validates() {
         let workflow = parse(
             r#"
-schema = 2
+schema = 3
 name = "implement"
 revision = 1
 
@@ -1094,7 +1332,7 @@ command = "cargo test"
     fn a_step_is_enabled_unless_the_file_says_otherwise() {
         let workflow = parse(
             r#"
-schema = 2
+schema = 3
 name = "implement"
 revision = 1
 
@@ -1267,7 +1505,7 @@ enabled = false
     fn a_merge_step_parses_and_validates() {
         let workflow = parse(
             r#"
-schema = 2
+schema = 3
 name = "implement"
 revision = 1
 
@@ -1531,7 +1769,7 @@ depends_on = ["code"]
             step("check", StepKind::Gate, &["analyze"]),
         ]);
         let text = graph.to_toml().expect("write");
-        assert!(text.starts_with("schema = 2\n"), "{text}");
+        assert!(text.starts_with("schema = 3\n"), "{text}");
         assert!(text.contains("name = \"test\""), "{text}");
         assert!(text.contains("[[step]]"), "{text}");
         let back = parse(&text);
@@ -1593,7 +1831,7 @@ depends_on = ["code"]
     fn an_unknown_field_is_rejected_at_parse_time() {
         let error = Workflow::parse(
             r#"
-schema = 2
+schema = 3
 name = "implement"
 revision = 1
 
@@ -1639,47 +1877,81 @@ depends-on = ["b"]
         code.produces = Some("code.md".to_owned());
         let mut review = step("review", StepKind::Harness, &["code"]);
         review.produces = Some("review.md".to_owned());
-        review.rework_to = Some("code".to_owned());
-        review.rework_max = Some(3);
+        review.edges = vec![edge("code", Trigger::VerdictChanges, Some(3))];
         workflow(vec![analyze, code, review])
     }
 
+    /// One edge with the fields a test cares about.
+    fn edge(to: &str, when: Trigger, max: Option<u32>) -> Edge {
+        Edge {
+            to: to.to_owned(),
+            when,
+            max,
+            on_exhausted: None,
+        }
+    }
+
     #[test]
-    fn a_rework_edge_keeps_the_graph_acyclic() {
+    fn an_edge_keeps_the_graph_acyclic() {
         let graph = rework_graph();
-        graph.validate().expect("a rework edge is not a dependency");
+        graph.validate().expect("an edge is not a dependency");
         // The walk the validator makes still sees a chain, not a loop.
         let review = graph.step("review").expect("review");
         assert_eq!(
-            graph.rework_target(review).map(|step| step.id.as_str()),
+            graph
+                .edge_target(&review.edges[0])
+                .map(|step| step.id.as_str()),
             Some("code")
         );
     }
 
     #[test]
-    fn a_rework_edge_must_point_upstream() {
-        let mut graph = rework_graph();
-        // `analyze` does not wait for `review`, so there is nothing to go back to.
-        graph.steps[2].rework_to = Some("analyze".to_owned());
-        graph.steps[0].enabled = true;
-        // analyze *is* upstream of review, so this one is allowed...
-        graph.validate().expect("analyze is upstream of review");
-        // ...but a step it never waited for is not.
-        let mut sibling = step("sibling", StepKind::Harness, &[]);
-        sibling.produces = Some("sibling.md".to_owned());
-        graph.steps.push(sibling);
-        graph.steps[2].rework_to = Some("sibling".to_owned());
-        let error = graph.validate().expect_err("not upstream");
-        assert!(
-            error.to_string().contains("is not a step it waits for"),
-            "{error}"
+    fn an_edge_may_point_at_any_step_not_only_an_ancestor() {
+        // The diagram this engine must draw has a back-edge from a join to one
+        // of its branches, and from a chain's end to its start. Neither target
+        // is "the step it waits for" in the old sense, and both are legal now.
+        let mut root = step("root", StepKind::Harness, &[]);
+        root.produces = Some("root.md".to_owned());
+        let mut left = step("left", StepKind::Harness, &["root"]);
+        left.produces = Some("left.md".to_owned());
+        let mut right = step("right", StepKind::Harness, &["root"]);
+        right.produces = Some("right.md".to_owned());
+        let mut join = step("join", StepKind::Harness, &["left", "right"]);
+        join.produces = Some("join.md".to_owned());
+        // a sibling branch, not an ancestor of `join`'s own dependency chain
+        join.edges = vec![edge("right", Trigger::VerdictChanges, Some(2))];
+        let graph = workflow(vec![root, left, right, join]);
+        graph
+            .validate()
+            .expect("a sibling branch is a legal target");
+        assert_eq!(
+            graph.edge_span("join", "right"),
+            vec!["right".to_owned(), "join".to_owned()],
+            "the span is the target and the sender, not the whole graph"
         );
     }
 
     #[test]
-    fn a_rework_edge_must_name_a_real_step() {
+    fn an_edge_span_is_the_path_between_the_target_and_the_sender() {
+        let graph = rework_graph();
+        assert_eq!(
+            graph.edge_span("review", "code"),
+            vec!["code".to_owned(), "review".to_owned()],
+            "code rebuilds the work and review judges it again"
+        );
+        // A target the sender does not wait for has no path: the span is the
+        // target alone, and the scheduler walks forward from there.
+        assert_eq!(
+            graph.edge_span("review", "analyze"),
+            vec!["analyze".to_owned(), "code".to_owned(), "review".to_owned()],
+            "analyze is upstream, so the whole chain re-runs"
+        );
+    }
+
+    #[test]
+    fn an_edge_must_name_a_real_step() {
         let mut graph = rework_graph();
-        graph.steps[2].rework_to = Some("nowhere".to_owned());
+        graph.steps[2].edges = vec![edge("nowhere", Trigger::VerdictChanges, None)];
         let error = graph.validate().expect_err("unknown target");
         assert!(
             error.to_string().contains("which is not in the graph"),
@@ -1688,7 +1960,7 @@ depends-on = ["b"]
     }
 
     #[test]
-    fn a_rework_edge_must_write_an_artifact() {
+    fn a_verdict_edge_must_write_an_artifact() {
         let mut graph = rework_graph();
         graph.steps[2].produces = None;
         let error = graph.validate().expect_err("no produces");
@@ -1696,26 +1968,27 @@ depends-on = ["b"]
     }
 
     #[test]
-    fn a_rework_budget_without_a_target_is_refused() {
+    fn an_edge_budget_of_zero_is_refused() {
         let mut graph = rework_graph();
-        graph.steps[2].rework_to = None;
-        let error = graph.validate().expect_err("budget without a target");
-        assert!(error.to_string().contains("but no `rework_to`"), "{error}");
-    }
-
-    #[test]
-    fn a_rework_budget_of_zero_is_refused() {
-        let mut graph = rework_graph();
-        graph.steps[2].rework_max = Some(0);
+        graph.steps[2].edges = vec![edge("code", Trigger::VerdictChanges, Some(0))];
         let error = graph.validate().expect_err("zero budget");
-        assert!(error.to_string().contains("may rework 0 times"), "{error}");
+        assert!(error.to_string().contains("budget of 0"), "{error}");
     }
 
     #[test]
-    fn a_merge_step_cannot_rework() {
+    fn an_edge_budget_falls_back_to_one() {
+        let mut graph = rework_graph();
+        graph.steps[2].edges = vec![edge("code", Trigger::VerdictChanges, None)];
+        graph.validate().expect("a missing budget is allowed");
+        assert_eq!(graph.steps[2].edges[0].budget(), 1);
+        assert_eq!(graph.steps[2].edges[0].exhausted(), OnExhausted::Block);
+    }
+
+    #[test]
+    fn a_merge_step_cannot_have_an_edge() {
         let mut merge = step("merge", StepKind::Merge, &["analyze"]);
         merge.per_task = true;
-        merge.rework_to = Some("analyze".to_owned());
+        merge.edges = vec![edge("analyze", Trigger::Blocked, None)];
         let graph = workflow(vec![
             {
                 let mut analyze = step("analyze", StepKind::Harness, &[]);
@@ -1724,7 +1997,7 @@ depends-on = ["b"]
             },
             merge,
         ]);
-        let error = graph.validate().expect_err("merge cannot rework");
+        let error = graph.validate().expect_err("merge cannot loop");
         assert!(
             error.to_string().contains("either lands or fails"),
             "{error}"
@@ -1732,11 +2005,67 @@ depends-on = ["b"]
     }
 
     #[test]
-    fn a_rework_budget_falls_back_to_one() {
+    fn a_trigger_the_sender_cannot_raise_is_refused() {
+        // A gate has no artifact, so it can never write a verdict.
+        let mut gate = step("test", StepKind::Gate, &["code"]);
+        gate.edges = vec![edge("code", Trigger::VerdictChanges, None)];
+        let graph = workflow(vec![
+            {
+                let mut code = step("code", StepKind::Harness, &[]);
+                code.produces = Some("code.md".to_owned());
+                code
+            },
+            gate,
+        ]);
+        let error = graph.validate().expect_err("a gate cannot raise a verdict");
+        assert!(
+            error
+                .to_string()
+                .contains("can never raise `verdict_changes`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_gate_may_loop_back_on_its_exit_code() {
+        // The loop the old model could not express at all: the tests fail, so
+        // the work goes back to the code step (ADR-0023).
+        let mut code = step("code", StepKind::Harness, &[]);
+        code.produces = Some("code.md".to_owned());
+        let mut test = step("test", StepKind::Gate, &["code"]);
+        test.edges = vec![edge("code", Trigger::GateFailed, Some(3))];
+        let graph = workflow(vec![code, test]);
+        graph.validate().expect("a gate may loop on its exit code");
+        assert_eq!(
+            graph.edge_span("test", "code"),
+            vec!["code".to_owned(), "test".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_step_may_declare_several_edges() {
+        let mut code = step("code", StepKind::Harness, &[]);
+        code.produces = Some("code.md".to_owned());
+        let mut review = step("review", StepKind::Harness, &["code"]);
+        review.produces = Some("review.md".to_owned());
+        review.edges = vec![
+            edge("code", Trigger::VerdictChanges, Some(2)),
+            edge("code", Trigger::Blocked, Some(1)),
+        ];
+        let graph = workflow(vec![code, review]);
+        graph.validate().expect("two edges, two triggers");
+        assert_eq!(graph.edges().len(), 2);
+    }
+
+    #[test]
+    fn the_same_edge_twice_is_refused() {
         let mut graph = rework_graph();
-        graph.steps[2].rework_max = None;
-        graph.validate().expect("a missing budget is allowed");
-        assert_eq!(Workflow::rework_budget(&graph.steps[2]), 1);
+        graph.steps[2].edges = vec![
+            edge("code", Trigger::VerdictChanges, Some(1)),
+            edge("code", Trigger::VerdictChanges, Some(2)),
+        ];
+        let error = graph.validate().expect_err("one edge written twice");
+        assert!(error.to_string().contains("declares the edge"), "{error}");
     }
 
     #[test]
@@ -1848,7 +2177,7 @@ depends-on = ["b"]
     }
 
     #[test]
-    fn a_rework_edge_may_point_at_any_step_declared_before_it() {
+    fn an_edge_may_point_at_any_step_declared_before_it() {
         // with an omitted set every earlier step is upstream, so a loop from the
         // last step back to the first is legal without naming it
         let mut graph = workflow(vec![
@@ -1858,7 +2187,7 @@ depends-on = ["b"]
         ]);
         graph.steps[0].produces = Some("spec.md".to_owned());
         graph.steps[2].produces = Some("review.md".to_owned());
-        graph.steps[2].rework_to = Some("analyze".to_owned());
+        graph.steps[2].edges = vec![edge("analyze", Trigger::VerdictChanges, None)];
         graph.validate().expect("an earlier step is upstream");
     }
 

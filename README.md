@@ -45,49 +45,58 @@ needs the usual Wayland/Vulkan development packages.
 ## What it does
 
 The app is the process that drives a run, and it wears the suite's one shell: a
-76 rail of sections, the 432 repository list, then the detail. The `Runs`
-section's detail holds the 320 run column — the board read downwards, one lane
-band per state the issue folders fall into — beside the open run. The `Repos`
-section holds the selected repository's workflow graph.
+76 rail of sections, the 432 repository list — folded away and back by the title
+bar's toggle or `Ctrl+\` — then the detail. The `Runs` section's detail holds
+the 320 run column — the board read downwards, one lane band per state the issue
+folders fall into — beside the open run. The `Repos` section holds the selected
+repository's workflow graph.
 
 The run column's **New run** is the one screen action that creates an issue
 folder: a title and the request become `.scratch/<slug>/spec.md` (a title
 already in use gets `-2`, `-3`, …), the next scan lands the run in Triage, and
 the window opens it with **Start run** in reach.
 
-The rail is `Runs`, `Repos`, then `About` and `Settings` at its foot. Opening a
-run puts its four tabs in the run's head:
+The rail is `Runs`, `Repos`, then `Settings` at its foot. Opening a run puts its
+four tabs in the run's head:
 
 | Screen | What it is |
 | --- | --- |
-| Run | the workflow as step bands, the task chips, the question, the attempt history, the engine's log and the harness sessions each step recorded |
+| Run | the workflow as a matrix — steps down, tasks across, one cell per crossing — the task chips, the question, the attempt history, the engine's log and the harness sessions each step recorded |
 | Artifacts | the issue folder's documents, edited in place and saved atomically |
 | Task & diff | the task's branch, its files and diff while the run holds them, and the run's gates with the outcome each last produced |
 | Workflow | the revision the run uses, read-only: the template is edited in Repos › Workflow |
 
 `Repos` is the window a person edits: its `Workflow` tab is the repository's
-step graph with its revisions, drawn as an indented tree — each step sits under
-its first dependency, and any further dependency is a chip on its row, so a
-fork and a join are visible as such. The file is read downwards: a step that
-names nothing waits for every step above it, `depends_on = []` is a root, and a
-list is exactly what the step waits for — so a pipeline needs no edges and only
-a fork names its parent (ADR-0018). A step is added at the front, after the
-selection or at the end, which is what decides what it waits for; a step can be
-disabled, and its dependents then inherit its own dependencies so the pipeline
-closes over it. A harness step picks its harness, model and effort from the
-door's catalog — three selects beside the text fields, each cascading to the
-next, with an empty choice meaning the engine's own — and the engine runs
-exactly what the step names: a harness it does not publish is a step that stops
-at its own boundary with a repair naming it, never a silent substitution
-(ADR-0017). `About` carries the
-installed family, the build and the license; `Settings` the reduce-motion
-switch, where the app keeps its files, the door's state and the version.
+step graph with its revisions, drawn as a graph of nodes and arrows — a node
+per step, an arrow per dependency and a loop per back-edge, so a fork, a join
+and a loop are visible as such. The file is read downwards: a step that names
+nothing waits for every step above it, `depends_on = []` is a root, and a list
+is exactly what the step waits for — so a pipeline needs no `depends_on` list
+and only a fork names its parent (ADR-0018). A step is added at the front, after
+the selection or at the end, which is what decides what it waits for; a step can
+be disabled, and its dependents then inherit its own dependencies so the
+pipeline closes over it. A harness step picks its harness, model and effort
+from the door's catalog — three selects beside the text fields, each cascading
+to the next, with an empty choice meaning the engine's own — and the engine
+runs exactly what the step names: a harness it does not publish is a step that
+stops at its own boundary with a repair naming it, never a silent substitution
+(ADR-0017). `Settings` is a list of groups — Appearance, Engine, Files and
+About: the first three hold the reduce-motion switch, where the app keeps its
+files, and the door's state and the version, while the About group is the
+family's About page, which takes the section's whole width in place of the group
+list — a second press on the rail's Settings item returns to the groups.
 
-A step can also send the work back to an earlier step it waits for: `rework_to`
-names that step, the `verdict` in the artifact's front matter — `ready` or
-`changes` — decides whether the run advances or walks back, and `rework_max` is
-the budget. A budget spent with no round saying `ready` fails the step and
-stops the run.
+A step can also send the work back: `edges` is a list of back-edges, each
+naming the step the work returns to (`to`), what makes it return (`when`) and
+how many rounds it may take (`max`). The trigger is a word the engine reads from
+a file or an exit code — `verdict_changes` from a harness step's artifact,
+`gate_failed` from a gate's exit code, `answer_no` from a question's answer,
+`blocked` from a step that could not finish — so the tests failing can send the
+work back to the code, and a rejected plan can send it back to the analysis
+(ADR-0023). The graph stays acyclic: the engine un-completes the steps between
+the target and the sender and lets the ordinary readiness walk go forward
+again. A budget spent with no round clearing it fails the step and stops the
+run, unless the edge says `on_exhausted = "continue"`.
 
 A merge step can name the step that resolves its conflict: `on_conflict` runs
 that step in the task's worktree when the rebase conflicts, and the merge

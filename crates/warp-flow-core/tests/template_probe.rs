@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use warp_flow_core::graph::{StepKind, Workflow};
+use warp_flow_core::graph::{StepKind, Trigger, Workflow};
 
 fn template() -> Workflow {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -44,15 +44,20 @@ fn the_repositorys_own_template_ships_the_skills_it_names() {
 
 #[test]
 fn the_repositorys_own_template_has_a_loop_it_can_survive() {
-    // The point of the template's rework edge is that it is bounded: a review
+    // The point of the template's edge is that it is bounded: a review
     // that always says `changes` must stop the run, not circle it.
     let graph = template();
     let review = graph.step("review").expect("review is in the template");
+    let edge = review
+        .edges
+        .iter()
+        .find(|edge| edge.when == Trigger::VerdictChanges)
+        .expect("review loops back on a changes verdict");
     assert_eq!(
-        graph.rework_target(review).map(|step| step.id.as_str()),
+        graph.edge_target(edge).map(|step| step.id.as_str()),
         Some("code")
     );
-    assert!(Workflow::rework_budget(review) >= 1);
+    assert!(edge.budget() >= 1);
 }
 
 #[test]

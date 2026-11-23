@@ -64,15 +64,6 @@ pub const RUN_COLUMN_WIDTH: f32 = 320.;
 /// One lane band over the runs that share a state.
 pub const LANE_HEIGHT: f32 = 32.;
 
-/// The strip under a run's head: state, step, attempts, updated.
-pub const RUN_STRIP_HEIGHT: f32 = 44.;
-
-/// One step band in the Workflow card.
-pub const STEP_HEIGHT: f32 = 44.;
-
-/// One task row hanging under a per-task step.
-pub const TASK_ROW_HEIGHT: f32 = 36.;
-
 /// One attempt row in the history.
 pub const ATTEMPT_HEIGHT: f32 = 44.;
 

@@ -5,11 +5,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::prelude::*;
-use gpui::{App, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
+use gpui::{App, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 use gpui_platform::application;
 
 use crate::door::{Door, SharedBoard};
 use crate::host::Host;
+use crate::ui::window::ToggleList;
+
+/// The window's own keys, registered in the bootstrap like every app-wide
+/// table. `Ctrl+\` is the title bar's list toggle from the keyboard: the
+/// tooltip, the title bar and the key all do the one act.
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("ctrl-\\", ToggleList, None)]);
+}
 
 /// What a launch asks for: repositories to remember and show. `--repo` is
 /// repeatable; a bare launch shows the repositories already in settings.
@@ -46,6 +54,7 @@ pub fn run(launch: Launch) {
             // screen has no reduce-motion switch yet (S5 settings), so the
             // desktop preference is the only input.
             warpui_kit_core::bootstrap::init(cx, None, false, crate::theme::apply_kit_theme);
+            bind_keys(cx);
 
             // The app's own door, over the same host and board the window
             // uses. A failure to bind or publish is logged and the window

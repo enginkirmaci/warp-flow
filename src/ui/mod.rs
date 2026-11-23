@@ -4,6 +4,7 @@
 pub mod about;
 pub mod chrome;
 pub mod detail;
+pub mod graph;
 pub mod new_run;
 pub mod repos;
 pub mod run;
