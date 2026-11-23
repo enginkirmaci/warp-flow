@@ -3,7 +3,7 @@ issue: bump-gate
 workflow: implement
 revision: 1
 status: running
-running: merge@02
+running: merge@04
 started: 2026-11-23T10:16:59Z
 updated: 2026-11-23T12:22:41Z
 ---
