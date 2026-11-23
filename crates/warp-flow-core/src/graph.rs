@@ -600,6 +600,10 @@ impl Workflow {
     /// answer this, because it flattens disabled steps and stops at enabled
     /// ones.
     ///
+    /// Every enabled gate ancestor is returned, per-task or not; the merge
+    /// queue is the caller that narrows the result to [`Step::per_task`] steps,
+    /// because only those measure the task branch it rebases (ADR-0019).
+    ///
     /// The result is the file's step order — the engine's tie-break between
     /// independent steps — with each step once. A disabled step is transparent
     /// the same way it is in [`Workflow::resolve`]: it is not returned, but what
