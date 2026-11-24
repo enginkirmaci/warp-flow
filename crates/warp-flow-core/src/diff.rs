@@ -1,11 +1,10 @@
 //! One task's branch, as the diff screen reads it.
 //!
-//! A task's branch is the one [`crate::worktree`] created for it: the kit's
-//! `agent/<NN>-<slug>` name derived from the task number and title. The lookup
-//! here follows the same rule, so a task the engine created is found by its
-//! number even after its worktree folder was removed (the branch outlives it),
-//! and a branch that took a numeric suffix is still found by its `agent/<NN>-`
-//! prefix.
+//! A task's branch is the one [`crate::worktree`] created for it, read from the
+//! task file's `**Branch:**` line. Until the engine has created that worktree
+//! there is nothing to read, and the diff is the not-yet-there state; the diff
+//! never guesses a branch from the task number, because a branch another issue
+//! folder left behind is not this task's work.
 //!
 //! Everything is read-only: this module runs `git diff`, `git rev-list` and
 //! reads refs/worktrees. It never checks out, commits, fetches or writes a
@@ -157,7 +156,7 @@ pub fn task_diff(repo: &Repo, task: &Task) -> Result<TaskDiff> {
         ))
     })?;
     let branches = branches(root)?;
-    let branch = resolve_branch(&worktrees, &branches, &wanted, task.number);
+    let branch = resolve_branch(&worktrees, &branches, &wanted);
     let Some(branch) = branch else {
         return Ok(TaskDiff {
             task: task.number,
@@ -194,28 +193,21 @@ pub fn task_diff(repo: &Repo, task: &Task) -> Result<TaskDiff> {
 
 /// The branch name the worktree rules create for `task`.
 fn wanted_branch(task: &Task) -> String {
-    kit::branch_name(&format!("{:02} {}", task.number, task.title))
+    task.branch
+        .clone()
+        .unwrap_or_else(|| crate::worktree::branch_name(task))
 }
 
-/// The prefix every worktree of one task shares, numeric suffix included.
-fn task_prefix(task_number: u32) -> String {
-    format!("{}/{:02}-", kit::BRANCH_PREFIX, task_number)
-}
-
-/// The task's branch: the worktree's own branch when one is still attached,
-/// else a branch ref with the exact name, else the first ref carrying the
-/// task's number prefix.
+/// The task's branch: the worktree's own branch when one is attached, else a
+/// branch ref with the recorded name.
 ///
-/// The order matches the engine's lookup: the exact wanted name wins, and a
-/// suffixed `agent/<NN>-<slug>-2` is still the task's when the exact name is
-/// gone.
+/// The name is exact. A branch that only shares the task's number belongs to
+/// another issue folder's plan, so it is not this task's work.
 fn resolve_branch(
     worktrees: &[kit::Worktree],
     branches: &[String],
     wanted: &str,
-    task_number: u32,
 ) -> Option<String> {
-    let prefix = task_prefix(task_number);
     let attached = worktrees
         .iter()
         .filter(|entry| !entry.main)
@@ -223,18 +215,11 @@ fn resolve_branch(
     attached
         .clone()
         .find(|branch| *branch == wanted)
-        .or_else(|| attached.clone().find(|branch| branch.starts_with(&prefix)))
         .map(str::to_owned)
         .or_else(|| {
             branches
                 .iter()
                 .find(|branch| branch.as_str() == wanted)
-                .cloned()
-        })
-        .or_else(|| {
-            branches
-                .iter()
-                .find(|branch| branch.starts_with(&prefix))
                 .cloned()
         })
 }
@@ -677,6 +662,39 @@ mod tests {
     }
 
     #[test]
+    fn another_issue_folders_branch_with_the_same_number_is_not_shown() {
+        // The task number is a position in one issue folder, not an identity:
+        // a leftover `agent/01-…` belongs to another plan and must not be read
+        // as this task's work.
+        let dir = TempDir::new();
+        let root = repository(&dir);
+        branch_with_commit(&root, "agent/01-another-task", "old.txt", "old\n");
+        let repo = Repo::open(&root).expect("repo opens");
+
+        let diff = task_diff(&repo, &task(1, "Demo task")).expect("diff");
+
+        assert!(!diff.exists, "the leftover branch is not this task's");
+        assert_eq!(diff.branch, "agent/01-demo-task");
+        assert!(diff.files.is_empty());
+    }
+
+    #[test]
+    fn a_recorded_branch_is_read_even_when_the_title_changed() {
+        let dir = TempDir::new();
+        let root = repository(&dir);
+        branch_with_commit(&root, "agent/01-old-title", "src/lib.rs", "fn main() {}\n");
+        let repo = Repo::open(&root).expect("repo opens");
+        let mut task = task(1, "New title");
+        task.branch = Some("agent/01-old-title".to_owned());
+
+        let diff = task_diff(&repo, &task).expect("diff");
+
+        assert!(diff.exists);
+        assert_eq!(diff.branch, "agent/01-old-title");
+        assert_eq!(diff.commits, 1);
+    }
+
+    #[test]
     fn a_branch_checked_out_in_a_worktree_reports_its_path() {
         let dir = TempDir::new();
         let root = repository(&dir);
@@ -832,6 +850,7 @@ mod tests {
             status: Status::ReadyForAgent,
             category: "feature".to_owned(),
             blocked_by: Vec::new(),
+            branch: None,
         }
     }
 

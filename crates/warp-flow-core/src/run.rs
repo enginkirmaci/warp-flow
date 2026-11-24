@@ -2289,7 +2289,14 @@ impl<H: Harness + Send + 'static> Runner<H> {
         }
     }
 
-    /// The task's worktree, created on first use and reused afterwards.
+    /// The task's worktree, created on first use and recorded on the task
+    /// file.
+    ///
+    /// The record is what makes the second call — a later step, a retry, or a
+    /// run resumed after a restart — find the same worktree. Without it the
+    /// engine would have to re-derive the branch from the title, and a title
+    /// that changed (or a worktree another issue folder left behind) would
+    /// move the task's work somewhere it never ran.
     fn worktree(&mut self, task: &Task) -> Result<TaskWorktree> {
         if let Some(existing) = self.worktrees.get(&task.number) {
             return Ok(existing.clone());
@@ -2298,8 +2305,22 @@ impl<H: Harness + Send + 'static> Runner<H> {
             Error::Run("no repository is configured for task worktrees".to_owned())
         })?;
         let worktree = TaskWorktree::create(repo, task)?;
+        self.record_branch(task, &worktree.branch)?;
         self.worktrees.insert(task.number, worktree.clone());
         Ok(worktree)
+    }
+
+    /// Record the branch the worktree lives on, before a session can use it.
+    ///
+    /// The scheduler thread is the only writer of the issue folder, and this
+    /// runs on it, so the `**Branch:**` line lands before the step starts; a
+    /// write that fails fails the step rather than leaving work unpinned.
+    fn record_branch(&mut self, task: &Task, branch: &str) -> Result<()> {
+        if task.branch.as_deref() == Some(branch) {
+            return Ok(());
+        }
+        let mut issue = Issue::open(&self.issue)?;
+        issue.set_branch(task.number, branch)
     }
 
     /// Run the merge queue for one task and write `resolved` on success.
@@ -3346,16 +3367,20 @@ fn require_git(output: &std::process::Output, action: &str, dir: &Path) -> Resul
 fn run_cleanup(repo: &Repo, tasks: &[Task]) -> Result<StepOutcome> {
     let mut removed = 0usize;
     for task in tasks {
-        // The worktree knows the branch's exact name (a clash appends a
-        // suffix); with the worktree already gone, the task's own name is the
-        // branch the engine would create.
-        let branch = match TaskWorktree::find(repo, task.number)? {
+        // The task file records the branch the engine created (a clash appends
+        // a suffix); with the worktree already gone the same record names the
+        // branch. Only a task the engine never created a worktree for falls
+        // back to the name its title would give.
+        let branch = match TaskWorktree::find(repo, task)? {
             Some(worktree) => {
                 let branch = worktree.branch.clone();
                 worktree.remove(true)?;
                 branch
             }
-            None => crate::worktree::branch_name(task),
+            None => task
+                .branch
+                .clone()
+                .unwrap_or_else(|| crate::worktree::branch_name(task)),
         };
         let listed = git(&repo.root, &["branch", "--list", &branch])?;
         require_git(&listed, "list the task branch", &repo.root)?;
@@ -4133,6 +4158,14 @@ skill = "analyze"
         issue
     }
 
+    /// Record the branch a test pre-created, the way the engine records one
+    /// before a session starts, so the runner finds that worktree instead of
+    /// making a second one.
+    fn record_branch(issue: &Path, number: u32, branch: &str) {
+        let mut issue = Issue::open(issue).expect("issue opens");
+        issue.set_branch(number, branch).expect("branch recorded");
+    }
+
     const MERGE_WORKFLOW: &str = r#"
 schema = 3
 name = "implement"
@@ -4178,6 +4211,7 @@ depends_on = ["test"]
         let opened = Issue::open(&issue).expect("issue opens");
         let worktree =
             TaskWorktree::create(&repo, opened.task(1).expect("task 1")).expect("worktree created");
+        record_branch(&issue, 1, &worktree.branch);
         fs::write(worktree.path.join("feature.txt"), "done\n").expect("feature file");
         run_git(&worktree.path, &["add", "feature.txt"]);
         run_git(&worktree.path, &["commit", "--quiet", "-m", "task work"]);
@@ -4318,6 +4352,7 @@ depends_on = ["test"]
         let opened = Issue::open(&issue).expect("issue opens");
         let worktree =
             TaskWorktree::create(&repo, opened.task(1).expect("task 1")).expect("worktree created");
+        record_branch(&issue, 1, &worktree.branch);
         fs::write(worktree.path.join("feature.txt"), "done\n").expect("feature file");
         run_git(&worktree.path, &["add", "feature.txt"]);
         run_git(&worktree.path, &["commit", "--quiet", "-m", "task work"]);
@@ -4560,6 +4595,7 @@ depends_on = ["merge"]
         let opened = Issue::open(&issue).expect("issue opens");
         let worktree =
             TaskWorktree::create(&repo, opened.task(1).expect("task 1")).expect("worktree");
+        record_branch(&issue, 1, &worktree.branch);
         fs::write(worktree.path.join("shared.txt"), "task\n").expect("task side");
         run_git(&worktree.path, &["add", "shared.txt"]);
         run_git(&worktree.path, &["commit", "--quiet", "-m", "task side"]);
@@ -4721,6 +4757,11 @@ depends_on = ["merge"]
             .collect();
         assert_eq!(worktrees.len(), 1, "one worktree for the one task");
         assert!(root.join("feature.txt").is_file(), "the branch landed");
+        let task_file = fs::read_to_string(issue.join("issues/01-first.md")).expect("task file");
+        assert!(
+            task_file.contains("**Branch:** agent/01-first-task"),
+            "the branch is recorded before the session starts: {task_file}"
+        );
 
         let calls = runner.harness().calls();
         assert_eq!(calls.len(), 2);
@@ -4728,6 +4769,53 @@ depends_on = ["merge"]
             calls[1].workdir.starts_with(root.join(".worktrees")),
             "code ran in {}",
             calls[1].workdir.display()
+        );
+    }
+
+    #[test]
+    fn a_worktree_left_by_another_plan_is_not_adopted() {
+        // The regression this guards: `create` used to return the first
+        // worktree whose branch carried the `agent/01-` prefix, so a run whose
+        // task 01 was a different title worked — and merged — another plan's
+        // branch. The run must make its own and leave the leftover alone.
+        let dir = TempDir::new();
+        let root = repository(&dir);
+        let issue = issue_in(&root);
+        let repo = Repo::open(&root).expect("repo opens");
+        let opened = Issue::open(&issue).expect("issue opens");
+        let mut another = opened.task(1).expect("task 1").clone();
+        another.title = "Another plan's task".to_owned();
+        let leftover = TaskWorktree::create(&repo, &another).expect("leftover worktree");
+        fs::write(leftover.path.join("stale.txt"), "stale\n").expect("stale file");
+        run_git(&leftover.path, &["add", "stale.txt"]);
+        run_git(&leftover.path, &["commit", "--quiet", "-m", "another plan"]);
+
+        let workflow = Workflow::parse(MERGE_WORKFLOW).expect("workflow parses");
+        let mut config = RunnerConfig::new(&issue, workflow, CommittingHarness::default());
+        config.workdir = root.clone();
+        config.repo = Some(repo);
+        config.max_attempts = 2;
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+
+        let task_file = fs::read_to_string(issue.join("issues/01-first.md")).expect("task file");
+        assert!(
+            task_file.contains("**Branch:** agent/01-first-task"),
+            "the run recorded its own branch: {task_file}"
+        );
+        assert!(
+            !task_file.contains("agent/01-another"),
+            "the leftover's branch is not this task's: {task_file}"
+        );
+        assert!(root.join("feature.txt").is_file(), "the run's work landed");
+        assert!(
+            !root.join("stale.txt").exists(),
+            "the leftover's work was not merged"
+        );
+        assert!(
+            leftover.path.join("stale.txt").exists(),
+            "the leftover is untouched"
         );
     }
 
@@ -5456,6 +5544,7 @@ per_task = true
         let opened = Issue::open(&issue).expect("issue opens");
         let worktree =
             TaskWorktree::create(&repo, opened.task(1).expect("task 1")).expect("worktree created");
+        record_branch(&issue, 1, &worktree.branch);
         fs::write(worktree.path.join("feature.txt"), "done\n").expect("feature file");
         run_git(&worktree.path, &["add", "feature.txt"]);
         run_git(&worktree.path, &["commit", "--quiet", "-m", "task work"]);

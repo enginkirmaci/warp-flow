@@ -25,8 +25,8 @@ use serde::Serialize;
 
 use crate::{Error, Result};
 
-/// The `**Status:**` marker every task file carries.
-const STATUS_MARKER: &str = "**Status:**";
+/// The field a task's worktree branch is recorded on.
+const BRANCH_KEY: &str = "Branch";
 
 /// The names a `Status:` line may carry, for error messages.
 const STATUS_NAMES: &str =
@@ -112,6 +112,13 @@ pub struct Task {
     pub category: String,
     /// Tasks that must be resolved before this one starts (`**Blocked by:**`).
     pub blocked_by: Vec<u32>,
+    /// The branch the engine created for this task's worktree, from the
+    /// `**Branch:**` line.
+    ///
+    /// `None` until the first worktree is created. The engine writes it then
+    /// and reads it from every later attempt, so the branch is decided once
+    /// instead of being re-derived from a title that may have changed.
+    pub branch: Option<String>,
 }
 
 impl Task {
@@ -187,6 +194,11 @@ impl Task {
             return Err(malformed_task(path, "a task cannot be blocked by itself"));
         }
 
+        let branch = field("Branch")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+
         Ok(Self {
             number,
             title: title.to_owned(),
@@ -194,6 +206,7 @@ impl Task {
             status,
             category: category.to_owned(),
             blocked_by,
+            branch,
         })
     }
 }
@@ -641,36 +654,125 @@ impl Issue {
         task.status = status;
         Ok(())
     }
+
+    /// Record the branch a task's worktree lives on, in place.
+    ///
+    /// The first `**Branch:**` line is rewritten; when the task has none, one
+    /// is inserted after the last `**…:**` field of the header block. Every
+    /// other byte of the task file is preserved, as at [`Issue::set_status`].
+    ///
+    /// The line is the engine's record of the one decision that must not be
+    /// re-derived: which branch carries this task's commits. A title change, a
+    /// restart or a worktree re-creation all read it instead of asking the
+    /// title again.
+    pub fn set_branch(&mut self, number: u32, branch: &str) -> Result<()> {
+        let task = self
+            .tasks
+            .iter_mut()
+            .find(|task| task.number == number)
+            .ok_or_else(|| {
+                Error::malformed("issue folder", format!("task {number:02} does not exist"))
+            })?;
+        let path = task.path.clone();
+        let text = fs::read_to_string(&path).map_err(|error| Error::io(&path, error))?;
+        let updated = match replace_field(&text, BRANCH_KEY, branch) {
+            Some(updated) => updated,
+            None => insert_field(&text, BRANCH_KEY, branch).ok_or_else(|| {
+                Error::malformed_file(
+                    "task",
+                    &path,
+                    "no `**…:**` field block to add a `**Branch:**` line to",
+                )
+            })?,
+        };
+        write_atomic(&path, &updated)?;
+        task.branch = Some(branch.to_owned());
+        Ok(())
+    }
 }
 
 /// Replace the first `**Status:**` line's value, keeping everything else.
 fn replace_status(text: &str, status: Status) -> Result<String> {
+    replace_field(text, "Status", status.as_str())
+        .ok_or_else(|| Error::malformed("task", "missing a `**Status:**` line"))
+}
+
+/// Replace the first `**Key:**` line's value, keeping everything else.
+///
+/// `None` when the document has no such line; the caller decides whether that
+/// is an error or a line to insert.
+fn replace_field(text: &str, key: &str, value: &str) -> Option<String> {
     let mut output = String::with_capacity(text.len());
     let mut replaced = false;
     for line in text.split_inclusive('\n') {
-        let (body, ending) = match line.strip_suffix('\n') {
-            Some(body) => match body.strip_suffix('\r') {
-                Some(body) => (body, "\r\n"),
-                None => (body, "\n"),
-            },
-            None => (line, ""),
-        };
-        if !replaced && bold_field(body).is_some_and(|(key, _)| key == "Status") {
+        let (body, ending) = split_line_ending(line);
+        if !replaced && bold_field(body).is_some_and(|(seen, _)| seen == key) {
             let indent = &body[..body.len() - body.trim_start().len()];
             output.push_str(indent);
-            output.push_str(STATUS_MARKER);
+            output.push_str("**");
+            output.push_str(key);
+            output.push_str(":**");
             output.push(' ');
-            output.push_str(status.as_str());
+            output.push_str(value);
             output.push_str(ending);
             replaced = true;
             continue;
         }
         output.push_str(line);
     }
-    if !replaced {
-        return Err(Error::malformed("task", "missing a `**Status:**` line"));
+    replaced.then_some(output)
+}
+
+/// Insert `**Key:** value` after the last `**…:**` line before the first `##`
+/// heading, keeping every other byte.
+///
+/// `None` when the document has no field line to insert after: a task file
+/// without its `**Status:**`/`**Category:**` block is not one the engine wrote.
+fn insert_field(text: &str, key: &str, value: &str) -> Option<String> {
+    let mut insert_at = None;
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        let (body, ending) = split_line_ending(line);
+        if body.starts_with("## ") {
+            break;
+        }
+        if bold_field(body).is_some() {
+            insert_at = Some((offset + line.len(), ending));
+        }
+        offset += line.len();
     }
-    Ok(output)
+    let (at, ending) = insert_at?;
+    let mut output = String::with_capacity(text.len() + key.len() + value.len() + 12);
+    output.push_str(&text[..at]);
+    if ending.is_empty() {
+        // The field line had no newline (the file ended there): add one so the
+        // new line starts on its own line, and leave the file without one.
+        output.push('\n');
+        output.push_str("**");
+        output.push_str(key);
+        output.push_str(":** ");
+        output.push_str(value);
+    } else {
+        output.push_str("**");
+        output.push_str(key);
+        output.push_str(":** ");
+        output.push_str(value);
+        output.push_str(ending);
+    }
+    output.push_str(&text[at..]);
+    Some(output)
+}
+
+/// A line's body and its ending, so a writer can preserve CRLF and a missing
+/// final newline.
+fn split_line_ending(line: &str) -> (&str, &'static str) {
+    match line.strip_suffix('\n') {
+        Some(body) => match body.strip_suffix('\r') {
+            Some(body) => (body, "\r\n"),
+            None => (body, "\n"),
+        },
+        None => (line, ""),
+    }
 }
 
 #[cfg(test)]
@@ -898,6 +1000,68 @@ mod tests {
             before.replace("**Status:** ready-for-agent", "**Status:** resolved")
         );
         assert_eq!(issue.task(1).expect("task").status, Status::Resolved);
+    }
+
+    #[test]
+    fn a_branch_line_is_read_into_the_task() {
+        let text = task_text(1, "ready-for-agent", "None").replace(
+            "**Category:** feature\n",
+            "**Category:** feature\n**Branch:** agent/01-a-task\n",
+        );
+
+        let task = Task::parse(Path::new("issues/01-a-task.md"), &text).expect("parses");
+
+        assert_eq!(task.branch.as_deref(), Some("agent/01-a-task"));
+    }
+
+    #[test]
+    fn a_task_without_a_branch_line_has_no_branch() {
+        let task = Task::parse(
+            Path::new("issues/01-a-task.md"),
+            &task_text(1, "ready-for-agent", "None"),
+        )
+        .expect("parses");
+
+        assert_eq!(task.branch, None);
+    }
+
+    #[test]
+    fn set_branch_inserts_the_line_after_the_last_field() {
+        let (_dir, path) = issue_with(&[(1, "ready-for-agent", "None")]);
+        let file = path.join("issues/01-task.md");
+        let mut issue = Issue::open(&path).expect("open");
+
+        issue
+            .set_branch(1, "agent/01-a-task")
+            .expect("the branch is recorded");
+        let after = fs::read_to_string(&file).expect("read after");
+
+        assert!(
+            after.contains("**Category:** feature\n**Branch:** agent/01-a-task\n"),
+            "the line lands after the header block: {after}"
+        );
+        assert_eq!(
+            issue.task(1).expect("task").branch.as_deref(),
+            Some("agent/01-a-task")
+        );
+    }
+
+    #[test]
+    fn set_branch_rewrites_the_line_it_already_wrote() {
+        let (_dir, path) = issue_with(&[(1, "ready-for-agent", "None")]);
+        let file = path.join("issues/01-task.md");
+        let mut issue = Issue::open(&path).expect("open");
+        issue.set_branch(1, "agent/01-first").expect("first");
+        let first = fs::read_to_string(&file).expect("read first");
+
+        issue.set_branch(1, "agent/01-second").expect("second");
+        let second = fs::read_to_string(&file).expect("read second");
+
+        assert_eq!(
+            second,
+            first.replace("**Branch:** agent/01-first", "**Branch:** agent/01-second"),
+            "only the recorded branch changes"
+        );
     }
 
     #[test]

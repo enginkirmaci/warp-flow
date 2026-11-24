@@ -267,13 +267,21 @@ fn two_tasks(fixture: &Fixture) -> (PathBuf, PathBuf) {
 ///
 /// A `FakeHarness` writes files but cannot commit, while the merge queue merges
 /// commits; so the probe commits each task's work on its branch up front. The
-/// engine finds these worktrees on first use instead of creating them.
+/// branch is recorded on each task file the way the engine records it before a
+/// session starts, so the engine finds these worktrees on first use instead of
+/// creating others.
 fn branch_both(fixture: &Fixture, first_file: &str, second_file: &str) -> (PathBuf, PathBuf) {
-    let issue = Issue::open(&fixture.issue).expect("issue opens");
+    let mut issue = Issue::open(&fixture.issue).expect("issue opens");
     let first = TaskWorktree::create(&fixture.repo(), issue.task(1).expect("task 01"))
         .expect("first worktree");
+    issue
+        .set_branch(1, &first.branch)
+        .expect("first branch recorded");
     let second = TaskWorktree::create(&fixture.repo(), issue.task(2).expect("task 02"))
         .expect("second worktree");
+    issue
+        .set_branch(2, &second.branch)
+        .expect("second branch recorded");
     fixture.commit_file(&first.path, first_file, "from task 01\n", "task one");
     fixture.commit_file(&second.path, second_file, "from task 02\n", "task two");
     (first.path, second.path)

@@ -129,6 +129,7 @@ fn task(number: u32, title: &str) -> Task {
         status: Status::ReadyForAgent,
         category: "feature".to_owned(),
         blocked_by: Vec::new(),
+        branch: None,
     }
 }
 
@@ -184,10 +185,11 @@ fn a_task_worktree_merges_into_main() {
 }
 
 #[test]
-fn creating_twice_yields_one_worktree() {
+fn creating_twice_with_the_record_yields_one_worktree() {
     let fixture = Fixture::new();
-    let task = task(2, "Retry the upload");
+    let mut task = task(2, "Retry the upload");
     let first = TaskWorktree::create(&fixture.repo(), &task).expect("first create");
+    task.branch = Some(first.branch.clone());
     let second = TaskWorktree::create(&fixture.repo(), &task).expect("second create");
 
     assert_eq!(first, second);
@@ -199,16 +201,33 @@ fn creating_twice_yields_one_worktree() {
 }
 
 #[test]
-fn open_finds_the_worktree_by_task_number() {
+fn find_reads_the_recorded_branch() {
     let fixture = Fixture::new();
-    let task = task(3, "Show the merge queue");
-    let created = TaskWorktree::create(&fixture.repo(), &task).expect("create");
-    let opened = TaskWorktree::open(&fixture.repo(), 3).expect("open by number");
+    let planned = task(3, "Show the merge queue");
+    let created = TaskWorktree::create(&fixture.repo(), &planned).expect("create");
+    assert_eq!(
+        TaskWorktree::find(&fixture.repo(), &planned).expect("listed"),
+        Some(created.clone()),
+        "without a record, cleanup finds the name the title gives"
+    );
 
-    assert_eq!(opened, created);
-    assert!(
-        TaskWorktree::open(&fixture.repo(), 4).is_err(),
-        "a task without a worktree is not found"
+    let mut recorded = planned.clone();
+    recorded.branch = Some(created.branch.clone());
+    assert_eq!(
+        TaskWorktree::find(&fixture.repo(), &recorded).expect("listed"),
+        Some(created.clone())
+    );
+
+    recorded.branch = Some("agent/03-gone".to_owned());
+    assert_eq!(
+        TaskWorktree::find(&fixture.repo(), &recorded).expect("listed"),
+        None,
+        "a record wins over the title; it never falls back to it"
+    );
+    assert_eq!(
+        TaskWorktree::find(&fixture.repo(), &task(3, "A different title")).expect("listed"),
+        None,
+        "a worktree on the same number is another task's when the name differs"
     );
 }
 
@@ -375,15 +394,20 @@ fn push_false_never_touches_a_remote() {
 #[test]
 fn remove_deletes_the_folder_and_keeps_the_branch() {
     let fixture = Fixture::new();
-    let task = task(8, "Remove the worktree");
+    let mut task = task(8, "Remove the worktree");
     let worktree = TaskWorktree::create(&fixture.repo(), &task).expect("create");
     let branch = worktree.branch.clone();
     let path = worktree.path.clone();
+    task.branch = Some(branch.clone());
 
     worktree.remove(false).expect("remove the worktree");
 
     assert!(!path.exists());
-    assert!(TaskWorktree::open(&fixture.repo(), 8).is_err());
+    assert!(
+        TaskWorktree::find(&fixture.repo(), &task)
+            .expect("listed")
+            .is_none()
+    );
     let branch_ref = format!("refs/heads/{branch}");
     let shown = fixture.git(&fixture.repo, &["show-ref", "--verify", &branch_ref]);
     assert!(
