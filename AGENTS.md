@@ -242,8 +242,8 @@ whole engine can be exercised in a temp directory with no model and no network.
 
 > **`cargo test --locked` at this root runs the app's probes only.**
 > `warp-flow-core` is a path dependency, not a workspace member (there is no
-> `[workspace]` in `Cargo.toml`), so the engine's 241 tests only run with
-> `cargo test --locked -p warp-flow-core`. Always run both; a green
+> `[workspace]` in `Cargo.toml`), so the engine's unit tests and probes only
+> run with `cargo test --locked -p warp-flow-core`. Always run both; a green
 > `cargo test --locked` says nothing about the engine.
 
 ### Build output
