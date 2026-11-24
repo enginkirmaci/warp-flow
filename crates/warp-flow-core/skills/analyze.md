@@ -28,9 +28,18 @@ size them, and a plan written with its spec cannot contradict it (ADR-0022).
 - **Change.** Which modules, crates and user-visible surfaces move. Name files
   and functions. When two designs are plausible, name both, choose one, and say
   why.
+- **Risk.** `low`, `medium` or `high`: what a wrong plan costs, and what would
+  catch it. `low` is additive, and reverting it is one commit; `medium` changes
+  a behaviour something else already relies on; `high` is a mistake nothing in
+  the run would catch — the issue folder's protocol, a merge, data on disk, a
+  published contract. It steers no step; it is there for the person who
+  approves the plan.
 - **Acceptance criteria.** Checkable statements — "the run screen shows the
   worktree tab only when one exists", not "improve the tab". Each criterion
   should be answerable by a test or a gate.
+- **Tasks.** One row per task file — its number, title, size, what blocks it
+  and the one check that proves it — so a person approves the cut without
+  opening the files. A row and its task file never disagree.
 - **Out of scope.** Work the request could imply that this run will not do.
 - **Open questions.** A decision you cannot make from the repository. A person
   answers these; do not guess, and do not hide one in prose.
@@ -73,8 +82,11 @@ The body of each task is the detail the spec does not carry:
 - **Dependencies are real.** `Blocked by:` names only tasks whose *merge* must
   land first: a shared file, a moved API, a schema change. Everything else is
   parallel and must not be chained out of caution.
-- **Size.** Three to eight tasks for a normal feature. If you need more, the
-  spec is too big for one run — say so in your report.
+- **Size.** `S`, `M` or `L`, by what the task changes: `S` is one function or
+  one type, `M` a few that together make one behaviour true, `L` a new module
+  or several types later tasks build on. Nothing is larger than `L` — a task
+  bigger than that is two tasks. Three to eight tasks for a normal feature. If
+  you need more, the spec is too big for one run — say so in your report.
 
 ## Output
 
@@ -85,12 +97,25 @@ Two artifacts, in the issue folder, written together:
 
         # <title>
 
+        **Risk:** <level> — <what a wrong plan costs, and what catches it>
+
         ## Problem
         ## Today
         ## Change
         ## Acceptance criteria
+
+        ## Tasks
+
+        | # | Task | Size | Blocked by | Done when |
+        | --- | --- | --- | --- | --- |
+        | 01 | <title> | <S> | — | <the one check that proves it> |
+        | 02 | <title> | <M> | 01 | <the one check that proves it> |
+
         ## Out of scope
         ## Open questions
+
+   The table is the plan at a glance; each task file's `Done when` is still the
+   full list.
 
 2. `issues/NN-<slug>.md` — one file per task, as above. The tasks carry the
    detail; the spec is the contract they cut.

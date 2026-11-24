@@ -1,7 +1,12 @@
 schema = 3
 name = "implement"
-revision = 2
+revision = 3
 max_parallel = 2
+
+# ═══ 1. SPEC + PLAN ═══════════════════════════════════════════════════════
+# En yüksek kaldıraçlı aşama: hatalı spec en pahalı hatadır.
+# analyze skill'i spec.md içine şunları yazmalı: risk seviyesi (low/med/high),
+# task listesi + boyutları, task başına test edilebilir kabul kriteri, kapsam dışı.
 
 [[step]]
 id = "analyze"
@@ -9,12 +14,13 @@ kind = "harness"
 enabled = true
 skill = "analyze"
 harness = "dsh"
-model = "opencode-go/deepseek-v4.1-flash"
+model = "commandcode/deepseek/deepseek-v4.1-flash"
 effort = "max"
 produces = "spec.md"
 per_task = false
 push = false
 
+# HITL #1: spec/plan onayı
 [[step]]
 id = "approve-plan"
 kind = "question"
@@ -27,34 +33,22 @@ to = "analyze"
 when = "answer_no"
 max = 2
 
+# ═══ 2. İMPLEMENTASYON ════════════════════════════════════════════════════
 [[step]]
 id = "code"
 kind = "harness"
 enabled = true
 skill = "code"
 harness = "dsh"
-model = "opencode-go/deepseek-v4.1-flash"
+model = "commandcode/deepseek/deepseek-v4.1-flash"
 effort = "max"
 per_task = true
 push = false
 
-[[step]]
-id = "review"
-kind = "harness"
-enabled = true
-skill = "review"
-harness = "dsh"
-model = "opencode-go/deepseek-v4.1-flash"
-effort = "high"
-produces = "review.md"
-per_task = true
-push = false
-
-[[step.edges]]
-to = "code"
-when = "verdict_changes"
-max = 3
-
+# ═══ 3. DETERMİNİSTİK KAPILAR (ucuz, LLM'den ÖNCE) ═════════════════════════
+# Sıra: en hızlı fail eden en başta (fmt → clippy → test).
+# İpucu: fmt'yi LLM'e hiç göndermemek için komutu `--check`siz çalıştırıp
+# otomatik düzelttirebilirsin; engine worktree değişikliklerini commit'liyorsa.
 [[step]]
 id = "fmt"
 kind = "gate"
@@ -62,9 +56,14 @@ enabled = true
 command = "cargo fmt --all --check && cargo fmt --all --manifest-path crates/warp-flow-core/Cargo.toml --check"
 cwd = "."
 timeout_secs = 300
-depends_on = ["review"]
+depends_on = ["code"]
 per_task = true
 push = false
+
+[[step.edges]]
+to = "code"
+when = "gate_failed"
+max = 1
 
 [[step]]
 id = "clippy"
@@ -73,9 +72,14 @@ enabled = true
 command = "cargo clippy --locked --all-targets -- -D warnings && cargo clippy --locked --all-targets -p warp-flow-core -- -D warnings"
 cwd = "."
 timeout_secs = 1800
-depends_on = ["review"]
+depends_on = ["fmt"]
 per_task = true
 push = false
+
+[[step.edges]]
+to = "code"
+when = "gate_failed"
+max = 2
 
 [[step]]
 id = "test"
@@ -93,6 +97,29 @@ to = "code"
 when = "gate_failed"
 max = 2
 
+# ═══ 4. AI REVIEW (sadece tüm kapılar yeşilse çalışır) ══════════════════════
+# Review ajanı temiz bağlamda çalışır. Code'dan farklı bir model koymak
+# bağımsız bakış sağlar:
+# model = "<farkli-veya-daha-guclu-model>"
+[[step]]
+id = "review"
+kind = "harness"
+enabled = true
+skill = "review"
+harness = "dsh"
+model = "commandcode/deepseek/deepseek-v4.1-flash"
+effort = "high"
+produces = "review.md"
+depends_on = ["test"]
+per_task = true
+push = false
+
+[[step.edges]]
+to = "code"
+when = "verdict_changes"
+max = 3
+
+# ═══ 5. VERSİYON + MERGE ══════════════════════════════════════════════════
 [[step]]
 id = "bump"
 kind = "gate"
@@ -119,34 +146,48 @@ kind = "harness"
 enabled = true
 skill = "merge-conflict"
 harness = "dsh"
-model = "opencode-go/deepseek-v4.1-flash"
+model = "commandcode/deepseek/deepseek-v4.1-flash"
 effort = "max"
 depends_on = ["merge"]
 per_task = true
 push = false
 
+# Hata çıktısı hedefi zaten gösterdiği için max → high.
 [[step]]
 id = "fix-gates"
 kind = "harness"
 enabled = true
 skill = "code"
 harness = "dsh"
-model = "opencode-go/deepseek-v4.1-flash"
-effort = "max"
+model = "commandcode/deepseek/deepseek-v4.1-flash"
+effort = "high"
 depends_on = ["merge"]
 per_task = true
 push = false
 
+# ═══ 6. ÖZET + SON İNSAN ONAYI ════════════════════════════════════════════
+# summary.md insana review paketi olmalı: diff stat, spec kabul kriterlerinin
+# karşılanma tablosu, gate sonuçları, kaç döngü döndüğü. Ham transcript değil.
 [[step]]
 id = "summary"
 kind = "harness"
 enabled = true
 skill = "summary"
 harness = "dsh"
-model = "opencode-go/deepseek-v4.1-flash"
+model = "commandcode/deepseek/deepseek-v4.1-flash"
 effort = "high"
 depends_on = ["merge"]
 produces = "summary.md"
+per_task = false
+push = false
+
+# HITL #2: merge local ve push=false olduğundan, bu adım "PR review" yerine geçer.
+# Cleanup onaya kadar bekler, böylece worktree'ler incelenebilir kalır.
+[[step]]
+id = "approve-result"
+kind = "question"
+enabled = true
+depends_on = ["summary"]
 per_task = false
 push = false
 
@@ -155,8 +196,7 @@ id = "cleanup"
 kind = "cleanup"
 enabled = true
 depends_on = [
-    "merge",
-    "summary",
+    "approve-result",
 ]
 per_task = false
 push = false
