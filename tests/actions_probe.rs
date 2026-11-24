@@ -457,25 +457,34 @@ fn a_refused_start_shows_the_engines_own_line(cx: &mut TestAppContext) {
     cx.update(theme::apply_kit_theme);
 
     // An issue folder with no workflow.toml: preparation is the refusal.
-    let (repo, _issue) = seed_repo(&home, "repo-a", false);
+    let (repo, issue) = seed_repo(&home, "repo-a", false);
     let (handle, page) = open_app(cx, vec![repo], fake_host());
     let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
     settle(cx);
 
     open_run_screen(cx);
     click(cx, "flow-run-start");
+    // The worker prepares, so the refusal arrives through its phase and the
+    // host snapshot rather than as the click's return value.
+    pump_until_phase(cx, &page, &issue, "the refused start", |phase| {
+        phase == Phase::Failed
+    });
     assert!(
         cx.debug_bounds("flow-run-action-error").is_some(),
         "the refusal is one readable line on the run screen"
     );
     page.read_with(cx, |page, _| {
-        let error = page
-            .run_action_error_for_probe()
-            .expect("the run screen kept the engine's message");
+        let host = page.host_snapshot_for_probe();
+        let error = host
+            .runs
+            .first()
+            .and_then(|run| run.error.as_deref())
+            .expect("the worker kept the engine's message");
         assert!(error.contains("workflow.toml"), "{error}");
-        assert!(
-            page.host_snapshot_for_probe().runs.is_empty(),
-            "a refused start leaves no host run behind"
+        assert_eq!(
+            host.runs.len(),
+            1,
+            "the refused start leaves one failed slot"
         );
     });
 

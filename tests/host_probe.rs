@@ -272,6 +272,26 @@ fn wait_for_harness(gate: &ProbeGate) {
     }
 }
 
+/// Wait until the worker fails, and return the error it recorded.
+fn wait_for_error(host: &Host, issue: &Path) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if host.phase(issue) == Some(Phase::Failed) {
+            return host
+                .snapshot()
+                .run(issue)
+                .and_then(|run| run.error.clone())
+                .expect("a failed run carries its error");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the worker never failed, the phase is {:?}",
+            host.phase(issue)
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// `run.md`'s status.
 fn run_status(issue: &Path) -> Option<String> {
     let text = fs::read_to_string(issue.join("run.md")).ok()?;
@@ -410,21 +430,29 @@ fn a_refused_start_carries_the_engine_message() {
     let fixture = Fixture::new("refuse", WORKFLOW);
     let host = Host::with_factory(probe_factory(Arc::new(ProbeGate::default())));
 
-    // A dirty tree outside the issue folder is a refusal, not a warning.
+    // A dirty tree outside the issue folder is a refusal, not a warning. The
+    // worker prepares, so the refusal lands in the run's phase and error.
     fs::write(fixture.repo.join("someone-elses.txt"), "work\n").expect("dirty file");
-    let error = host.start(&fixture.issue).expect_err("dirty tree");
+    host.start(&fixture.issue).expect("the worker starts");
+    let error = wait_for_error(&host, &fixture.issue);
     assert!(error.contains("outside the issue folders"), "{error}");
     assert!(error.contains("someone-elses.txt"), "{error}");
 
-    // A bad issue is a start error in the workflow's own words.
+    // A bad issue is the workflow's own words, from the same worker path.
     fs::remove_file(warp_flow_core::layout::pinned_workflow(&fixture.issue))
         .expect("remove workflow");
     run_git(&fixture.repo, &["add", "-A"]);
     run_git(&fixture.repo, &["commit", "--quiet", "-m", "break it"]);
-    let error = host.start(&fixture.issue).expect_err("no workflow");
+    host.start(&fixture.issue)
+        .expect("the second worker starts");
+    let error = wait_for_error(&host, &fixture.issue);
     assert!(error.contains("workflow.toml"), "{error}");
 
-    assert_eq!(host.snapshot().runs.len(), 0, "nothing started");
+    assert_eq!(
+        host.snapshot().runs.len(),
+        1,
+        "the failed slot is replaced, not duplicated"
+    );
 }
 
 #[test]

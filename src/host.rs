@@ -542,23 +542,21 @@ impl Host {
         initial: Option<Signal>,
     ) -> std::result::Result<(), String> {
         let issue = canonical_issue(issue);
-        let prepared = prepare(&issue).map_err(|error| error.to_string())?;
-        // the repository's template is pinned into the issue folder here, so
-        // the run reads one revision for its whole life (Repos › Workflow keeps
-        // revising the template, never this run's graph)
-        prepared.pin_workflow().map_err(|error| error.to_string())?;
-        let id = prepared
-            .issue
+        let id = issue
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| prepared.issue.display().to_string());
-        let record = run_record_status(&prepared.issue);
+            .unwrap_or_else(|| issue.display().to_string());
+        // The checks that decide whether a run may start at all are cheap
+        // reads; the preparation that reads and validates the checkout runs on
+        // the worker, so a slow disk never holds the frame that pressed Start.
+        let repo_root = enclosing_repo(&issue);
+        let record = run_record_status(&issue);
         if matches!(record.as_deref(), Some("done" | "merged")) {
             return Err(format!(
                 "`{id}` is already done; there is nothing to start."
             ));
         }
-        if mode == DriveMode::Resume && !prepared.resume() {
+        if mode == DriveMode::Resume && !issue.join("run.md").is_file() {
             return Err(format!(
                 "`{id}` has no run record to resume; start it instead."
             ));
@@ -566,40 +564,29 @@ impl Host {
         let mut runs = lock(&self.runs);
         if let Some(active) = runs.values().find(|slot| {
             slot.shared.phase().is_driving()
-                && (slot.shared.repo == prepared.repo.root
-                    || slot.shared.issue.starts_with(&prepared.repo.root))
+                && (slot.shared.repo() == repo_root || slot.shared.issue.starts_with(&repo_root))
         }) {
             let driving = active.shared.id();
             return Err(format!(
                 "{} is already driving `{driving}`; one run per repository at a time.",
-                prepared.repo.root.display()
+                repo_root.display()
             ));
         }
         // A fresh start rewrites `run.md` from row one. Doing that over an
         // existing record would erase its attempts, its questions and the
         // repairs a person is reading; the record says which verb applies.
-        if mode == DriveMode::Fresh && prepared.resume() {
+        if mode == DriveMode::Fresh && issue.join("run.md").is_file() {
             return Err(format!(
                 "`{id}` already has a run record; resume it instead of starting over."
             ));
         }
-        // The repository is free, so the run may start; a dirty tree outside
-        // the engine's issue folders is the next refusal, and its message is
-        // the engine's own.
-        prepared
-            .require_clean()
-            .map_err(|error| error.to_string())?;
 
         let state = match (mode, runs.get(&issue)) {
             (DriveMode::Resume, Some(slot)) if !slot.shared.phase().is_driving() => {
                 slot.shared.restart();
                 Arc::clone(&slot.shared)
             }
-            _ => Arc::new(RunState::new(
-                &prepared.issue,
-                &prepared.repo.root,
-                &prepared.title,
-            )),
+            _ => Arc::new(RunState::new(&issue, &repo_root, &id)),
         };
 
         // A request that arrives before the worker exists is the worker's
@@ -609,19 +596,41 @@ impl Host {
             state.control.request(signal);
         }
 
-        let context = DriverContext {
-            issue: prepared.issue.clone(),
-            prepared: Arc::new(prepared),
-            mode,
-            control: state.control.clone(),
-            log: state.log.clone(),
-        };
+        let context_issue = issue.clone();
         let factory = Arc::clone(&self.factory);
         let worker = Arc::clone(&state);
         let name = format!("warp-flow-run-{}", worker.id());
         let handle = thread::Builder::new()
             .name(name)
             .spawn(move || {
+                // Preparation is the worker's first job: it reads the issue
+                // and its workflow, pins the graph the run will use, and
+                // refuses a dirty checkout. Every refusal is the run's error
+                // and a failed phase, which the window already draws.
+                let prepared = match prepare(&context_issue) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        fail_run(&worker, error.to_string());
+                        return;
+                    }
+                };
+                if let Err(error) = prepared.pin_workflow() {
+                    fail_run(&worker, error.to_string());
+                    return;
+                }
+                if let Err(error) = prepared.require_clean() {
+                    fail_run(&worker, error.to_string());
+                    return;
+                }
+                worker.set_repo(&prepared.repo.root);
+                worker.set_title(&prepared.title);
+                let context = DriverContext {
+                    issue: prepared.issue.clone(),
+                    prepared: Arc::new(prepared),
+                    mode,
+                    control: worker.control.clone(),
+                    log: worker.log.clone(),
+                };
                 let outcome = match factory(context) {
                     Ok(mut driver) => {
                         // The factory is what connects to the door, so the run
@@ -677,8 +686,13 @@ pub fn answer_question(question: &Path, answer: &str) -> std::result::Result<(),
 /// One run's worker state; the snapshot reads it and the worker writes it.
 struct RunState {
     issue: PathBuf,
-    repo: PathBuf,
-    title: String,
+    /// The checkout the worker's `prepare` confirmed. A `Mutex` because the
+    /// provisional value comes from a file check before the worker reads the
+    /// repository, and the snapshot may be read in between.
+    repo: Mutex<PathBuf>,
+    /// The issue's own title, from `spec.md`; the folder's name until the
+    /// worker has prepared it.
+    title: Mutex<String>,
     phase: Mutex<Phase>,
     status: Mutex<Option<RunStatus>>,
     error: Mutex<Option<String>>,
@@ -692,8 +706,8 @@ impl RunState {
     fn new(issue: &Path, repo: &Path, title: &str) -> Self {
         Self {
             issue: issue.to_path_buf(),
-            repo: repo.to_path_buf(),
-            title: title.to_owned(),
+            repo: Mutex::new(repo.to_path_buf()),
+            title: Mutex::new(title.to_owned()),
             phase: Mutex::new(Phase::Starting),
             status: Mutex::new(None),
             error: Mutex::new(None),
@@ -710,6 +724,22 @@ impl RunState {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| self.issue.display().to_string())
+    }
+
+    fn repo(&self) -> PathBuf {
+        lock(&self.repo).clone()
+    }
+
+    fn set_repo(&self, repo: &Path) {
+        *lock(&self.repo) = repo.to_path_buf();
+    }
+
+    fn title(&self) -> String {
+        lock(&self.title).clone()
+    }
+
+    fn set_title(&self, title: &str) {
+        *lock(&self.title) = title.to_owned();
     }
 
     fn phase(&self) -> Phase {
@@ -781,8 +811,8 @@ impl RunState {
     fn snapshot(&self) -> RunSnapshot {
         RunSnapshot {
             issue: self.issue.clone(),
-            repo: self.repo.clone(),
-            title: self.title.clone(),
+            repo: self.repo(),
+            title: self.title(),
             phase: self.phase(),
             status: lock(&self.status).map(crate::store::RunState::from),
             started: timestamp(self.started),
@@ -809,6 +839,31 @@ fn run_record_status(issue: &Path) -> Option<String> {
 /// same issue folder share one map key and one comparison.
 fn canonical_issue(issue: &Path) -> PathBuf {
     issue.canonicalize().unwrap_or_else(|_| issue.to_path_buf())
+}
+
+/// The checkout an issue folder belongs to, by the `.git` every checkout has.
+///
+/// The worker's `prepare` confirms it; this copy exists so the checks in
+/// [`Host::begin`] can name the repository before a worker exists. A folder
+/// that is not inside a checkout falls back to its parent, which is the best
+/// identity the host can offer and enough for the one-run-per-repo check.
+fn enclosing_repo(issue: &Path) -> PathBuf {
+    issue
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map(Path::to_path_buf)
+        .or_else(|| issue.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| issue.to_path_buf())
+}
+
+/// Stop a run whose preparation or driver could not start.
+///
+/// The window already draws a failed phase's error, so a refusal that used to
+/// be a `start` return value is visible there instead.
+fn fail_run(worker: &RunState, error: String) {
+    worker.set_error(Some(error));
+    worker.set_phase(Phase::Failed);
+    worker.finish();
 }
 
 /// Lock a mutex, treating a poisoned lock as a plain value: a panicked worker
