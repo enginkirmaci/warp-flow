@@ -1,6 +1,6 @@
 # 01: Derive the run's title and folder from its request
 
-**Status:** ready-for-agent
+**Status:** resolved
 **Category:** enhancement
 **Blocked by:** None
 
