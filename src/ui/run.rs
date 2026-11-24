@@ -1826,7 +1826,10 @@ fn matrix_cell(step: &StepView, column: &MatrixColumn, column_width: f32) -> Any
     let state_selector = format!("flow-run-state-{}-{:02}", step.id, column.number);
     let state = matrix_lane(step, column.number).map(|lane| lane.state);
     let color = state.map_or_else(theme::text_muted, state_color_public);
-    let quiet = matches!(state, None | Some(StepState::Idle));
+    let quiet = matches!(
+        state,
+        None | Some(StepState::Idle) | Some(StepState::Skipped)
+    );
     let mut square = div()
         .id(SharedString::from(selector.clone()))
         .debug_selector(move || selector.clone())
@@ -2532,6 +2535,7 @@ fn state_color(state: StepState) -> gpui::Rgba {
         StepState::Failed => theme::DANGER,
         StepState::Waiting => theme::CHANGES,
         StepState::Idle => theme::text_dim(),
+        StepState::Skipped => theme::text_muted(),
     }
 }
 
@@ -2542,6 +2546,7 @@ fn state_icon(state: StepState) -> &'static str {
         StepState::Failed => "icons/icon-close.svg",
         StepState::Waiting => "icons/icon-shield.svg",
         StepState::Idle => "icons/icon-clock.svg",
+        StepState::Skipped => "icons/icon-minus.svg",
     }
 }
 
@@ -2939,6 +2944,26 @@ fn workflow_note_row(note: &str) -> AnyElement {
 mod tests {
     use super::*;
     use crate::store::{Column, Repair, Run, RunKey, Session};
+
+    /// Every state the run screen can draw has a glyph that ships: a renamed
+    /// icon would otherwise draw nothing where the word belongs.
+    #[test]
+    fn every_step_state_has_a_glyph_that_ships() {
+        for state in [
+            StepState::Done,
+            StepState::Running,
+            StepState::Failed,
+            StepState::Waiting,
+            StepState::Idle,
+            StepState::Skipped,
+        ] {
+            let path = state_icon(state);
+            assert!(
+                crate::assets::Assets::get(path).is_some(),
+                "{path} ships for {state:?}"
+            );
+        }
+    }
 
     /// A run record with the fields the failure line reads.
     fn run() -> Run {

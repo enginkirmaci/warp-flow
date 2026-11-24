@@ -2207,6 +2207,7 @@ fn gate_row(index: usize, gate: &GateView) -> AnyElement {
         StepState::Running => theme::BEHIND,
         StepState::Waiting => theme::CHANGES,
         StepState::Idle => theme::text_muted(),
+        StepState::Skipped => theme::text_muted(),
     };
     let word = match gate.state {
         StepState::Done => "passed".to_owned(),
@@ -2214,6 +2215,7 @@ fn gate_row(index: usize, gate: &GateView) -> AnyElement {
         StepState::Running => "running".to_owned(),
         StepState::Waiting => "waiting".to_owned(),
         StepState::Idle => "not run yet".to_owned(),
+        StepState::Skipped => "skipped".to_owned(),
     };
     let mut row = div()
         .id(SharedString::from(format!("flow-diff-gate-{index}")))
@@ -2243,6 +2245,7 @@ fn gate_row(index: usize, gate: &GateView) -> AnyElement {
             match gate.state {
                 StepState::Done => "icons/icon-check.svg",
                 StepState::Failed => "icons/icon-close.svg",
+                StepState::Skipped => "icons/icon-minus.svg",
                 _ => "icons/icon-clock.svg",
             },
             px(theme::icon_tiny()),

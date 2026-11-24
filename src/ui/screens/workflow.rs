@@ -3165,6 +3165,7 @@ fn state_pill(state: StepState, step: &str) -> AnyElement {
         StepState::Failed => (theme::DANGER, "icons/icon-close.svg"),
         StepState::Waiting => (theme::CHANGES, "icons/icon-shield.svg"),
         StepState::Idle => (theme::text_muted(), "icons/icon-play.svg"),
+        StepState::Skipped => (theme::text_muted(), "icons/icon-minus.svg"),
     };
     let mut pill = div()
         .flex()
@@ -3176,7 +3177,7 @@ fn state_pill(state: StepState, step: &str) -> AnyElement {
         .text_size(px(theme::font_meta()))
         .font_weight(FontWeight::MEDIUM)
         .text_color(hue);
-    pill = if state == StepState::Idle {
+    pill = if matches!(state, StepState::Idle | StepState::Skipped) {
         pill.bg(theme::raised())
     } else {
         pill.bg(theme::tint(hue))

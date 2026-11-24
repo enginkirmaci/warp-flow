@@ -40,7 +40,9 @@ rules that still matter move into `README.md` or this file.
   behind the board, plus `RunState`: the one typed vocabulary for a run's
   state. It reads `run.md`, then `spec.md`, then Triage — never a third copy of
   the strings — and a `RunState` is what the lanes, the pills and the action
-  plan speak.
+  plan speak. A lane the run never gave a job — a merge's repair step it did
+  not need, or a step the workflow switched off — reads `skipped`, never
+  `done`: the task's file says it landed, not that the step ran.
 - `src/host.rs` — the engine host: one blocking `Runner` per issue folder on a
   worker thread, one run per repository, the control value the engine reads at
   a step boundary, the log ring, and the snapshot the window and the door read.

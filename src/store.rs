@@ -517,6 +517,10 @@ pub enum StepState {
     Failed,
     Waiting,
     Idle,
+    /// The step never got a job: a merge's repair step the merge did not need,
+    /// or a step the workflow has switched off. Not `Done` — nothing ran — and
+    /// not `Idle` — nothing is going to.
+    Skipped,
 }
 
 impl StepState {
@@ -528,6 +532,7 @@ impl StepState {
             Self::Failed => "failed",
             Self::Waiting => "waiting",
             Self::Idle => "idle",
+            Self::Skipped => "skipped",
         }
     }
 
@@ -539,6 +544,7 @@ impl StepState {
             Self::Failed => "failed",
             Self::Waiting => "waiting on you",
             Self::Idle => "idle",
+            Self::Skipped => "skipped",
         }
     }
 }
@@ -1630,11 +1636,17 @@ fn lane_view(
     run_status: RunState,
     run_step: &str,
 ) -> LaneView {
-    // A resolved task has landed: its lane is done whatever an older log row
-    // still says.
+    // A resolved task has landed, so every lane it actually ran is done
+    // whatever an older log row still says. A lane with no row at all is a
+    // step that never got a job — a merge's repair step the merge did not
+    // need — and calling that done would count work that never happened.
     let resolved = task.status.is_resolved();
     let mut state = if resolved {
-        StepState::Done
+        if latest_row(rows, &step.id, Some(task.number)).is_some() {
+            StepState::Done
+        } else {
+            StepState::Skipped
+        }
     } else {
         step_state(
             step,
@@ -1648,7 +1660,7 @@ fn lane_view(
     // The record's present beats the log: while the run is running, the lane
     // `running:` names is working whatever its last row says — a retried lane
     // still carries the attempt that failed as its newest row. A resolved
-    // task's lane stays done: the task file is not the log.
+    // task's lane stays done or skipped: the task file is not the log.
     if !resolved && run_status.is_running() && running_names(run_step, &step.id, task.number, tasks)
     {
         state = StepState::Running;
@@ -1672,6 +1684,11 @@ fn step_state(
     run_status: RunState,
     run_step: &str,
 ) -> StepState {
+    // A disabled step never runs: only enabled steps decide the run is over,
+    // and the screen says what that means rather than leaving it idle.
+    if !step.enabled {
+        return StepState::Skipped;
+    }
     let open = question_open(step, task, questions);
     // The record's present beats the log, so it is read before the rows: a
     // retried step's newest row is still the attempt that failed. A lane's
@@ -1730,7 +1747,8 @@ fn running_names(running: &str, step: &str, task: u32, tasks: &[TaskRow]) -> boo
     bare && next_ready_task(tasks) == Some(task)
 }
 
-/// A `per_task` band's state: the worst lane wins, and all done is done.
+/// A `per_task` band's state: the worst lane wins, all done is done, and a
+/// step no task ran is skipped.
 fn aggregate_state(lanes: &[LaneView]) -> StepState {
     if lanes.is_empty() {
         return StepState::Idle;
@@ -1744,7 +1762,10 @@ fn aggregate_state(lanes: &[LaneView]) -> StepState {
     if lanes.iter().any(|lane| lane.state == StepState::Waiting) {
         return StepState::Waiting;
     }
-    if lanes.iter().all(|lane| lane.state == StepState::Done) {
+    if lanes.iter().all(|lane| lane.state == StepState::Skipped) {
+        return StepState::Skipped;
+    }
+    if lanes.iter().any(|lane| lane.state == StepState::Done) {
         return StepState::Done;
     }
     StepState::Idle
@@ -2668,5 +2689,80 @@ depends_on = []
             })
             .collect();
         assert_eq!(lanes, vec![StepState::Running, StepState::Done]);
+    }
+
+    /// A merge's repair step gets a job only when the merge needs it. With no
+    /// row of its own the task still landed, but the step never ran: it was
+    /// skipped, and calling it done would count work that never happened.
+    #[test]
+    fn a_repair_step_the_merge_never_needed_is_skipped() {
+        let step = per_task_step("resolve-conflict");
+        let mut landed = task(1, &[]);
+        landed.status = Status::Resolved;
+        let tasks = vec![landed.clone()];
+        let merge = row("merge", "01", 1, "merged");
+        assert_eq!(
+            lane_view(
+                &step,
+                &landed,
+                &tasks,
+                std::slice::from_ref(&merge),
+                &[],
+                RunState::Done,
+                ""
+            )
+            .state,
+            StepState::Skipped,
+            "the merge landed and the repair step wrote no row"
+        );
+        assert_eq!(
+            lane_view(
+                &step,
+                &landed,
+                &tasks,
+                &[merge, row("resolve-conflict", "01", 1, "done")],
+                &[],
+                RunState::Done,
+                "",
+            )
+            .state,
+            StepState::Done,
+            "a repair step that ran wrote its own row"
+        );
+    }
+
+    #[test]
+    fn a_band_is_skipped_only_when_no_task_ran_it() {
+        let lane = |state: StepState| LaneView {
+            number: 1,
+            title: "One".to_owned(),
+            state,
+        };
+        assert_eq!(
+            aggregate_state(&[lane(StepState::Skipped), lane(StepState::Skipped)]),
+            StepState::Skipped
+        );
+        assert_eq!(
+            aggregate_state(&[lane(StepState::Done), lane(StepState::Skipped)]),
+            StepState::Done,
+            "one task that ran it makes the band done"
+        );
+        assert_eq!(
+            aggregate_state(&[lane(StepState::Skipped), lane(StepState::Idle)]),
+            StepState::Idle,
+            "a task that has not reached it yet is not skipped"
+        );
+    }
+
+    #[test]
+    fn a_disabled_step_is_skipped_not_idle() {
+        let mut step = per_task_step("fix-gates");
+        step.per_task = false;
+        step.enabled = false;
+        assert_eq!(
+            step_state(&step, None, &[], &[], RunState::Running, ""),
+            StepState::Skipped,
+            "a step the workflow switches off will never run, whatever the run is doing"
+        );
     }
 }
