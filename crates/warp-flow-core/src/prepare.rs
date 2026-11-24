@@ -294,7 +294,7 @@ fn canonical_or_self(path: &Path) -> PathBuf {
 /// `.scratch/`, which the protocol reserves for issue folders and the engine
 /// writes. An untracked `.scratch/` itself (which git collapses into one
 /// `?? .scratch/` entry) is that area too.
-fn is_engine_path(path: &Path) -> bool {
+pub(crate) fn is_engine_path(path: &Path) -> bool {
     matches!(
         path.components().next(),
         Some(std::path::Component::Normal(name)) if name == ".scratch"

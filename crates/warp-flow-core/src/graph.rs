@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -522,6 +522,43 @@ impl Workflow {
         for step in &self.steps {
             if step.id.trim().is_empty() {
                 return Err(Error::Workflow("a step has an empty id".to_owned()));
+            }
+            // The id is written into `run.md`'s log table and `running:` list
+            // and into every `sent-back:<to>:<trigger>` key. A separator in it
+            // would split a cell or an entry, and a resumed run would read a
+            // different step than the one the record names.
+            if let Some(bad) = step.id.chars().find(|character| {
+                character.is_control()
+                    || character.is_whitespace()
+                    || matches!(character, '|' | '@' | ',' | ':' | '/')
+            }) {
+                return Err(Error::Workflow(format!(
+                    "step id `{}` contains `{bad}`; an id may not contain whitespace, `|`, \
+                     `@`, `,`, `:` or `/`, because `run.md` and the edge keys use them as \
+                     separators",
+                    step.id
+                )));
+            }
+            // `produces` is resolved inside the issue folder: a path that
+            // climbs out of it, or names an absolute one, would let a step
+            // write (and the engine read) a file the issue folder does not own.
+            if let Some(produces) = step.produces.as_deref() {
+                let path = Path::new(produces);
+                if produces.trim().is_empty()
+                    || path.is_absolute()
+                    || path.components().any(|component| {
+                        matches!(
+                            component,
+                            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                        )
+                    })
+                {
+                    return Err(Error::Workflow(format!(
+                        "step `{}` produces `{produces}`, which must be a relative path inside \
+                         the issue folder (no `..`, no absolute path)",
+                        step.id
+                    )));
+                }
             }
             if by_id.insert(step.id.as_str(), step).is_some() {
                 return Err(Error::Workflow(format!("duplicate step id `{}`", step.id)));
@@ -2239,5 +2276,53 @@ depends-on = ["b"]
             .validate()
             .expect_err("an enabled resolver beside a disabled merge runs alone");
         assert!(error.to_string().contains("is disabled"), "{error}");
+    }
+
+    #[test]
+    fn a_step_id_may_not_carry_the_records_separators() {
+        // `run.md`'s table and `running:` list use `|`, `@` and `,`, and an
+        // edge key uses `:`. An id carrying one of them writes a row a resume
+        // cannot read back as the step it names.
+        let graph = parse(
+            r#"
+schema = 3
+name = "implement"
+revision = 1
+
+[[step]]
+id = "a|b"
+kind = "harness"
+skill = "analyze"
+"#,
+        );
+        let error = graph.validate().expect_err("the separator is refused");
+        assert!(error.to_string().contains("may not contain"), "{error}");
+        assert!(error.to_string().contains("`|`"), "{error}");
+    }
+
+    #[test]
+    fn a_produced_artifact_stays_inside_the_issue_folder() {
+        for produces in ["../escape.md", "/tmp/escape.md", "tasks/../../escape.md"] {
+            let graph = parse(&format!(
+                r#"
+schema = 3
+name = "implement"
+revision = 1
+
+[[step]]
+id = "analyze"
+kind = "harness"
+skill = "analyze"
+produces = "{produces}"
+"#
+            ));
+            let error = graph
+                .validate()
+                .expect_err("a path outside the issue folder is refused");
+            assert!(
+                error.to_string().contains("relative path inside"),
+                "{produces}: {error}"
+            );
+        }
     }
 }

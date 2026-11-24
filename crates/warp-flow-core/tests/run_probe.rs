@@ -413,6 +413,7 @@ fn a_resume_whose_control_already_says_abandon_runs_no_step() {
         config
     };
     config.control = Box::new(AlreadyAbandoning);
+    drop(runner);
     let mut resumed = Runner::resume(config).expect("resume");
     assert_eq!(resumed.run().expect("resume"), RunStatus::Abandoned);
 

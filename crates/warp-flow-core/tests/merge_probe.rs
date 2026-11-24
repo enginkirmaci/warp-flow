@@ -273,9 +273,55 @@ fn a_dirty_main_checkout_is_refused() {
 
     let outcome = fixture.run_merge(&worktree, vec![gate("check", "false")], false);
 
-    assert_eq!(outcome, MergeOutcome::DirtyMain);
+    assert_eq!(
+        outcome,
+        MergeOutcome::DirtyMain {
+            paths: vec!["dirty.txt".to_owned()]
+        }
+    );
     assert_eq!(fixture.head(&fixture.repo), main_before);
     assert!(!fixture.repo.join("feature.txt").exists());
+}
+
+#[test]
+fn a_dirty_engine_folder_does_not_refuse_the_merge() {
+    // The engine writes `run.md`, questions and repairs while a run drives;
+    // those writes are its own record, not someone else's uncommitted work.
+    // The queue still holds every other path to the dirty-tree rule.
+    let fixture = Fixture::new();
+    let task = task(55, "Merge beside a dirty record");
+    let worktree = TaskWorktree::create(&fixture.repo(), &task).expect("create");
+    fixture.commit_file(&worktree.path, "feature.txt", "done\n", "task work");
+    let record = fixture.repo.join(".scratch/demo");
+    fs::create_dir_all(&record).expect("issue folder");
+    fs::write(record.join("run.md"), "status: running\n").expect("run.md");
+
+    let outcome = fixture.run_merge(&worktree, vec![gate("check", "true")], false);
+
+    assert!(
+        matches!(outcome, MergeOutcome::Merged { .. }),
+        "the engine's own record must not refuse the merge: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_merge_that_already_landed_is_reconciled_not_repeated() {
+    // The queue can lose the window between `git merge` and the run recording
+    // it. The next attempt sees a branch already contained in `main`; it must
+    // name the merge that landed instead of reporting an empty branch.
+    let fixture = Fixture::new();
+    let task = task(56, "Merge once");
+    let worktree = TaskWorktree::create(&fixture.repo(), &task).expect("create");
+    fixture.commit_file(&worktree.path, "feature.txt", "done\n", "task work");
+
+    let first = fixture.run_merge(&worktree, vec![gate("check", "true")], false);
+    let commit = match first {
+        MergeOutcome::Merged { commit } => commit,
+        other => panic!("the first merge lands, got {other:?}"),
+    };
+    let second = fixture.run_merge(&worktree, vec![gate("check", "true")], false);
+
+    assert_eq!(second, MergeOutcome::AlreadyMerged { commit });
 }
 
 #[test]

@@ -428,6 +428,26 @@ fn a_refused_start_carries_the_engine_message() {
 }
 
 #[test]
+fn a_fresh_start_over_an_existing_record_is_refused() {
+    // `start` rewrites `run.md` from row one. Over an existing record that
+    // would erase its questions, attempts and repairs; the guard points the
+    // caller at Resume instead.
+    let fixture = Fixture::new("fresh-over-record", QUESTION_WORKFLOW);
+    let host = Host::with_factory(probe_factory(Arc::new(ProbeGate::default())));
+
+    host.start(&fixture.issue).expect("the first start");
+    wait_for_phase(&host, &fixture.issue, Phase::Waiting);
+
+    let error = host
+        .start(&fixture.issue)
+        .expect_err("a second fresh start");
+    assert!(error.contains("already has a run record"), "{error}");
+    assert!(error.contains("resume"), "{error}");
+
+    host.shutdown_within(Duration::from_secs(1));
+}
+
+#[test]
 fn a_pause_asked_while_a_question_waits_is_not_lost() {
     let fixture = Fixture::new("pause-waiting", QUESTION_WORKFLOW);
     let host = Host::with_factory(probe_factory(Arc::new(ProbeGate::default())));

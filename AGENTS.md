@@ -155,9 +155,14 @@ process: the kit ties its `gsettings monitor` to the app's lifetime
   above a merge runs once per run, which is why `bump` is not per task.
 - The engine writes the issue folder, `run.md` and `questions/`, and commits
   that folder — only that folder, only on `main`, with hooks and signing off —
-  at three points: `flow: issue <slug>` at run start, `flow: record <slug>`
-  before a merge attempt, and `flow: resolve task NN` after a task lands. It
-  never force-pushes and never touches another path on `main`.
+  at four points: `flow: issue <slug>` at run start, `flow: record <slug>`
+  before a merge attempt, `flow: resolve task NN` after a task lands, and
+  `flow: done <slug>` when the run finishes, so the summary and the final
+  record are not left for the next run to commit. It never force-pushes and
+  never touches another path on `main`. A merge refuses a dirty checkout
+  outside `.scratch/`, the engine's own record area: the engine writes there
+  throughout a run and commits it at those points, so those writes are not
+  someone else's uncommitted work.
 - A dirty working tree is a refusal to start, not a warning.
 - Only a merge that lands a commit resolves a task. A task branch with nothing
   on it is a failed attempt with a repair that names the repository the queue

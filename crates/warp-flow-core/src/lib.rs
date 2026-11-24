@@ -24,6 +24,7 @@ pub mod gate;
 pub mod graph;
 pub mod harness;
 pub mod layout;
+mod lock;
 pub mod merge;
 pub mod prepare;
 pub mod run;

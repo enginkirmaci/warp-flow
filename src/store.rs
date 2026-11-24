@@ -258,10 +258,11 @@ impl RunState {
         )
     }
 
-    /// The lane this state falls into. An open question outranks the record:
-    /// the person is the one thing the run waits for.
+    /// The lane this state falls into. An open question outranks the record
+    /// while the run can still take the answer; a terminal run that left a
+    /// question behind is not waiting on anyone.
     pub fn column(self, question_open: bool) -> Column {
-        if question_open {
+        if question_open && !self.is_terminal() {
             return Column::Waiting;
         }
         match self {
@@ -912,7 +913,18 @@ fn scan_run(
         spec_status,
     );
     let rows = table_rows(run_body);
-    let attempts = rows.len();
+    // An "attempt" is work the engine tried, not every log row: a `sent-back`
+    // row records the edge a step took, a `waiting` row says a question was
+    // asked, and a `skipped` row is a disabled step that never ran. Counting
+    // those made a three-round rework read as six attempts.
+    let attempts = rows
+        .iter()
+        .filter(|row| {
+            !row.outcome.starts_with("sent-back:")
+                && row.outcome != "skipped"
+                && row.outcome != "waiting"
+        })
+        .count();
     let stop_reason = run_body
         .lines()
         .find_map(|line| line.trim().strip_prefix("**Run stopped:**"))
@@ -1856,12 +1868,22 @@ mod tests {
             "ready-for-agent",
             "running",
             "blocked",
-            "merged",
+            "waiting",
+            "paused",
         ] {
             assert_eq!(
                 Column::from_state(RunState::parse(status), true),
                 Column::Waiting,
                 "{status} with a question is Waiting on you"
+            );
+        }
+        // A terminal run cannot take the answer: its worker is gone, and
+        // answering would not resume it. The record's own status wins.
+        for status in ["done", "merged", "abandoned", "wontfix"] {
+            assert_ne!(
+                Column::from_state(RunState::parse(status), true),
+                Column::Waiting,
+                "{status} is not waiting on an answer it cannot use"
             );
         }
     }
@@ -2138,6 +2160,38 @@ depends_on = []
         assert_eq!(
             run.stop_reason.as_deref(),
             Some("task 02 `Second` is not resolved and no step can advance it")
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn attempts_count_work_not_every_log_row() {
+        let dir = scratch_dir("attempts");
+        let issue = dir.join(".scratch/demo");
+        fs::create_dir_all(&issue).expect("issue folder");
+        fs::write(issue.join("spec.md"), "# Demo\n").expect("spec");
+        fs::write(
+            issue.join("run.md"),
+            "---\nissue: demo\nworkflow: implement\nrevision: 1\nstatus: blocked\n\
+             started: 2026-01-01T00:00:00Z\n---\n\n\
+             # Run: implement\n\n## Log\n\n\
+             | Step | Task | Attempt | Outcome | At |\n\
+             | --- | --- | --- | --- | --- |\n\
+             | code | 01 | 1 | done | 2026-01-01T00:01:00Z |\n\
+             | test | 01 | 1 | sent-back:code:gate_failed | 2026-01-01T00:02:00Z |\n\
+             | ask | - | 1 | waiting | 2026-01-01T00:03:00Z |\n\
+             | off | - | 0 | skipped | 2026-01-01T00:04:00Z |\n\
+             | code | 01 | 2 | blocked | 2026-01-01T00:05:00Z |\n",
+        )
+        .expect("run.md");
+
+        let snapshot = scan(std::slice::from_ref(&dir));
+        let run = &snapshot.repos[0].runs[0];
+        assert_eq!(
+            run.attempts, 2,
+            "the done and blocked rows are the attempts; an edge round, a \
+             question and a disabled step are not"
         );
 
         let _ = fs::remove_dir_all(dir);

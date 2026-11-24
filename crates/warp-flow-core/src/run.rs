@@ -349,6 +349,12 @@ pub struct Runner<H> {
     /// A retry opens a new attempt window, so the log's attempt numbers start
     /// again at 1; this list is the record that says why (AGENTS.md).
     retried: Vec<String>,
+    /// Rows before this index belong to an earlier attempt window: a person's
+    /// retry of a blocked run resets the rework edge budgets with the attempt
+    /// budgets, and this is where the new window starts.
+    edge_floor: usize,
+    /// The cross-process claim on this run, held until the runner drops.
+    _run_lock: crate::lock::RunLock,
 }
 
 impl<H: Harness + Send + 'static> Runner<H> {
@@ -404,10 +410,28 @@ impl<H: Harness + Send + 'static> Runner<H> {
         }
         Issue::open(&issue)?;
 
+        let Some(factory) = factory else {
+            return Err(Error::Run(
+                "the runner config carries neither a harness nor a factory".to_owned(),
+            ));
+        };
+        // One run per repository, across processes: the host's own check only
+        // sees this process, so the lock is what stops the CLI and a window
+        // from writing the same issue folder at once.
+        // A repository lock lives inside `.git/`, where it cannot make the
+        // checkout dirty; a run without a repository (the engine's unit tests)
+        // keeps its lock in the issue folder, which is already the engine's.
+        let lock_folder = match &repo {
+            Some(repo) if repo.root.join(".git").is_dir() => repo.root.join(".git"),
+            Some(repo) => repo.root.join(".scratch"),
+            None => issue.clone(),
+        };
+        let run_lock = crate::lock::RunLock::acquire(&lock_folder)?;
+
         Ok(Self {
             issue,
             workflow,
-            harness_factory: factory.expect("a config carries a harness or a factory"),
+            harness_factory: factory,
             max_attempts,
             workdir,
             repo,
@@ -427,6 +451,8 @@ impl<H: Harness + Send + 'static> Runner<H> {
             note: None,
             resumed: false,
             retried: Vec::new(),
+            edge_floor: 0,
+            _run_lock: run_lock,
         })
     }
 
@@ -627,12 +653,19 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 // The cleanup is the one engine step that does not run in the
                 // checkout at all: it takes the worktrees folder as its place,
                 // which is what lets it run in the same wave as the summary.
+                // Capacity before place: `step_workdir` creates a worktree,
+                // and a pass that built one for every ready task before
+                // checking `max_parallel` spent a `git worktree add` on work
+                // that was not going to start this wave.
+                if jobs.len() >= self.max_parallel() {
+                    continue;
+                }
                 let workdir = if step.kind == StepKind::Cleanup {
                     self.workdir.join(".worktrees")
                 } else {
                     self.step_workdir(&step, task.as_ref())?
                 };
-                if busy.contains(&workdir) || jobs.len() >= self.max_parallel() {
+                if busy.contains(&workdir) {
                     continue;
                 }
                 busy.insert(workdir.clone());
@@ -703,6 +736,11 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 self.note = None;
                 self.write_run()?;
                 self.log_line("run done");
+                // The closing record — the last `run.md`, the summary and the
+                // cleanup's own notes — is part of the run, not a leftover for
+                // the next one to commit. Only the issue folder is staged, as
+                // at every other engine commit.
+                self.commit_issue(&format!("flow: done {}", self.issue_name()))?;
                 return Ok(RunStatus::Done);
             }
             if !ran {
@@ -733,6 +771,16 @@ impl<H: Harness + Send + 'static> Runner<H> {
 
     /// Mark `step` complete for `task`, or for the graph when it has none.
     fn mark_done(&mut self, step: &Step, task: Option<&Task>) {
+        // A per-task step without a task is the report `apply_report` refuses:
+        // marking it done here would finish the graph for work no task did.
+        if step.per_task && task.is_none() {
+            debug_assert!(
+                false,
+                "a per-task step `{}` cannot be marked done without a task",
+                step.id
+            );
+            return;
+        }
         match task {
             Some(task) => {
                 self.completed
@@ -913,11 +961,48 @@ impl<H: Harness + Send + 'static> Runner<H> {
         let Some(step) = self.workflow.step(&report.step).cloned() else {
             return Ok(None);
         };
-        let task = report.task.and_then(|number| {
-            Issue::open(&self.issue)
-                .ok()
-                .and_then(|issue| issue.task(number).cloned())
-        });
+        // A per-task report that names no task, or names one whose file has
+        // gone, cannot be applied to the graph: marking the step done without
+        // a task would open every join above it. The report blocks instead.
+        if step.per_task && report.task.is_none() {
+            let failure = Failure {
+                outcome: FailureOutcome::Blocked,
+                summary: format!(
+                    "step `{}` is per task, but its report names no task",
+                    step.id
+                ),
+                detail: None,
+            };
+            return self.block_report(&step, None, report.attempt, failure);
+        }
+        let task = match report.task {
+            None => None,
+            Some(number) => {
+                let opened = Issue::open(&self.issue).and_then(|issue| {
+                    issue.task(number).cloned().ok_or_else(|| {
+                        Error::Run(format!(
+                            "task {number:02} is not in `{}`",
+                            self.issue.display()
+                        ))
+                    })
+                });
+                match opened {
+                    Ok(task) => Some(task),
+                    Err(error) => {
+                        let failure = Failure {
+                            outcome: FailureOutcome::Blocked,
+                            summary: format!(
+                                "step `{}` reported on task {number:02}, but its task file \
+                                 cannot be read: {error}",
+                                step.id
+                            ),
+                            detail: None,
+                        };
+                        return self.block_report(&step, None, report.attempt, failure);
+                    }
+                }
+            }
+        };
         // The verdict is read only where a step declares a verdict edge: it is
         // the one place a session's own judgement moves the run, and it moves
         // it through a declared file, never through the report's prose.
@@ -947,11 +1032,6 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 Trigger::Blocked
             }),
         };
-        if let Some(trigger) = raised
-            && let Some(edge) = step.edges.iter().find(|edge| edge.when == trigger)
-        {
-            return self.take_edge(&step, edge, task.as_ref(), report.attempt);
-        }
         let failure = match report.result {
             Ok(StepOutcome::Done { .. }) => refused,
             Ok(StepOutcome::Blocked { reason }) => Some(Failure {
@@ -965,6 +1045,18 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 detail: None,
             }),
         };
+        if let Some(trigger) = raised
+            && let Some(edge) = step.edges.iter().find(|edge| edge.when == trigger)
+        {
+            // A gate's tail, or a session's reason for blocking, is the
+            // findings the target needs. The repair keeps it before the
+            // `sent-back` row moves the work, because the report's prose is
+            // gone once this function returns.
+            if let Some(failure) = &failure {
+                self.write_repair(&step, task.as_ref(), report.attempt, failure)?;
+            }
+            return self.take_edge(&step, edge, task.as_ref(), report.attempt);
+        }
         let key = (step.id.clone(), report.task);
         self.attempts.insert(key, report.attempt);
         match failure {
@@ -996,6 +1088,25 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 Ok(None)
             }
         }
+    }
+
+    /// Register a report the engine cannot apply and stop the run there.
+    ///
+    /// The failure is written like any other: a repair a person can read and a
+    /// `blocked` row in `run.md`. It is never retried inside the run, because
+    /// the report is already gone.
+    fn block_report(
+        &mut self,
+        step: &Step,
+        task: Option<&Task>,
+        attempt: u32,
+        failure: Failure,
+    ) -> Result<Option<RunStatus>> {
+        self.register_failure(step, task, attempt, &failure, Retry::Never)?;
+        self.status = RunStatus::Blocked;
+        self.write_run()?;
+        self.log_line("run blocked");
+        Ok(Some(RunStatus::Blocked))
     }
 
     /// Take one of a step's edges: record the round and un-complete the target.
@@ -1130,6 +1241,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
         self.rows.clear();
         self.pending_questions.clear();
         self.retried.clear();
+        self.edge_floor = 0;
         self.record.clear();
         self.note = None;
         // One timestamp for the record and the skipped rows: they are written
@@ -1142,6 +1254,10 @@ impl<H: Harness + Send + 'static> Runner<H> {
             self.rows.push(row_line(&step.id, None, 0, "skipped", &now));
         }
         self.write_run()?;
+        // The first of the engine's commit points (AGENTS.md): a fresh run's
+        // folder — spec, tasks, the pinned graph and the opening `run.md` —
+        // lands before the first step reads it.
+        self.commit_issue(&format!("flow: issue {}", self.issue_name()))?;
         let line = format!(
             "run: `{}` revision {} on {}",
             self.workflow.name,
@@ -1267,6 +1383,11 @@ impl<H: Harness + Send + 'static> Runner<H> {
             self.retried
                 .push(format!("{step} @ {}", timestamp(SystemTime::now())));
             self.attempts.clear();
+            // A retry opens a new window for the rework edges too: the
+            // `sent-back` rows before this one belong to the window whose
+            // budget was spent, and counting them again would make the retry
+            // a no-op.
+            self.edge_floor = self.rows.len();
         }
         self.resumed = true;
         Ok(())
@@ -1450,13 +1571,12 @@ impl<H: Harness + Send + 'static> Runner<H> {
                     // is what lets a rejected plan send the work back to the
                     // step that wrote it (ADR-0023).
                     let answer = self.answer_of(step, task)?;
-                    let raised = answer.as_deref().map(|answer| {
-                        if Self::answer_is_yes(answer) {
-                            Trigger::AnswerYes
-                        } else {
-                            Trigger::AnswerNo
-                        }
-                    });
+                    let word = answer.as_deref().map(Self::answer_word);
+                    let raised = match word {
+                        Some(AnswerWord::Yes) => Some(Trigger::AnswerYes),
+                        Some(AnswerWord::No) => Some(Trigger::AnswerNo),
+                        Some(AnswerWord::Other) | None => None,
+                    };
                     if let Some(trigger) = raised
                         && let Some(edge) = step.edges.iter().find(|edge| edge.when == trigger)
                     {
@@ -1471,10 +1591,53 @@ impl<H: Harness + Send + 'static> Runner<H> {
                             None => Ok(StepRun::Looped),
                         };
                     }
-                    self.record_row(step, task, 1, "done")?;
-                    let line = format!("{label}: answered by {}", path.display());
-                    self.log_line(&line);
-                    return Ok(StepRun::Done);
+                    // Only a yes may fall through to approval. A no with no
+                    // `answer_no` edge used to be recorded as `done`, which
+                    // read a rejection as permission; a word the engine does
+                    // not recognise is not permission either. Both stop the
+                    // run with a repair that says what the graph is missing.
+                    if word == Some(AnswerWord::Yes) {
+                        self.record_row(step, task, 1, "done")?;
+                        let line = format!("{label}: answered by {}", path.display());
+                        self.log_line(&line);
+                        return Ok(StepRun::Done);
+                    }
+                    let (summary, detail) = match (word, answer.as_deref()) {
+                        (Some(AnswerWord::No), _) => (
+                            format!(
+                                "question `{}` was answered `no`, but the graph has no \
+                                 `answer_no` edge saying where the rejected work goes",
+                                step.id
+                            ),
+                            "Add an `edges = [{ to = \"<step>\", when = \"answer_no\" }]` \
+                             entry to the question step, then resume the run."
+                                .to_owned(),
+                        ),
+                        (Some(AnswerWord::Other), Some(answer)) => (
+                            format!(
+                                "question `{}` was answered `{answer}`, which is neither yes \
+                                 nor no",
+                                step.id
+                            ),
+                            "Answer with `yes` or `no`; an approval question does not let an \
+                             unrecognised word stand in for permission."
+                                .to_owned(),
+                        ),
+                        _ => (
+                            format!(
+                                "question `{}` is marked answered but carries no `answer:` value",
+                                step.id
+                            ),
+                            format!("Write the answer into `{}`.", path.display()),
+                        ),
+                    };
+                    let failure = Failure {
+                        outcome: FailureOutcome::Blocked,
+                        summary,
+                        detail: Some(detail),
+                    };
+                    self.register_failure(step, task, 1, &failure, Retry::Never)?;
+                    return Ok(StepRun::Blocked);
                 }
                 // An open question is the same decision still waiting: asking
                 // again would write a second file for one answer, so the run
@@ -1649,6 +1812,9 @@ impl<H: Harness + Send + 'static> Runner<H> {
         let key = format!("sent-back:{}", edge.key());
         self.rows
             .iter()
+            // A person's retry opens a new window: only the rounds taken
+            // since then count against the edge's budget.
+            .skip(self.edge_floor)
             .filter_map(|line| LogRow::parse(line))
             .filter(|row| row.step == step && row.task == number && row.outcome == key)
             .count() as u32
@@ -1666,6 +1832,47 @@ impl<H: Harness + Send + 'static> Runner<H> {
             .iter()
             .filter_map(|line| LogRow::parse(line))
             .any(|row| row.step == step && row.task == number && row.outcome.starts_with(&prefix))
+    }
+
+    /// The newest repair this step wrote, for the findings paragraph of the
+    /// prompt an edge's target receives.
+    ///
+    /// A repair is where a failed gate's output survives the report: the
+    /// `sent-back` row names the round, and this file names what went wrong.
+    /// Reading it back by number keeps the pointer stable across a resume.
+    fn latest_repair(&self, step: &str, task: Option<&Task>) -> Option<PathBuf> {
+        let dir = self.issue.join("repairs");
+        let entries = fs::read_dir(&dir).ok()?;
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("md"))
+            .collect();
+        paths.sort();
+        paths.reverse();
+        let wanted_task = task.map(|task| format!("{:02}", task.number));
+        let mut fallback = None;
+        for path in paths {
+            let Ok(document) = Document::read(&path) else {
+                continue;
+            };
+            if document.front.get("step") != Some(step) {
+                continue;
+            }
+            if let Some(wanted) = &wanted_task
+                && document.front.get("task") != Some(wanted.as_str())
+            {
+                // A step that runs once (a gate above the merge queue) writes
+                // its repair without a task; it still names the work it sent
+                // back, so it is the fallback for a per-task target.
+                if document.front.get("task").is_none() {
+                    fallback.get_or_insert(path);
+                }
+                continue;
+            }
+            return Some(path);
+        }
+        fallback
     }
 
     /// Un-complete `span` for `task`, so the run walks up to the target again.
@@ -1827,15 +2034,27 @@ impl<H: Harness + Send + 'static> Runner<H> {
             .map(str::to_owned))
     }
 
-    /// Whether an answer means "yes".
+    /// What an answer to an approval question means.
     ///
     /// An approval's options are `yes, no`, and a person may type either word
-    /// with any capitalisation or a trailing full stop. Everything that is not
-    /// a yes is a no: a question that stops a run must not let an unrecognised
-    /// answer read as permission.
-    fn answer_is_yes(answer: &str) -> bool {
+    /// with any capitalisation or a trailing full stop, and may write a
+    /// sentence around it (`yes, go ahead`). The first word is the answer; a
+    /// word outside both vocabularies is not folded into "no": the run stops
+    /// and names it, because letting it read as either approval or rejection
+    /// would guess at the one decision a person was asked to make.
+    fn answer_word(answer: &str) -> AnswerWord {
         let word = answer.trim().trim_end_matches(['.', '!']).to_lowercase();
-        matches!(word.as_str(), "yes" | "y" | "true" | "approve" | "approved")
+        let head = word
+            .split(|character: char| {
+                character.is_whitespace() || character == ',' || character == ';'
+            })
+            .next()
+            .unwrap_or("");
+        match head {
+            "yes" | "y" | "true" | "approve" | "approved" => AnswerWord::Yes,
+            "no" | "n" | "false" | "reject" | "rejected" => AnswerWord::No,
+            _ => AnswerWord::Other,
+        }
     }
 
     /// The directory a step runs in: the task's worktree for a per-task step
@@ -1884,13 +2103,30 @@ impl<H: Harness + Send + 'static> Runner<H> {
             // queue insists on a clean main checkout.
             self.commit_issue(&format!("flow: record {}", self.issue_name()))?;
 
-            let outcome = crate::merge::merge(MergeRequest {
+            // A git failure — an unclean task worktree, a main checkout on
+            // another branch, a rebase that could not start — is a failed
+            // attempt with a repair, not an engine error that abandons the run
+            // with `run.md` still saying `running`. Retrying cannot fix most of
+            // them, so the repair is the record and the person's retry is the
+            // next window.
+            let outcome = match crate::merge::merge(MergeRequest {
                 repo: repo.clone(),
                 worktree: worktree.clone(),
                 main: "main".to_owned(),
                 gates: self.merge_gates(step)?,
                 push: step.push,
-            })?;
+            }) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let failure = Failure {
+                        outcome: FailureOutcome::Failed,
+                        summary: format!("the merge queue could not finish: {error}"),
+                        detail: None,
+                    };
+                    self.register_failure(step, Some(task), attempt, &failure, Retry::Never)?;
+                    return Ok(StepRun::Blocked);
+                }
+            };
 
             match outcome {
                 MergeOutcome::Merged { commit } => {
@@ -1898,6 +2134,20 @@ impl<H: Harness + Send + 'static> Runner<H> {
                     self.resolve_task(task.number)?;
                     self.commit_issue(&format!("flow: resolve task {:02}", task.number))?;
                     let line = format!("{label} attempt {attempt}: merged {commit}");
+                    self.log_line(&line);
+                    return Ok(StepRun::Done);
+                }
+                MergeOutcome::AlreadyMerged { commit } => {
+                    // The merge landed before the run recorded it (a crash
+                    // between `git merge` and the row). The branch is already
+                    // an ancestor of `main` with a merge commit naming it, so
+                    // the record is reconciled instead of merging it twice.
+                    self.record_row(step, Some(task), attempt, "merged")?;
+                    self.resolve_task(task.number)?;
+                    self.commit_issue(&format!("flow: resolve task {:02}", task.number))?;
+                    let line = format!(
+                        "{label} attempt {attempt}: already merged as {commit}; task resolved"
+                    );
                     self.log_line(&line);
                     return Ok(StepRun::Done);
                 }
@@ -1969,11 +2219,39 @@ impl<H: Harness + Send + 'static> Runner<H> {
                         self.current_step = Some(merge_label);
                         self.write_run()?;
                         match outcome? {
-                            StepRun::Done => {}
+                            StepRun::Done => {
+                                // A resolver that said done but left the rebase
+                                // in progress would make the next `git rebase`
+                                // fail on unmerged paths. The engine cannot
+                                // trust a session's cleanup, so it checks.
+                                if crate::merge::rebase_in_progress(&worktree.path) {
+                                    crate::merge::abort_rebase(&worktree.path);
+                                    let failure = Failure {
+                                        outcome: FailureOutcome::Conflicted,
+                                        summary: format!(
+                                            "conflict step `{target}` reported done, but the \
+                                             rebase was still in progress; it was aborted"
+                                        ),
+                                        detail: None,
+                                    };
+                                    self.register_failure(
+                                        step,
+                                        Some(task),
+                                        attempt,
+                                        &failure,
+                                        Retry::Never,
+                                    )?;
+                                    return Ok(StepRun::Blocked);
+                                }
+                            }
                             StepRun::Blocked
                             | StepRun::Waiting(_)
                             | StepRun::Stopped(_)
                             | StepRun::Looped => {
+                                // Whatever the resolver left behind, the next
+                                // attempt must start from a checkout with no
+                                // rebase in progress.
+                                crate::merge::abort_rebase(&worktree.path);
                                 return Ok(StepRun::Blocked);
                             }
                         }
@@ -1995,14 +2273,13 @@ impl<H: Harness + Send + 'static> Runner<H> {
                         return Ok(StepRun::Blocked);
                     }
                 }
-                MergeOutcome::DirtyMain => {
+                MergeOutcome::DirtyMain { paths } => {
                     // A dirty main is a refusal, not a failed merge: retrying
                     // the identical merge cannot clean the checkout, so this is
                     // the step's last attempt. Every other refusal leaves a
                     // repair a person can read, and so does this one — with the
                     // paths `git status` holds up, so the person knows what to
                     // clean.
-                    let paths = dirty_paths(&repo.root);
                     let named = paths.join(", ");
                     let note = format!(
                         "the main checkout is dirty; the merge queue refuses to merge task {:02} \
@@ -2215,6 +2492,17 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 prompt.push_str(&format!(
                     "\n`{}` sent this work back with findings. Read `{findings}` and address \
                      every finding before you finish.\n",
+                    sender.id
+                ));
+            }
+            if let Some(repair) = self.latest_repair(&sender.id, task) {
+                let name = repair
+                    .strip_prefix(&self.issue)
+                    .unwrap_or(&repair)
+                    .display();
+                prompt.push_str(&format!(
+                    "\n`{}` recorded why it sent this work back in `{name}`. Read it and \
+                     address what it names before you finish.\n",
                     sender.id
                 ));
             }
@@ -2501,6 +2789,16 @@ enum Verdict {
     Refused(Failure),
 }
 
+/// What a person's answer to an approval question means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnswerWord {
+    Yes,
+    No,
+    /// A word outside the approval vocabulary; the run stops rather than
+    /// guessing which way it points.
+    Other,
+}
+
 /// One row of `run.md`'s log table, as resume reads it back.
 struct LogRow {
     /// The row as it was written, with its line ending, so it can be kept.
@@ -2657,30 +2955,6 @@ fn require_git(output: &std::process::Output, action: &str, dir: &Path) -> Resul
         "git could not {action} in {}: {reason}",
         dir.display()
     )))
-}
-
-/// The paths `git status` reports as dirty in `dir`, for a repair.
-///
-/// A refusal that names what is wrong gives a person something to do; "the
-/// checkout is dirty" without the paths sends them hunting. A status that
-/// cannot be read is not an error here: the merge queue already decided the
-/// checkout is dirty, so the repair is still written, just without the list.
-fn dirty_paths(dir: &Path) -> Vec<String> {
-    let Ok(output) = git(dir, &["status", "--porcelain"]) else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            // `XY <path>`, with the two status columns and one space before
-            // the path; a rename reads `old -> new` after them.
-            let path = line.get(3..)?.trim();
-            (!path.is_empty()).then(|| path.to_owned())
-        })
-        .collect()
 }
 
 /// Remove the run's landed work: each merged task's worktree and branch, then
@@ -3479,6 +3753,20 @@ depends_on = ["test"]
         assert!(root.join("feature.txt").is_file(), "the branch landed");
         let merges = run_git(&root, &["log", "--merges", "--format=%s", "main"]);
         assert!(merges.contains("flow: merge task 01"), "{merges}");
+        let subjects = run_git(&root, &["log", "--format=%s", "main"]);
+        assert!(
+            subjects.contains("flow: issue demo"),
+            "the run's opening record is committed: {subjects}"
+        );
+        assert!(
+            subjects.contains("flow: done demo"),
+            "the closing record is committed, not left for the next run: {subjects}"
+        );
+        assert_eq!(
+            run_git(&root, &["status", "--porcelain"]),
+            "",
+            "a finished run leaves no uncommitted record behind"
+        );
 
         let calls = runner.harness().calls();
         assert_eq!(calls.len(), 2, "analyze then code");
@@ -3951,6 +4239,7 @@ kind = "question"
         question.front.set("state", "answered");
         question.write_atomic(&path).expect("answer is written");
 
+        drop(runner);
         let mut config = RunnerConfig::new(&issue, workflow, FakeHarness::new());
         config.log = Box::new(MemoryLog::new());
         let mut resumed = Runner::resume(config).expect("resume");
@@ -3970,6 +4259,399 @@ kind = "question"
         assert!(
             !issue.join("questions/02.md").exists(),
             "no second question"
+        );
+    }
+
+    #[test]
+    fn a_no_without_an_answer_no_edge_blocks_instead_of_approving() {
+        // The default approval question has no edge. A `no` used to be recorded
+        // as `done`, which read a rejection as permission; the run now stops
+        // and says what the graph is missing.
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let workflow = workflow(
+            r#"
+schema = 3
+name = "implement"
+revision = 1
+
+[[step]]
+id = "approve-plan"
+kind = "question"
+"#,
+        );
+        let mut config = RunnerConfig::new(&issue, workflow.clone(), FakeHarness::new());
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::new(config).expect("runner");
+        assert_eq!(runner.run().expect("run"), RunStatus::Waiting);
+
+        let path = issue.join("questions/01.md");
+        let mut question = Document::read(&path).expect("question parses");
+        question.front.set("answer", "no");
+        question.front.set("state", "answered");
+        question.write_atomic(&path).expect("answer is written");
+
+        drop(runner);
+        let mut config = RunnerConfig::new(&issue, workflow, FakeHarness::new());
+        config.log = Box::new(MemoryLog::new());
+        let mut resumed = Runner::resume(config).expect("resume");
+        assert_eq!(resumed.run().expect("resumed run"), RunStatus::Blocked);
+
+        let document = run_md(&issue);
+        assert!(
+            !document.body.contains("| approve-plan | - | 1 | done |"),
+            "a no must not approve the plan: {}",
+            document.body
+        );
+        assert!(
+            document.body.contains("| approve-plan | - | 1 | blocked |"),
+            "{}",
+            document.body
+        );
+        let repair = fs::read_to_string(issue.join("repairs/01.md")).expect("repair written");
+        assert!(repair.contains("answer_no"), "{repair}");
+    }
+
+    #[test]
+    fn an_unrecognised_answer_does_not_stand_in_for_permission() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let workflow = workflow(
+            r#"
+schema = 3
+name = "implement"
+revision = 1
+
+[[step]]
+id = "approve-plan"
+kind = "question"
+"#,
+        );
+        fs::create_dir_all(issue.join("questions")).expect("questions folder");
+        fs::write(
+            issue.join("questions/01.md"),
+            r#"---
+kind: approve
+options: yes, no
+asked_by: approve-plan
+state: answered
+answer: maybe
+---
+
+# Question 01: approve-plan
+"#,
+        )
+        .expect("question");
+        fs::write(
+            issue.join("run.md"),
+            r#"---
+issue: demo
+workflow: implement
+revision: 1
+status: waiting
+started: 2026-11-23T10:00:00Z
+---
+
+# Run: implement
+
+## Log
+
+| Step | Task | Attempt | Outcome | At |
+| --- | --- | --- | --- | --- |
+| approve-plan | - | 1 | waiting | 2026-11-23T10:00:01Z |
+"#,
+        )
+        .expect("run.md");
+        let mut config = RunnerConfig::new(&issue, workflow, FakeHarness::new());
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::resume(config).expect("resume");
+        assert_eq!(runner.run().expect("run"), RunStatus::Blocked);
+        let repair = fs::read_to_string(issue.join("repairs/01.md")).expect("repair written");
+        assert!(repair.contains("neither yes"), "{repair}");
+    }
+
+    #[test]
+    fn a_gate_failure_writes_the_findings_the_target_reads() {
+        // A gate's tail used to be dropped when its edge sent the work back:
+        // `code` restarted with no idea which check had failed.
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let workflow = workflow(
+            r#"
+schema = 3
+name = "implement"
+revision = 1
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+
+[[step]]
+id = "test"
+kind = "gate"
+command = "echo boom >&2; exit 1"
+cwd = "."
+timeout_secs = 5
+depends_on = ["code"]
+edges = [{ to = "code", when = "gate_failed", max = 2 }]
+"#,
+        );
+        let mut harness = FakeHarness::new();
+        for _ in 0..3 {
+            harness.script(
+                "code",
+                Scripted::Done {
+                    files: Vec::new(),
+                    text: "coded".to_owned(),
+                },
+            );
+        }
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.workdir = dir.path().to_path_buf();
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Blocked);
+        let calls = runner.harness().calls();
+        assert_eq!(calls.len(), 3, "one code session per gate round");
+        assert!(
+            calls[1].prompt.contains("repairs/01.md"),
+            "the second code session is told where the gate's findings are: {}",
+            calls[1].prompt
+        );
+        let repair = fs::read_to_string(issue.join("repairs/01.md")).expect("repair written");
+        assert!(repair.contains("boom"), "{repair}");
+        assert!(
+            calls[2].prompt.contains("repairs/02.md"),
+            "each round names its own findings: {}",
+            calls[2].prompt
+        );
+    }
+
+    #[test]
+    fn a_retry_resets_the_edge_window() {
+        // The run blocked after spending its edge budget. A person's retry
+        // opens a new attempt window, and the edge rounds belong to it too:
+        // the first gate failure after the retry must be able to send the work
+        // back once more.
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let workflow = workflow(
+            r#"
+schema = 3
+name = "implement"
+revision = 1
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+
+[[step]]
+id = "test"
+kind = "gate"
+command = "false"
+cwd = "."
+timeout_secs = 5
+depends_on = ["code"]
+edges = [{ to = "code", when = "gate_failed", max = 1 }]
+"#,
+        );
+        fs::write(
+            issue.join("run.md"),
+            r#"---
+issue: demo
+workflow: implement
+revision: 1
+status: blocked
+started: 2026-11-23T10:00:00Z
+---
+
+# Run: implement
+
+## Log
+
+| Step | Task | Attempt | Outcome | At |
+| --- | --- | --- | --- | --- |
+| code | - | 1 | done | 2026-11-23T10:00:01Z |
+| test | - | 1 | failed | 2026-11-23T10:00:02Z |
+| test | - | 1 | sent-back:code:gate_failed | 2026-11-23T10:00:03Z |
+"#,
+        )
+        .expect("run.md");
+        let mut harness = FakeHarness::new();
+        harness.script(
+            "code",
+            Scripted::Done {
+                files: Vec::new(),
+                text: "coded".to_owned(),
+            },
+        );
+        harness.script(
+            "code",
+            Scripted::Done {
+                files: Vec::new(),
+                text: "coded again".to_owned(),
+            },
+        );
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.workdir = dir.path().to_path_buf();
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::resume(config).expect("resume");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Blocked);
+        let document = run_md(&issue);
+        assert_eq!(
+            document.body.matches("sent-back:code:gate_failed").count(),
+            2,
+            "the retry opened a new edge window: {}",
+            document.body
+        );
+    }
+
+    #[test]
+    fn two_runners_cannot_drive_the_same_issue() {
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let workflow = workflow(
+            r#"
+schema = 3
+name = "implement"
+revision = 1
+
+[[step]]
+id = "check"
+kind = "gate"
+command = "true"
+cwd = "."
+timeout_secs = 5
+"#,
+        );
+        let first = Runner::new(RunnerConfig::new(
+            &issue,
+            workflow.clone(),
+            FakeHarness::new(),
+        ))
+        .expect("first runner");
+        let second = Runner::new(RunnerConfig::new(
+            &issue,
+            workflow.clone(),
+            FakeHarness::new(),
+        ));
+        match second {
+            Err(crate::Error::Run(message)) => assert!(
+                message.contains("another warp-flow process"),
+                "the refusal names the other engine: {message}"
+            ),
+            Ok(_) => panic!("a second runner must be refused"),
+            Err(other) => panic!("the refusal must name the lock, got {other}"),
+        }
+        drop(first);
+        Runner::new(RunnerConfig::new(&issue, workflow, FakeHarness::new()))
+            .expect("the lock is released with the first runner");
+    }
+
+    #[test]
+    fn a_per_task_report_whose_task_file_vanished_blocks() {
+        // `Issue::open(...).ok()` used to turn a missing task into `None` and
+        // mark the per-task step graph-done, which opened every join above it.
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let task = issue.join("issues/01-first.md");
+        fs::write(&task, task_text(1, "First task", "ready-for-agent")).expect("task file");
+        let workflow = workflow(
+            r#"
+schema = 3
+name = "implement"
+revision = 1
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+per_task = true
+"#,
+        );
+
+        #[derive(Clone)]
+        struct VanishingHarness {
+            task: PathBuf,
+        }
+        impl Harness for VanishingHarness {
+            fn run(&mut self, _request: &StepRequest) -> Result<StepOutcome> {
+                fs::remove_file(&self.task).map_err(|error| crate::Error::io(&self.task, error))?;
+                Ok(StepOutcome::Done {
+                    wrote: Vec::new(),
+                    text: "the task file is gone".to_owned(),
+                })
+            }
+        }
+
+        let mut config =
+            RunnerConfig::new(&issue, workflow, VanishingHarness { task: task.clone() });
+        config.workdir = dir.path().to_path_buf();
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Blocked);
+        let document = run_md(&issue);
+        assert!(
+            !document.body.contains("| code | 01 | 1 | done |"),
+            "a report with no task must not finish the step: {}",
+            document.body
+        );
+        let repair = fs::read_to_string(issue.join("repairs/01.md")).expect("repair written");
+        assert!(repair.contains("task file"), "{repair}");
+        assert!(repair.contains("01"), "{repair}");
+    }
+
+    #[test]
+    fn a_merge_whose_checkout_is_on_another_branch_blocks_with_a_repair() {
+        // A git refusal used to propagate as a run error while `run.md` still
+        // said `running`; it is a failed attempt with a repair now.
+        let dir = TempDir::new();
+        let root = repository(&dir);
+        let issue = issue_in(&root);
+        let repo = Repo::open(&root).expect("repo opens");
+        let opened = Issue::open(&issue).expect("issue opens");
+        let worktree =
+            TaskWorktree::create(&repo, opened.task(1).expect("task 1")).expect("worktree created");
+        fs::write(worktree.path.join("feature.txt"), "done\n").expect("feature file");
+        run_git(&worktree.path, &["add", "feature.txt"]);
+        run_git(&worktree.path, &["commit", "--quiet", "-m", "task work"]);
+        run_git(&root, &["checkout", "-b", "somewhere-else"]);
+
+        let mut harness = FakeHarness::new();
+        harness.script(
+            "analyze",
+            Scripted::Done {
+                files: vec![(issue.join("spec.md"), "# Spec\n".to_owned())],
+                text: "analyzed".to_owned(),
+            },
+        );
+        harness.script(
+            "code",
+            Scripted::Done {
+                files: Vec::new(),
+                text: "coded".to_owned(),
+            },
+        );
+        let workflow = Workflow::parse(MERGE_WORKFLOW).expect("workflow parses");
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.workdir = root.clone();
+        config.repo = Some(repo);
+        config.max_attempts = 2;
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Blocked);
+        assert_eq!(run_md(&issue).front.get("status"), Some("blocked"));
+        let repair = fs::read_to_string(issue.join("repairs/01.md")).expect("repair written");
+        assert!(repair.contains("somewhere-else"), "{repair}");
+        assert!(
+            repair.contains("could not finish"),
+            "the merge's own words survive: {repair}"
         );
     }
 
@@ -4657,6 +5339,7 @@ skill = "code"
             .map(str::to_owned)
             .expect("the pause recorded a start time");
 
+        drop(runner);
         let mut resumed = two_gate_resume(&issue, Box::new(KeepGoing));
         assert_eq!(resumed.run().expect("resumed run"), RunStatus::Done);
 
@@ -5178,6 +5861,7 @@ depends_on = ["off"]
         assert_eq!(document.body.matches("| off |").count(), 1);
 
         // A resume replays `run.md`: the row is kept, and not written again.
+        drop(runner);
         let mut resumed =
             Runner::resume(RunnerConfig::new(&issue, graph, FakeHarness::new())).expect("resume");
         assert_eq!(resumed.run().expect("resumed run"), RunStatus::Done);
@@ -5306,6 +5990,7 @@ depends_on = ["ask"]
 
         // The question is open, not re-asked: a resume waits on the file it
         // already has.
+        drop(runner);
         let mut resumed =
             Runner::resume(RunnerConfig::new(&issue, graph, FakeHarness::new())).expect("resume");
         assert_eq!(resumed.run().expect("resumed run"), RunStatus::Waiting);
@@ -5804,6 +6489,7 @@ edges = [{ to = "analyze", when = "answer_no", max = 1 }]
         document.front.set("state", "answered");
         document.write_atomic(&question).expect("answer written");
 
+        drop(runner);
         let mut harness = FakeHarness::new();
         harness.script("analyze", done("planned again"));
         let mut config = RunnerConfig::new(&issue, workflow.clone(), harness);
@@ -5834,6 +6520,7 @@ edges = [{ to = "analyze", when = "answer_no", max = 1 }]
         document.front.set("answer", "yes");
         document.front.set("state", "answered");
         document.write_atomic(&second).expect("answer written");
+        drop(runner);
         let mut config = RunnerConfig::new(&issue, workflow.clone(), FakeHarness::new());
         config.log = Box::new(MemoryLog::new());
         let mut runner = Runner::resume(config).expect("runner");
@@ -5875,6 +6562,7 @@ edges = [{ to = "analyze", when = "answer_no", max = 1 }]
         document.front.set("state", "answered");
         document.write_atomic(&question).expect("answer written");
 
+        drop(runner);
         let mut config = RunnerConfig::new(&issue, workflow.clone(), FakeHarness::new());
         config.log = Box::new(MemoryLog::new());
         let mut runner = Runner::resume(config).expect("runner");
@@ -6119,6 +6807,7 @@ edges = [{ to = "analyze", when = "answer_no", max = 1 }]
         );
         let mut config = RunnerConfig::new(&issue, workflow, harness);
         config.log = Box::new(MemoryLog::new());
+        drop(runner);
         let mut resumed = Runner::resume(config).expect("resume");
         assert_eq!(resumed.run().expect("resumed run"), RunStatus::Blocked);
 

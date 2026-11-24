@@ -575,6 +575,14 @@ impl Host {
                 prepared.repo.root.display()
             ));
         }
+        // A fresh start rewrites `run.md` from row one. Doing that over an
+        // existing record would erase its attempts, its questions and the
+        // repairs a person is reading; the record says which verb applies.
+        if mode == DriveMode::Fresh && prepared.resume() {
+            return Err(format!(
+                "`{id}` already has a run record; resume it instead of starting over."
+            ));
+        }
         // The repository is free, so the run may start; a dirty tree outside
         // the engine's issue folders is the next refusal, and its message is
         // the engine's own.

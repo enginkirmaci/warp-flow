@@ -14,7 +14,7 @@
 
 use std::fmt;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -61,6 +61,13 @@ pub enum MergeOutcome {
         /// The conflicting paths, relative to the checkout's root.
         files: Vec<String>,
     },
+    /// `main` already carries the merge of this branch: the merge landed
+    /// before the run recorded it, so the queue reconciles the record instead
+    /// of merging the same branch twice.
+    AlreadyMerged {
+        /// The merge commit already on `main`.
+        commit: String,
+    },
     /// A gate failed after the rebase; `tail` is the gate's output tail (or
     /// why it timed out).
     GateFailed {
@@ -69,9 +76,12 @@ pub enum MergeOutcome {
         /// The failing gate's output tail.
         tail: String,
     },
-    /// The main checkout has uncommitted changes, so the queue refuses to
-    /// start.
-    DirtyMain,
+    /// The main checkout has uncommitted changes outside the engine's own
+    /// `.scratch/` area, so the queue refuses to start.
+    DirtyMain {
+        /// The dirty paths, relative to the checkout's root.
+        paths: Vec<String>,
+    },
     /// The task branch has no commits that `main` lacks, so the queue has
     /// nothing to merge.
     ///
@@ -110,7 +120,7 @@ pub fn merge(request: MergeRequest) -> Result<MergeOutcome> {
     } = request;
 
     // 1. A merge queue never merges on top of someone else's uncommitted work.
-    let status = git(&repo.root, &["status", "--porcelain"])?;
+    let status = git(&repo.root, &["status", "--porcelain", "-z"])?;
     if !status.ok {
         return Err(git_failure(
             "read the main checkout's status",
@@ -118,8 +128,9 @@ pub fn merge(request: MergeRequest) -> Result<MergeOutcome> {
             &status,
         ));
     }
-    if !status.stdout.trim().is_empty() {
-        return Ok(MergeOutcome::DirtyMain);
+    let dirty = dirty_outside_engine(&status.stdout);
+    if !dirty.is_empty() {
+        return Ok(MergeOutcome::DirtyMain { paths: dirty });
     }
 
     let head = git(&repo.root, &["symbolic-ref", "--short", "-q", "HEAD"])?;
@@ -154,6 +165,9 @@ pub fn merge(request: MergeRequest) -> Result<MergeOutcome> {
         ));
     }
     if ahead.stdout.trim() == "0" {
+        if let Some(commit) = landed_merge(&repo.root, &worktree.branch, &main)? {
+            return Ok(MergeOutcome::AlreadyMerged { commit });
+        }
         return Ok(MergeOutcome::NothingToDo);
     }
 
@@ -266,6 +280,109 @@ fn in_worktree(mut gate: Gate, worktree: &Path) -> Gate {
         gate.cwd = worktree.join(&gate.cwd);
     }
     gate
+}
+
+/// The dirty paths that are not the engine's own record under `.scratch/`.
+///
+/// The engine writes `run.md`, questions and repairs throughout a run, and
+/// commits that folder at its own points; a merge that refused those writes
+/// would refuse the record it is about to extend. Everything outside the
+/// engine's area still holds the queue to the dirty-tree rule.
+fn dirty_outside_engine(status: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut fields = status.split('\0').filter(|field| !field.is_empty());
+    while let Some(field) = fields.next() {
+        // `XY <path>`; a rename or copy carries the source as the next field.
+        if field.len() < 4 {
+            continue;
+        }
+        let (code, path) = field.split_at(3);
+        if code.starts_with('R') || code.starts_with('C') {
+            let _ = fields.next();
+        }
+        let path = Path::new(path);
+        if !crate::prepare::is_engine_path(path) {
+            paths.push(path.display().to_string());
+        }
+    }
+    paths
+}
+
+/// The merge commit on `main` whose second parent is `branch`'s tip, if one
+/// exists.
+///
+/// This is what tells a branch that already landed from one that never carried
+/// a commit: both are ancestors of `main`, but only a landed task has a merge
+/// commit naming its tip. The check makes the window between `git merge` and
+/// the `merged` row idempotent.
+fn landed_merge(dir: &Path, branch: &str, main: &str) -> Result<Option<String>> {
+    let tip = git(dir, &["rev-parse", "--verify", branch])?;
+    if !tip.ok {
+        return Err(git_failure(
+            format!("read the tip of `{branch}`"),
+            dir,
+            &tip,
+        ));
+    }
+    let tip = tip.stdout.trim();
+    if tip.is_empty() {
+        return Ok(None);
+    }
+    let merges = git(dir, &["rev-list", "--merges", "--parents", main])?;
+    if !merges.ok {
+        return Err(git_failure(
+            format!("list the merges on `{main}`"),
+            dir,
+            &merges,
+        ));
+    }
+    for line in merges.stdout.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(commit) = parts.next() else {
+            continue;
+        };
+        // The first parent is the mainline; the branch is the second (or a
+        // later parent of an octopus, which this engine never makes).
+        let _mainline = parts.next();
+        if parts.any(|parent| parent == tip) {
+            return Ok(Some(commit.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether the checkout has a rebase in progress under its git directory.
+pub(crate) fn rebase_in_progress(dir: &Path) -> bool {
+    for name in ["rebase-merge", "rebase-apply"] {
+        let Ok(run) = git(dir, &["rev-parse", "--git-path", name]) else {
+            return false;
+        };
+        if !run.ok {
+            continue;
+        }
+        let path = PathBuf::from(run.stdout.trim());
+        let path = if path.is_absolute() {
+            path
+        } else {
+            dir.join(path)
+        };
+        if path.exists() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Abort a rebase the conflict step left behind, best-effort.
+///
+/// A resolver that fails mid-rebase must not leave the next merge attempt
+/// measuring a checkout with unmerged paths; the skill tells the session to
+/// abort, but the engine cannot depend on a session finishing its cleanup.
+pub(crate) fn abort_rebase(dir: &Path) {
+    if !rebase_in_progress(dir) {
+        return;
+    }
+    let _ = git(dir, &["rebase", "--abort"]);
 }
 
 /// The paths git reports as unmerged, sorted and without duplicates.

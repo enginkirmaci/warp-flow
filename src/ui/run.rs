@@ -374,7 +374,12 @@ impl FlowApp {
     ) -> Option<AnyElement> {
         let phase = host.map(|host_run| host_run.phase);
         if let Some(question) = question {
-            return Some(self.render_question_card(run, question, question_doc, window, cx));
+            // A terminal run that still has an open question cannot act on the
+            // answer: its worker is gone. Drawing an answerable card would ask
+            // a person to decide something nothing is waiting for.
+            if !run.status.is_terminal() {
+                return Some(self.render_question_card(run, question, question_doc, window, cx));
+            }
         }
         if is_blocked(run, phase) {
             return Some(self.render_blocked_card(run, host));
@@ -641,7 +646,7 @@ impl FlowApp {
                      the repair file in the issue folder has the detail.",
                     step.id
                 );
-                if let Some(note) = &run.note {
+                if let Some(note) = &run.stop_reason {
                     why.push(' ');
                     why.push_str(note);
                 }
@@ -649,7 +654,7 @@ impl FlowApp {
             }
             None => {
                 let mut why = "The run stopped with no failing step in its record.".to_owned();
-                if let Some(note) = &run.note {
+                if let Some(note) = &run.stop_reason {
                     why.push(' ');
                     why.push_str(note);
                 }
