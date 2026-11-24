@@ -1,6 +1,6 @@
 # 02: Update the words that describe the New run form
 
-**Status:** ready-for-agent
+**Status:** resolved
 **Category:** enhancement
 **Blocked by:** None
 
