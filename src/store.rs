@@ -700,6 +700,12 @@ pub struct Session {
     pub updated: String,
     /// The transcript's text.
     pub text: String,
+    /// The file it was read from, so a screen can open exactly this session.
+    ///
+    /// Not on the wire: the door's document describes a session by its
+    /// fields, and only this window has the folder it came from.
+    #[serde(skip)]
+    pub path: PathBuf,
 }
 
 /// One repair record in `repairs/<NN>.md`, oldest first on the run.
@@ -724,6 +730,11 @@ pub struct Repair {
     pub at: String,
     /// The body after the heading: the engine's one-line reason.
     pub summary: String,
+    /// The file it was read from, for the screen that opens it.
+    ///
+    /// Not on the wire, as [`Session::path`].
+    #[serde(skip)]
+    pub path: PathBuf,
 }
 
 /// One configured repository.
@@ -1409,6 +1420,7 @@ fn read_sessions(dir: &Path, note: &mut Option<String>) -> Vec<Session> {
             status: document.front.get("status").unwrap_or("—").to_owned(),
             updated: document.front.get("updated").unwrap_or("").to_owned(),
             text: document.body.trim().to_owned(),
+            path: path.clone(),
         });
     }
     sessions.sort_by(|left, right| {
@@ -1472,6 +1484,7 @@ fn read_repairs(dir: &Path, note: &mut Option<String>) -> Vec<Repair> {
             outcome: document.front.get("outcome").unwrap_or("—").to_owned(),
             at: document.front.get("at").unwrap_or("").to_owned(),
             summary,
+            path: path.clone(),
         });
     }
     repairs.sort_by(|left, right| {

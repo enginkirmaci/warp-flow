@@ -101,7 +101,13 @@ rules that still matter move into `README.md` or this file.
   vocabulary, the `ScreenRun` a screen is handed, and the two rules they all
   follow: `edit_permission` (the engine owns the folder while it drives) and
   `write_artifact`/`write_atomic_raw` (the only writers). The Gates screen is
-  gone: a gate is a step, so `workflow.rs` edits it (ADR-0015). It draws the
+  gone: a gate is a step, so `workflow.rs` edits it (ADR-0015). The Artifacts
+  rail lists what the issue folder actually holds — the plan, the documents a
+  step wrote (`summary.md`, `review-NN.md`, …), the record, `sessions/` and
+  `repairs/` — never a hardcoded subset, because the file a warning names is
+  the one a person goes looking for. A control that names a document ("View
+  log", a session's "Read") opens it through `open_artifact`, not whichever tab
+  was showing. `workflow.rs` draws the
   graph through `graph.rs`: a layered node-link picture read top to bottom, with
   each back-edge looped on the right — not an indented tree.
 - Sections and tabs are state, not routes: `Section` (Runs, Repos, Settings)

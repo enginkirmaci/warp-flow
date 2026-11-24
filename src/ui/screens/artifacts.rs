@@ -1,6 +1,14 @@
 //! The artifacts tab: a run's documents, in the 240 file rail beside the
 //! document at the 760 reading measure.
 //!
+//! The rail is the folder's own listing, not a list of names this build knows:
+//! the plan (`spec.md`, `tasks.md`, `issues/`), the documents steps produced
+//! (`summary.md`, `review-NN.md`, anything else a step wrote), the engine's
+//! record (`run.md`), what each harness session said (`sessions/`) and why an
+//! attempt stopped (`repairs/`). A document a step wrote is exactly the one a
+//! person goes looking for after a warning, so a hardcoded subset is how it
+//! goes missing.
+//!
 //! The issue folder is the protocol (ADR-0009), so this screen is the one place
 //! a person reads what the engine wrote and, while the engine is not driving,
 //! edits it. Three rules keep it honest:
@@ -27,6 +35,7 @@ use gpui::{
     AnyElement, ClipboardItem, Context, Entity, FocusHandle, FontWeight, IntoElement, Render,
     ScrollHandle, SharedString, Window, div, px,
 };
+use warp_flow_core::artifact::Document;
 use warpui_kit_core::controls::{self, BtnKind};
 use warpui_kit_core::icon;
 use warpui_kit_core::motion;
@@ -88,6 +97,9 @@ pub struct ArtifactsScreen {
     /// What went wrong, in the engine's or the filesystem's words.
     error: Option<String>,
     loading: bool,
+    /// The document a control asked for, while the folder read that will hold
+    /// it is still in flight. Cleared once the tab is selected.
+    wanted: Option<PathBuf>,
     /// The document's scroll position.
     scroll: ScrollHandle,
     /// The file rail's own scroll position, kept across a poll.
@@ -109,6 +121,7 @@ impl ArtifactsScreen {
             status: None,
             error: None,
             loading: false,
+            wanted: None,
             scroll: ScrollHandle::new(),
             rail_scroll: ScrollHandle::new(),
             focus: cx.focus_handle(),
@@ -163,6 +176,34 @@ impl ArtifactsScreen {
         self.tabs = tabs_for(&read, self.run.as_ref());
         self.active = self.active.min(self.tabs.len().saturating_sub(1));
         self.shown = None;
+        self.select_wanted(cx);
+        cx.notify();
+    }
+
+    /// Open one document, once the folder read has a tab for it.
+    ///
+    /// A control that names a file asks for this instead of drawing a second
+    /// reader: the Artifacts tab is the one place a run's documents are read,
+    /// so "View log" and a session's "Read" land there.
+    pub fn reveal(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.wanted = Some(path);
+        self.select_wanted(cx);
+    }
+
+    /// Select the tab the reveal asked for, when it is here; otherwise keep
+    /// the request for the next [`Self::adopt`].
+    fn select_wanted(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.wanted.clone() else {
+            return;
+        };
+        let Some(index) = self.tabs.iter().position(|tab| tab.path == path) else {
+            return;
+        };
+        self.wanted = None;
+        self.active = index;
+        self.shown = None;
+        self.status = None;
+        self.error = None;
         cx.notify();
     }
 
@@ -381,7 +422,13 @@ impl ArtifactsScreen {
     fn render_rail_row(&self, index: usize, tab: &Tab, cx: &mut Context<Self>) -> AnyElement {
         let selected = index == self.active;
         let drafted = self.drafted(tab);
-        let name = file_name(&tab.path);
+        // A nested document keeps its folder, so `sessions/analyze.md` is not
+        // mistaken for a top-level `analyze.md` in the same rail.
+        let name = self
+            .run
+            .as_ref()
+            .map(|run| rail_name(run.issue(), &tab.path))
+            .unwrap_or_else(|| file_name(&tab.path));
         let description = tab.description.clone();
         let selector = format!("flow-artifact-tab-{index}");
         let a11y = format!("{}: {description}", tab.label);
@@ -468,7 +515,12 @@ impl ArtifactsScreen {
     fn render_doc_head(&self, run: &ScreenRun, tab: &Tab, cx: &mut Context<Self>) -> AnyElement {
         let name = file_name(&tab.path);
         let folder = folder_label(run);
-        let relative = format!("{folder}/{name}");
+        let under_issue = tab
+            .path
+            .strip_prefix(run.issue())
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| name.clone());
+        let relative = format!("{folder}/{under_issue}");
         let owner = if tab.editable {
             "the engine is the only writer while it drives"
         } else {
@@ -913,7 +965,54 @@ struct ReadFolder {
 /// background executor, never in a frame.
 fn read_folder(issue: &Path) -> ReadFolder {
     let mut read = ReadFolder::default();
-    let mut read_one = |path: PathBuf| match std::fs::read_to_string(&path) {
+    // The folder is the protocol, so the screen lists what is there: the
+    // person's plan, the documents steps wrote (`summary.md`, `review-NN.md`,
+    // …), the record, the graph and the harness's own files. A hardcoded
+    // list is how a review or a session goes missing.
+    match std::fs::read_dir(issue) {
+        Ok(entries) => {
+            for path in documents(entries, is_document) {
+                read_one(&mut read, path);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            read.error = Some(format!("{}: {error}", issue.display()));
+        }
+    }
+    for folder in ["issues", "questions", "sessions", "repairs"] {
+        let dir = issue.join(folder);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                read.error
+                    .get_or_insert_with(|| format!("{}: {error}", dir.display()));
+                continue;
+            }
+        };
+        for path in documents(entries, is_markdown) {
+            read_one(&mut read, path);
+        }
+    }
+    read
+}
+
+/// One folder's sorted files, keeping those `keep` accepts.
+fn documents(entries: std::fs::ReadDir, keep: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && keep(path))
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Read one document into the map; a file that cannot be read is the screen's
+/// one error line, not a failed folder.
+fn read_one(read: &mut ReadFolder, path: PathBuf) {
+    match std::fs::read_to_string(&path) {
         Ok(text) => {
             read.files.insert(path, text);
         }
@@ -922,51 +1021,68 @@ fn read_folder(issue: &Path) -> ReadFolder {
             read.error
                 .get_or_insert_with(|| format!("{}: {error}", path.display()));
         }
-    };
-    for name in ["spec.md", "tasks.md", "run.md"] {
-        read_one(issue.join(name));
     }
-    // the run's pinned revision lives beside its other artifacts
-    read_one(warp_flow_core::layout::pinned_workflow(issue));
-    for (dir, extension) in [("issues", "md"), ("questions", "md")] {
-        let folder = issue.join(dir);
-        let Ok(entries) = std::fs::read_dir(&folder) else {
-            continue;
-        };
-        let mut paths: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some(extension))
-            .collect();
-        paths.sort();
-        for path in paths {
-            read_one(path);
-        }
-    }
-    read
 }
 
-/// The files for what the folder holds, in §7's order: the person's documents
-/// first, then the engine's record and the graph.
+/// Whether a file is a document this screen reads.
+fn is_document(path: &Path) -> bool {
+    is_markdown(path) || path.extension().and_then(|ext| ext.to_str()) == Some("toml")
+}
+
+/// Whether a file is markdown.
+fn is_markdown(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("md")
+}
+
+/// The files for what the folder holds, in the run's own order: the person's
+/// plan, the documents the steps wrote, the engine's record, what the harness
+/// sessions said, why attempts stopped, the graph, and the questions.
 fn tabs_for(read: &ReadFolder, run: Option<&ScreenRun>) -> Vec<Tab> {
-    let mut tabs = Vec::new();
-    let issue = run.map(|run| run.issue().to_path_buf());
-    let tasks = run.map_or(0, |run| run.run.task_rows.len());
-    if let Some(issue) = &issue {
-        tabs.push(Tab {
-            path: issue.join("spec.md"),
-            label: "Spec".to_owned(),
-            description: "the ticket, as triaged".to_owned(),
-            editable: true,
-            lock_note: None,
-        });
-    }
-    for path in read.files.keys() {
-        match path.file_name().and_then(|name| name.to_str()) {
-            Some("tasks.md") => tabs.push(Tab {
+    let Some(run) = run else {
+        return Vec::new();
+    };
+    let issue = run.issue();
+    let mut plan = vec![Tab {
+        // a spec tab with no file yet is still the first tab: the first save
+        // creates it
+        path: issue.join("spec.md"),
+        label: "Spec".to_owned(),
+        description: "the ticket, as triaged".to_owned(),
+        editable: true,
+        lock_note: None,
+    }];
+    let mut produced = Vec::new();
+    let mut record = vec![Tab {
+        path: issue.join("run.md"),
+        label: "Run record".to_owned(),
+        description: "the engine's own record".to_owned(),
+        editable: false,
+        lock_note: Some(
+            "Read-only: `run.md` is the engine's record of what happened; this screen never writes it.",
+        ),
+    }];
+    let mut sessions = Vec::new();
+    let mut repairs = Vec::new();
+    let mut questions = Vec::new();
+
+    for (path, text) in &read.files {
+        let Ok(relative) = path.strip_prefix(issue) else {
+            continue;
+        };
+        let name = relative
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let folder = relative
+            .parent()
+            .map(|parent| parent.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match (name.as_str(), folder.as_str()) {
+            ("spec.md", "") | ("run.md", "") => {}
+            ("tasks.md", "") => plan.push(Tab {
                 path: path.clone(),
                 label: "Tasks".to_owned(),
-                description: match tasks {
+                description: match run.run.task_rows.len() {
                     0 => "the task list, in order".to_owned(),
                     1 => "1 task, in order".to_owned(),
                     other => format!("{other} tasks, in order"),
@@ -974,59 +1090,137 @@ fn tabs_for(read: &ReadFolder, run: Option<&ScreenRun>) -> Vec<Tab> {
                 editable: true,
                 lock_note: None,
             }),
-            Some(name) if path.parent().is_some_and(|dir| dir.ends_with("issues")) => {
-                let number = name.split('-').next().unwrap_or(name);
-                tabs.push(Tab {
-                    path: path.clone(),
-                    label: format!("Task {number}"),
-                    description: "the task, as split".to_owned(),
-                    editable: true,
-                    lock_note: None,
-                });
-            }
-            _ => {}
-        }
-    }
-    if let Some(issue) = &issue {
-        tabs.push(Tab {
-            path: issue.join("run.md"),
-            label: "Run record".to_owned(),
-            description: "the engine's own record".to_owned(),
-            editable: false,
-            lock_note: Some(
-                "Read-only: `run.md` is the engine's record of what happened; this screen never writes it.",
-            ),
-        });
-        tabs.push(Tab {
-            path: warp_flow_core::layout::pinned_workflow(issue),
-            label: "Workflow file".to_owned(),
-            description: "the revision this run reads".to_owned(),
-            editable: false,
-            lock_note: Some(
-                "Read-only here: `.flow/workflow.toml` is edited in Repos › Workflow, which appends the next revision on save.",
-            ),
-        });
-    }
-    for path in read.files.keys() {
-        if path.parent().is_some_and(|dir| dir.ends_with("questions")) {
-            let number = path
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            tabs.push(Tab {
+            ("workflow.toml", "") => {}
+            (_, "issues") => plan.push(Tab {
                 path: path.clone(),
-                label: format!("Q{number}"),
+                label: format!("Task {}", name.split('-').next().unwrap_or(&name)),
+                description: "the task, as split".to_owned(),
+                editable: true,
+                lock_note: None,
+            }),
+            (_, "questions") => questions.push(Tab {
+                path: path.clone(),
+                label: format!("Q{}", file_stem(path)),
                 description: "the open question".to_owned(),
                 editable: false,
                 lock_note: Some(
                     "Read-only: a question is answered on the Run tab, which writes the answer the engine reads.",
                 ),
-            });
+            }),
+            (_, "sessions") => sessions.push(session_tab(path, text)),
+            (_, "repairs") => repairs.push(repair_tab(path, text)),
+            (_, "") => produced.push(produced_tab(path)),
+            _ => {}
         }
     }
-    // a spec tab with no file yet is still the first tab: the first save
-    // creates it
+
+    let mut tabs = plan;
+    tabs.append(&mut produced);
+    tabs.append(&mut record);
+    tabs.append(&mut sessions);
+    tabs.append(&mut repairs);
+    tabs.push(Tab {
+        path: warp_flow_core::layout::pinned_workflow(issue),
+        label: "Workflow file".to_owned(),
+        description: "the revision this run reads".to_owned(),
+        editable: false,
+        lock_note: Some(
+            "Read-only here: `.flow/workflow.toml` is edited in Repos › Workflow, which appends the next revision on save.",
+        ),
+    });
+    tabs.append(&mut questions);
     tabs
+}
+
+/// One top-level document a step wrote: `summary.md`, `review-01.md`, or a
+/// name this build has not heard of yet.
+fn produced_tab(path: &Path) -> Tab {
+    let stem = file_stem(path);
+    let (label, description) = match stem.strip_prefix("review-") {
+        Some(number) if !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()) => (
+            format!("Review {number}"),
+            format!("task {number}'s review"),
+        ),
+        _ if stem == "summary" => (
+            "Summary".to_owned(),
+            "what the run did, in the harness's words".to_owned(),
+        ),
+        _ => (
+            title_word(&stem.replace('-', " ")),
+            "a document a step wrote".to_owned(),
+        ),
+    };
+    Tab {
+        path: path.to_path_buf(),
+        label,
+        description,
+        editable: false,
+        lock_note: Some("Read-only: a step wrote this file; it is the run's output, not a draft."),
+    }
+}
+
+/// One harness session's own record, named by the step and task it ran for.
+fn session_tab(path: &Path, text: &str) -> Tab {
+    let document = Document::parse(text).ok();
+    let field = |key: &str| document.as_ref().and_then(|doc| doc.front.get(key));
+    let step = field("step")
+        .map(str::to_owned)
+        .unwrap_or_else(|| title_word(&file_stem(path).replace('-', " ")));
+    let task = field("task");
+    let label = match task {
+        Some(task) => format!("Session {step} · task {task}"),
+        None => format!("Session {step}"),
+    };
+    let description = match (field("attempt"), field("status")) {
+        (Some(attempt), Some(status)) => format!("attempt {attempt} · {status}"),
+        (_, Some(status)) => status.to_owned(),
+        _ => "the harness's account of this step".to_owned(),
+    };
+    Tab {
+        path: path.to_path_buf(),
+        label,
+        description,
+        editable: false,
+        lock_note: Some(
+            "Read-only: what the harness said in this step; the engine writes it when the session settles.",
+        ),
+    }
+}
+
+/// One repair record, named by the attempt it belongs to.
+fn repair_tab(path: &Path, text: &str) -> Tab {
+    let document = Document::parse(text).ok();
+    let field = |key: &str| document.as_ref().and_then(|doc| doc.front.get(key));
+    let step = field("step").unwrap_or("—");
+    let description = match (field("attempt"), field("outcome")) {
+        (Some(attempt), Some(outcome)) => format!("{step} attempt {attempt} · {outcome}"),
+        (_, Some(outcome)) => format!("{step} · {outcome}"),
+        _ => "why this attempt stopped".to_owned(),
+    };
+    Tab {
+        path: path.to_path_buf(),
+        label: format!("Repair {}", file_stem(path)),
+        description,
+        editable: false,
+        lock_note: Some("Read-only: the engine's record of why this attempt stopped."),
+    }
+}
+
+/// A file's stem, as a string.
+fn file_stem(path: &Path) -> String {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// A word at the start of a sentence: `review 01` stays as it is, `summary`
+/// becomes `Summary`.
+fn title_word(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 /// The folder as the rail's head names it: `.scratch/<run-id>`.
@@ -1054,9 +1248,13 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// Whether a file renders as markdown.
-fn is_markdown(path: &Path) -> bool {
-    path.extension().and_then(|ext| ext.to_str()) == Some("md")
+/// The name the rail shows: the file, with its folder when it has one under
+/// the issue folder.
+fn rail_name(issue: &Path, path: &Path) -> String {
+    match path.strip_prefix(issue) {
+        Ok(relative) if relative.components().count() > 1 => relative.display().to_string(),
+        _ => file_name(path),
+    }
 }
 
 /// The clock, for the save line: `14:03`.

@@ -29,7 +29,7 @@ use crate::store::{
 };
 use crate::theme;
 use crate::ui::actions::{self, Flag, Primary};
-use crate::ui::window::{FlowApp, RunTab, attempt_word, ensure_document, tag};
+use crate::ui::window::{FlowApp, attempt_word, ensure_document, tag};
 
 /// The per-run state the Run tab prepares before it draws: the folder the
 /// host's verbs take, the key the document slot compares, and the open
@@ -320,7 +320,7 @@ impl FlowApp {
         if let Some(log) = self.render_engine_log(run, host.as_ref()) {
             column = column.child(log);
         }
-        column = column.child(self.render_sessions_card(run));
+        column = column.child(self.render_sessions_card(run, cx));
 
         let body = div()
             .id("flow-run-scroll")
@@ -395,7 +395,7 @@ impl FlowApp {
             }
         }
         if is_blocked(run, phase) {
-            return Some(self.render_blocked_card(run, host));
+            return Some(self.render_blocked_card(run, host, cx));
         }
         if is_paused(run, phase) {
             return Some(paused_note(host));
@@ -697,7 +697,12 @@ impl FlowApp {
     /// The blocked card: the failing step, why it stopped, the last failing
     /// line and the budget the retry spends. Its controls are the head's
     /// primary (a gate's Retry gate, a harness step's Retry step) and Abandon.
-    fn render_blocked_card(&self, run: &Run, host: Option<&RunSnapshot>) -> AnyElement {
+    fn render_blocked_card(
+        &self,
+        run: &Run,
+        host: Option<&RunSnapshot>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let failed = actions::failed_step(run);
         let head_right = failed.map(step_label).unwrap_or_else(|| run.key.id.clone());
         let headline = match failed {
@@ -813,6 +818,31 @@ impl FlowApp {
                     .line_height(relative(1.6))
                     .text_color(theme::text_dim())
                     .child(line),
+            );
+        }
+        // The card promises the repair file has the detail; this is the way
+        // there, so a failure's warning is read instead of taken on trust.
+        if let Some(repair) = failure_repair(run, failed) {
+            let path = repair.path.clone();
+            let name = repair
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| repair.path.display().to_string());
+            card = card.child(
+                div()
+                    .id("flow-run-blocked-repair")
+                    .debug_selector(|| "flow-run-blocked-repair".into())
+                    .mt(px(8.))
+                    .cursor_pointer()
+                    .a11y_button("Read the repair")
+                    .text_size(px(theme::font_control()))
+                    .text_color(theme::accent_ink())
+                    .hover(|style| style.text_color(theme::text()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_artifact(path.clone(), window, cx);
+                    }))
+                    .child(format!("Read repairs/{name}")),
             );
         }
 
@@ -1127,6 +1157,17 @@ impl FlowApp {
         let chip_selector = format!("flow-run-attempt-chip-{group_index}-{row_index}");
         let attempt = row.attempt.parse::<u32>().unwrap_or(0);
         let budget = attempt.max(DEFAULT_MAX_ATTEMPTS).max(1);
+        // A failed attempt's detail is its repair, not the record's one line;
+        // "View log" opens the file that actually explains the stop.
+        let repair = attempt_repair(run, group, row);
+        let record = repair
+            .map(|repair| repair.path.clone())
+            .unwrap_or_else(|| run.dir.join("run.md"));
+        let view_log_tip = if repair.is_some() {
+            "Open the repair record"
+        } else {
+            "Open the run record"
+        };
         let chip = group
             .task
             .parse::<u32>()
@@ -1171,10 +1212,10 @@ impl FlowApp {
             .text_size(px(theme::font_control()))
             .text_color(theme::accent_ink())
             .hover(|style| style.text_color(theme::text()))
-            .tooltip(tooltip_text("Open the run record"))
+            .tooltip(tooltip_text(view_log_tip))
             .a11y_button("View log")
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.open_run_tab(RunTab::Artifacts, window, cx);
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_artifact(record.clone(), window, cx);
             }))
             .child("View log");
 
@@ -1298,7 +1339,7 @@ impl FlowApp {
     /// What the harness sessions said, the newest last. Each is one markdown
     /// file the harness wrote into `sessions/`, shown with the step it belongs
     /// to, in the order it settled.
-    fn render_sessions_card(&self, run: &Run) -> AnyElement {
+    fn render_sessions_card(&self, run: &Run, cx: &mut Context<Self>) -> AnyElement {
         let mut card = card()
             .id("flow-run-sessions-card")
             .debug_selector(|| "flow-run-sessions".into())
@@ -1378,18 +1419,46 @@ impl FlowApp {
                             .into_any_element()
                         })
                         .child(session.status.clone()),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("{selector}-read")))
+                        .debug_selector({
+                            let selector = format!("{selector}-read");
+                            move || selector.clone()
+                        })
+                        .flex_shrink_0()
+                        .cursor_pointer()
+                        .a11y_button("Read the session record")
+                        .text_size(px(theme::font_control()))
+                        .text_color(theme::accent_ink())
+                        .hover(|style| style.text_color(theme::text()))
+                        .tooltip(tooltip_text("Open the session in Artifacts"))
+                        .on_click(cx.listener({
+                            let path = session.path.clone();
+                            move |this, _, window, cx| {
+                                this.open_artifact(path.clone(), window, cx);
+                            }
+                        }))
+                        .child("Read"),
                 );
 
             // The transcript's tail: a session can be long, and the run tab is
-            // a page of cards, not one document.
+            // a page of cards, not one document. A session that failed speaks
+            // from its head — the reason is the opening line, not the tail.
             let lines: Vec<&str> = session.text.lines().collect();
-            let shown: Vec<&str> = lines
-                .iter()
-                .rev()
-                .take(SESSION_LINES)
-                .rev()
-                .copied()
-                .collect();
+            let failed = matches!(session.status.as_str(), "failed" | "timed-out");
+            let shown: Vec<&str> = if failed {
+                lines.iter().take(SESSION_LINES).copied().collect()
+            } else {
+                lines
+                    .iter()
+                    .rev()
+                    .take(SESSION_LINES)
+                    .rev()
+                    .copied()
+                    .collect()
+            };
             let mut text = div()
                 .id(SharedString::from(format!("{selector}-text")))
                 .debug_selector({
@@ -1412,11 +1481,11 @@ impl FlowApp {
                 .line_height(relative(1.6))
                 .text_color(theme::text_dim());
             if lines.len() > shown.len() {
-                text = text.child(
-                    div()
-                        .text_color(theme::text_muted())
-                        .child(format!("… {} earlier lines", lines.len() - shown.len())),
-                );
+                text = text.child(div().text_color(theme::text_muted()).child(format!(
+                    "… {} {} lines",
+                    lines.len() - shown.len(),
+                    if failed { "later" } else { "earlier" }
+                )));
             }
             for line in shown {
                 text = text.child(div().child(line.to_owned()));
@@ -2643,20 +2712,14 @@ fn paused_note(host: Option<&RunSnapshot>) -> AnyElement {
 /// step stopped, and the only one that survives the app restarting — the card
 /// promises the repair file has the detail, so it must read it.
 fn failure_line(run: &Run, failed: Option<&StepView>) -> Option<String> {
-    let step = failed.map(|step| step.id.as_str());
-    let repair = run
-        .repairs
-        .iter()
-        .rev()
-        .find(|repair| step.is_none_or(|id| repair.step == id))
-        .and_then(|repair| {
-            repair
-                .summary
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-                .map(|reason| format!("{} attempt {}: {reason}", repair.step, repair.attempt))
-        });
+    let repair = failure_repair(run, failed).and_then(|repair| {
+        repair
+            .summary
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|reason| format!("{} attempt {}: {reason}", repair.step, repair.attempt))
+    });
     if repair.is_some() {
         return repair;
     }
@@ -2686,6 +2749,24 @@ fn failure_line(run: &Run, failed: Option<&StepView>) -> Option<String> {
                 row.step, row.task, row.attempt, row.outcome, row.at
             )
         })
+}
+
+/// The newest repair for `failed`, or the newest repair at all when the run
+/// has no failing step: the card and its link must quote the same record.
+fn failure_repair<'a>(run: &'a Run, failed: Option<&StepView>) -> Option<&'a store::Repair> {
+    let step = failed.map(|step| step.id.as_str());
+    run.repairs
+        .iter()
+        .rev()
+        .find(|repair| step.is_none_or(|id| repair.step == id))
+}
+
+/// The repair an attempt row's own attempt wrote, when it wrote one.
+fn attempt_repair<'a>(run: &'a Run, group: &LogGroup, row: &RunRow) -> Option<&'a store::Repair> {
+    let task = (group.task != "-").then_some(group.task.as_str());
+    run.repairs.iter().rev().find(|repair| {
+        repair.step == row.step && repair.attempt == row.attempt && repair.task.as_deref() == task
+    })
 }
 
 /// The door writes this line into a session that left no text. It is a
@@ -3010,6 +3091,7 @@ mod tests {
             outcome: "blocked".to_owned(),
             at: format!("2026-11-22T10:3{attempt}:22Z"),
             summary: summary.to_owned(),
+            path: PathBuf::from(format!("repairs/{attempt:02}.md")),
         }
     }
 
@@ -3023,6 +3105,7 @@ mod tests {
             status: "timed-out".to_owned(),
             updated: "2026-11-22T10:33:22Z".to_owned(),
             text: text.to_owned(),
+            path: PathBuf::from("sessions/analyze.md"),
         }
     }
 
@@ -3049,6 +3132,44 @@ mod tests {
         assert!(
             !line.contains("reported no text"),
             "the session's placeholder is never a reason: {line}"
+        );
+    }
+
+    #[test]
+    fn an_attempt_row_names_the_repair_its_own_attempt_wrote() {
+        let mut run = run();
+        run.repairs = vec![
+            Repair {
+                task: Some("01".to_owned()),
+                path: PathBuf::from("repairs/01.md"),
+                ..repair("code", 1, "the test gate failed")
+            },
+            Repair {
+                task: Some("02".to_owned()),
+                path: PathBuf::from("repairs/02.md"),
+                ..repair("code", 1, "the fmt gate failed")
+            },
+        ];
+        let group = LogGroup {
+            step: "code".to_owned(),
+            task: "01".to_owned(),
+            rows: Vec::new(),
+        };
+        let mut row = RunRow {
+            step: "code".to_owned(),
+            task: "01".to_owned(),
+            attempt: "1".to_owned(),
+            outcome: "blocked".to_owned(),
+            at: "2026-11-22T10:31:22Z".to_owned(),
+        };
+
+        let found = attempt_repair(&run, &group, &row).expect("the attempt has a repair");
+        assert_eq!(found.path, PathBuf::from("repairs/01.md"));
+
+        row.attempt = "2".to_owned();
+        assert!(
+            attempt_repair(&run, &group, &row).is_none(),
+            "an attempt with no repair is not another attempt's"
         );
     }
 

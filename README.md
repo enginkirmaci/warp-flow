@@ -73,7 +73,7 @@ four tabs in the run's head:
 | Screen | What it is |
 | --- | --- |
 | Run | the workflow as a matrix — steps down, tasks across, one cell per crossing — the task chips, the question, the attempt history, the engine's log and the harness sessions each step recorded |
-| Artifacts | the issue folder's documents, edited in place and saved atomically |
+| Artifacts | the issue folder's documents: the plan and its edits, the documents steps wrote (`summary.md`, `review-NN.md`), the record, the sessions and the repairs, read in place and saved atomically where a person owns the file |
 | Task & diff | the task's branch, its files and diff while the run holds them, and the run's gates with the outcome each last produced |
 | Workflow | the revision the run uses, read-only: the template is edited in Repos › Workflow |
 

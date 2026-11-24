@@ -269,6 +269,11 @@ fn the_run_screen_shows_the_harness_sessions_newest_last(cx: &mut TestAppContext
     // a session per step, in the order they settled: analyze first, code last
     assert!(cx.debug_bounds("flow-run-session-0").is_some());
     assert!(cx.debug_bounds("flow-run-session-1").is_some());
+    // every session can be read whole, in the tab that lists the folder
+    assert!(
+        cx.debug_bounds("flow-run-session-0-read").is_some(),
+        "the session card offers its record"
+    );
     let sessions = {
         let snapshot = warp_flow::store::scan(std::slice::from_ref(&repo));
         snapshot

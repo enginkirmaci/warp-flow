@@ -41,6 +41,8 @@ fn seed_repo(home: &Path) -> (PathBuf, PathBuf) {
     let issue = repo.join(".scratch/demo");
     std::fs::create_dir_all(issue.join("issues")).expect("issue folder");
     std::fs::create_dir_all(issue.join("questions")).expect("questions folder");
+    std::fs::create_dir_all(issue.join("sessions")).expect("sessions folder");
+    std::fs::create_dir_all(issue.join("repairs")).expect("repairs folder");
     std::fs::write(
         issue.join("spec.md"),
         "---\nstatus: ready-for-agent\n---\n\n# A demoted title\n\nThe body a person edits.\n",
@@ -68,6 +70,32 @@ fn seed_repo(home: &Path) -> (PathBuf, PathBuf) {
         "---\nkind: approve\nstate: open\n---\n\n# Question 01: may I?\n",
     )
     .expect("question file");
+    // What the steps wrote: a review with a verdict, the run's summary, a
+    // session's account with a warning, and the repair that explains a stop.
+    std::fs::write(
+        issue.join("review-01.md"),
+        "---\nverdict: changes\n---\n\n# Review\n\nThe branch leaves the retry unguarded.\n",
+    )
+    .expect("review file");
+    std::fs::write(
+        issue.join("summary.md"),
+        "# Summary: demo\n\nThe run landed one task.\n",
+    )
+    .expect("summary");
+    std::fs::write(
+        issue.join("sessions/analyze.md"),
+        "---\nsession: session-1\nharness: dsh\nstep: analyze\nattempt: 1\nstatus: done\n\
+         updated: 2026-11-22T10:00:00Z\n---\n# Session: analyze\n\n\
+         **Warning:** the working tree outside `.scratch/` is dirty.\n",
+    )
+    .expect("session file");
+    std::fs::write(
+        issue.join("repairs/01.md"),
+        "---\nstep: analyze\nattempt: 1\nof: 3\noutcome: blocked\n\
+         at: 2026-11-22T10:01:00Z\n---\n# Repair 01: analyze (attempt 1 of 3)\n\n\
+         the harness reported an error: rate limited\n",
+    )
+    .expect("repair file");
     for args in [
         vec!["init", "--initial-branch=main", "--quiet"],
         vec!["config", "user.email", "probe@example.com"],
@@ -159,11 +187,22 @@ fn the_artifacts_tabs_load_and_save(cx: &mut TestAppContext) {
         .expect("the window is open");
     assert_eq!(
         tabs,
-        vec!["Spec", "Task 01", "Run record", "Workflow file", "Q01"],
-        "the strip lists the spec, the task, the record, the graph and the question"
+        vec![
+            "Spec",
+            "Task 01",
+            "Review 01",
+            "Summary",
+            "Run record",
+            "Session analyze",
+            "Repair 01",
+            "Workflow file",
+            "Q01",
+        ],
+        "the strip lists the plan, what the steps wrote, the record, the session, the repair, \
+         the graph and the question"
     );
     assert!(cx.debug_bounds("flow-artifact-tab-0").is_some());
-    assert!(cx.debug_bounds("flow-artifact-tab-4").is_some());
+    assert!(cx.debug_bounds("flow-artifact-tab-8").is_some());
 
     // the spec's text is in the editor, front matter and all
     let spec_path = issue.join("spec.md");
@@ -208,9 +247,54 @@ fn the_artifacts_tabs_load_and_save(cx: &mut TestAppContext) {
     );
 
     // a read-only tab says why it is read-only
-    click(cx, "flow-artifact-tab-2");
+    click(cx, "flow-artifact-tab-4");
     assert!(cx.debug_bounds("flow-artifacts-lock").is_some());
     assert!(cx.debug_bounds("flow-artifacts-save").is_none());
+
+    // a document a step wrote is readable too, and never a draft
+    click(cx, "flow-artifact-tab-2");
+    let review = handle
+        .read_with(cx, |host, cx| host.0.read(cx).editor_for_probe())
+        .expect("the window is open")
+        .expect("the review has an editor");
+    let text = review.read_with(cx, |state, _| state.value().to_string());
+    assert!(
+        text.contains("unguarded") && text.contains("verdict: changes"),
+        "the review's findings are on screen: {text:?}"
+    );
+    assert!(
+        cx.debug_bounds("flow-artifacts-save").is_none(),
+        "a produced document is not a draft"
+    );
+
+    // the harness's own files are readable documents, not hidden ones
+    click(cx, "flow-artifact-tab-5");
+    let session = handle
+        .read_with(cx, |host, cx| host.0.read(cx).editor_for_probe())
+        .expect("the window is open")
+        .expect("the session has an editor");
+    let text = session.read_with(cx, |state, _| state.value().to_string());
+    assert!(
+        text.contains("Warning:") && text.contains("dirty"),
+        "the session's warning is on screen: {text:?}"
+    );
+
+    // a control that names a file lands on that file, not on the first tab
+    handle
+        .update(cx, |host, _, cx| {
+            host.0.update(cx, |screen, cx| {
+                screen.reveal(issue.join("repairs/01.md"), cx);
+            });
+        })
+        .expect("the window is open");
+    settle(cx);
+    assert_eq!(
+        handle
+            .read_with(cx, |host, cx| host.0.read(cx).active_tab_for_probe())
+            .expect("the window is open"),
+        Some("Repair 01".to_owned()),
+        "the reveal opens the repair the failed attempt names"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }

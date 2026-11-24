@@ -133,6 +133,15 @@ impl Screens {
         self.artifacts.clone()
     }
 
+    /// Open one document in the artifacts screen.
+    ///
+    /// The window asks for this when a control names a file; the screen keeps
+    /// the request until its folder read has the tab, so an in-flight load
+    /// does not drop it.
+    pub fn reveal_artifact(&mut self, path: PathBuf, cx: &mut App) {
+        self.artifacts.update(cx, |view, cx| view.reveal(path, cx));
+    }
+
     /// Point `screen` — the repository's editor — at `repo`.
     ///
     /// The repository detail is a window a person edits, so it never needs a

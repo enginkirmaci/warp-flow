@@ -793,6 +793,22 @@ impl FlowApp {
         self.open_screen(Some(tab.screen()), window, cx);
     }
 
+    /// Open one document of the run's issue folder in the Artifacts tab.
+    ///
+    /// A control that names a file — an attempt's "View log", a session's
+    /// "Read" — lands on that file, not on whichever tab the screen last
+    /// showed. The screen selects it once its folder read has the tab; a read
+    /// that is still in flight keeps the request until it lands.
+    pub(crate) fn open_artifact(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_run_tab(RunTab::Artifacts, window, cx);
+        self.screens.reveal_artifact(path, cx);
+    }
+
     /// Fold the list pane away, or bring it back: the title bar's toggle and
     /// `Ctrl+\`.
     ///
