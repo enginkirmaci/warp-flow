@@ -101,13 +101,13 @@ A step can also send the work back: `edges` is a list of back-edges, each
 naming the step the work returns to (`to`), what makes it return (`when`) and
 how many rounds it may take (`max`). The trigger is a word the engine reads from
 a file or an exit code — `verdict_changes` from a harness step's artifact,
-`gate_failed` from a gate's exit code, `answer_no` from a question's answer,
-`blocked` from a step that could not finish — so the tests failing can send the
-work back to the code, and a rejected plan can send it back to the analysis
-(ADR-0023). The graph stays acyclic: the engine un-completes the steps between
-the target and the sender and lets the ordinary readiness walk go forward
-again. A budget spent with no round clearing it fails the step and stops the
-run, unless the edge says `on_exhausted = "continue"`.
+`gate_failed` / `gate_passed` from a gate's exit code, `answer_no` from a
+question's answer, `blocked` from a harness step that could not finish — so the
+tests failing can send the work back to the code, and a rejected plan can send
+it back to the analysis (ADR-0023). The graph stays acyclic: the engine
+un-completes the steps between the target and the sender and lets the ordinary
+readiness walk go forward again. A budget spent with no round clearing it fails
+the step and stops the run, unless the edge says `on_exhausted = "continue"`.
 
 A merge step can name the step that resolves its conflict: `on_conflict` runs
 that step in the task's worktree when the rebase conflicts, and the merge

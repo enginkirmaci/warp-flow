@@ -185,7 +185,11 @@ pub enum Trigger {
     AnswerNo,
     /// The question this step asked was answered with `yes`.
     AnswerYes,
-    /// The step reported `blocked` — its own session could not finish.
+    /// The harness step reported `blocked` — its own session could not finish.
+    ///
+    /// A gate has no session to block: its `Blocked` report is an exit code,
+    /// which is `gate_failed`. Validation refuses the trigger on a gate so a
+    /// graph cannot name an edge that never fires.
     Blocked,
 }
 
@@ -217,15 +221,17 @@ impl Trigger {
     /// Whether a step of `kind` can raise this trigger at all.
     ///
     /// A gate cannot write an artifact, so it can never raise a verdict; a
-    /// harness step has no exit code, so it can never raise `gate_failed`. The
-    /// check exists so a graph that names an impossible trigger is refused
-    /// before the run starts rather than silently never firing.
+    /// harness step has no exit code, so it can never raise `gate_failed`. A
+    /// gate's failed command is its exit code, so it cannot raise `blocked`
+    /// either: only a harness session reports that. The check exists so a
+    /// graph that names an impossible trigger is refused before the run starts
+    /// rather than silently never firing.
     pub fn fits(self, kind: StepKind) -> bool {
         match self {
             Self::VerdictChanges | Self::VerdictReady => kind == StepKind::Harness,
             Self::GateFailed | Self::GatePassed => kind == StepKind::Gate,
             Self::AnswerNo | Self::AnswerYes => kind == StepKind::Question,
-            Self::Blocked => matches!(kind, StepKind::Harness | StepKind::Gate),
+            Self::Blocked => kind == StepKind::Harness,
         }
     }
 }
@@ -1236,7 +1242,7 @@ fn trigger_owner(trigger: Trigger) -> &'static str {
         Trigger::VerdictChanges | Trigger::VerdictReady => "harness",
         Trigger::GateFailed | Trigger::GatePassed => "gate",
         Trigger::AnswerNo | Trigger::AnswerYes => "question",
-        Trigger::Blocked => "harness or gate",
+        Trigger::Blocked => "harness",
     }
 }
 
@@ -2076,6 +2082,34 @@ depends-on = ["b"]
         assert_eq!(
             graph.edge_span("test", "code"),
             vec!["code".to_owned(), "test".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_gate_may_loop_on_a_pass_but_not_on_blocked() {
+        // `gate_passed` is the other half of the exit code: a gate that goes
+        // green can send the work on to another round. `blocked` is a
+        // session's word, not an exit code, so a gate cannot raise it.
+        let mut code = step("code", StepKind::Harness, &[]);
+        code.produces = Some("code.md".to_owned());
+        let mut test = step("test", StepKind::Gate, &["code"]);
+        test.edges = vec![edge("code", Trigger::GatePassed, Some(1))];
+        workflow(vec![code.clone(), test])
+            .validate()
+            .expect("a gate may loop on a pass");
+
+        let mut test = step("test", StepKind::Gate, &["code"]);
+        test.edges = vec![edge("code", Trigger::Blocked, None)];
+        let error = workflow(vec![code, test])
+            .validate()
+            .expect_err("a gate cannot report blocked");
+        assert!(
+            error.to_string().contains("can never raise `blocked`"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("belongs to a harness step"),
+            "{error}"
         );
     }
 

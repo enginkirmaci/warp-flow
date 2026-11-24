@@ -61,6 +61,28 @@ fn the_repositorys_own_template_has_a_loop_it_can_survive() {
 }
 
 #[test]
+fn the_repositorys_own_template_takes_a_rejection_back_to_the_plan() {
+    // A rejected plan used to park the run: the question had no `answer_no`
+    // edge and the engine refused to read `no` as permission. The template now
+    // says where the rejected plan goes, and that step is the one that wrote
+    // it.
+    let graph = template();
+    let approve = graph
+        .step("approve-plan")
+        .expect("approve-plan is in the template");
+    let edge = approve
+        .edges
+        .iter()
+        .find(|edge| edge.when == Trigger::AnswerNo)
+        .expect("a rejection has somewhere to go");
+    assert_eq!(
+        graph.edge_target(edge).map(|step| step.id.as_str()),
+        Some("analyze")
+    );
+    assert!(edge.budget() >= 1);
+}
+
+#[test]
 fn the_repositorys_own_template_reads_downwards() {
     // The template is written as a pipeline (ADR-0018): a step that names
     // nothing waits for every step above it, so the order in the file is the

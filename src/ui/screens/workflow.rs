@@ -3037,7 +3037,20 @@ fn new_graph() -> Workflow {
         // session: the spec and the task files (ADR-0022), so there is no
         // separate split step.
         harness("analyze", "analyze", Some("spec.md"), false, &[]),
-        new_step("approve-plan", StepKind::Question, &[]),
+        {
+            let mut approve = new_step("approve-plan", StepKind::Question, &[]);
+            // The shipped template pairs the approval with a return to
+            // `analyze`, and the menu keeps the pair: a person who turns both
+            // on gets a rejection that rewrites the plan from the answer's
+            // detail instead of a dead stop.
+            approve.edges.push(Edge {
+                to: "analyze".to_owned(),
+                when: Trigger::AnswerNo,
+                max: Some(2),
+                on_exhausted: None,
+            });
+            approve
+        },
         harness("code", "code", None, true, &[]),
         harness("review", "review", None, true, &[]),
         // The three checks are this repository's own CI, cheapest first, so a

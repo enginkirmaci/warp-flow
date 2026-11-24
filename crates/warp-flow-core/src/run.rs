@@ -1023,9 +1023,16 @@ impl<H: Harness + Send + 'static> Runner<H> {
         // status rather than prose. A dispatched gate reports a failed command
         // as `Blocked`, so the step's kind is what says which trigger that is:
         // for a gate it is the exit code, for a harness it is the session's own
-        // admission that it could not finish.
+        // admission that it could not finish. A gate that exits zero raises
+        // `gate_passed`, its other half.
         let raised = match &report.result {
-            Ok(StepOutcome::Done { .. }) => verdict,
+            Ok(StepOutcome::Done { .. }) => {
+                if step.kind == StepKind::Gate {
+                    Some(Trigger::GatePassed)
+                } else {
+                    verdict
+                }
+            }
             Ok(StepOutcome::Blocked { .. }) | Err(_) => Some(if step.kind == StepKind::Gate {
                 Trigger::GateFailed
             } else {
@@ -2043,13 +2050,18 @@ impl<H: Harness + Send + 'static> Runner<H> {
     /// and names it, because letting it read as either approval or rejection
     /// would guess at the one decision a person was asked to make.
     fn answer_word(answer: &str) -> AnswerWord {
-        let word = answer.trim().trim_end_matches(['.', '!']).to_lowercase();
+        let word = answer.trim().to_lowercase();
+        // A rejection carries its detail after the word (`no: the API should
+        // be async`). Punctuation is not part of the answer, so `no:`, `no,`
+        // and `no.` all read as `no` and the words after it stay in the file
+        // for the step the edge sends the work back to.
         let head = word
             .split(|character: char| {
                 character.is_whitespace() || character == ',' || character == ';'
             })
             .next()
-            .unwrap_or("");
+            .unwrap_or("")
+            .trim_end_matches(|character: char| !character.is_alphanumeric());
         match head {
             "yes" | "y" | "true" | "approve" | "approved" => AnswerWord::Yes,
             "no" | "n" | "false" | "reject" | "rejected" => AnswerWord::No,
@@ -2505,6 +2517,29 @@ impl<H: Harness + Send + 'static> Runner<H> {
                      address what it names before you finish.\n",
                     sender.id
                 ));
+            }
+            // A question's answer is the finding: a rejection carries the
+            // detail the person wrote after `no`, and the target re-plans from
+            // it. Taking the edge moved the file to `consumed`, which is the
+            // state it holds once the engine has acted on the answer.
+            if sender.kind == StepKind::Question
+                && let Some(path) = self.question_in_state(sender, task, "consumed")?
+            {
+                let document = Document::read(&path)?;
+                let answer = document
+                    .front
+                    .get("answer")
+                    .map(str::trim)
+                    .unwrap_or_default();
+                if !answer.is_empty() {
+                    let name = path.strip_prefix(&self.issue).unwrap_or(&path).display();
+                    prompt.push_str(&format!(
+                        "\n`{}` asked the person and they answered: {answer}\nThe question \
+                         and the answer are in `{name}`. Address the answer: it is what this \
+                         round must change.\n",
+                        sender.id
+                    ));
+                }
             }
         }
         prompt.push_str("\nWrite your files and report what you did.\n");
@@ -4313,6 +4348,96 @@ kind = "question"
     }
 
     #[test]
+    fn a_rejection_with_details_sends_the_plan_back_and_names_them() {
+        // `no: <detail>` is one answer with two halves: the word is the
+        // trigger, and the detail is what the plan is rewritten from. The
+        // engine names both in the target's prompt, so the re-plan is not a
+        // blind retry of the plan the person rejected.
+        const PLAN_WORKFLOW: &str = r#"
+schema = 3
+name = "implement"
+revision = 1
+
+[[step]]
+id = "analyze"
+kind = "harness"
+skill = "analyze"
+produces = "spec.md"
+
+[[step]]
+id = "approve-plan"
+kind = "question"
+edges = [{ to = "analyze", when = "answer_no", max = 2 }]
+"#;
+
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let mut harness = FakeHarness::new();
+        harness.script("analyze", writes(&issue, "spec.md", "# Plan\n".to_owned()));
+        let mut config = RunnerConfig::new(&issue, workflow(PLAN_WORKFLOW), harness);
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::new(config).expect("runner");
+        assert_eq!(runner.run().expect("first run"), RunStatus::Waiting);
+
+        let path = issue.join("questions/01.md");
+        let mut question = Document::read(&path).expect("question parses");
+        question
+            .front
+            .set("answer", "no: the API should stay synchronous");
+        question.front.set("state", "answered");
+        question.write_atomic(&path).expect("answer is written");
+
+        drop(runner);
+        let mut harness = FakeHarness::new();
+        harness.script(
+            "analyze",
+            writes(&issue, "spec.md", "# Plan 2\n".to_owned()),
+        );
+        let mut config = RunnerConfig::new(&issue, workflow(PLAN_WORKFLOW), harness);
+        config.log = Box::new(MemoryLog::new());
+        let mut resumed = Runner::resume(config).expect("resume");
+        assert_eq!(resumed.run().expect("resumed run"), RunStatus::Waiting);
+
+        let calls = resumed.harness().calls();
+        assert_eq!(calls.len(), 1, "the plan is written once more");
+        assert!(
+            calls[0]
+                .prompt
+                .contains("they answered: no: the API should stay synchronous"),
+            "{}",
+            calls[0].prompt
+        );
+        assert!(
+            calls[0].prompt.contains("questions/01.md"),
+            "the question file is named: {}",
+            calls[0].prompt
+        );
+
+        let document = run_md(&issue);
+        assert!(
+            document.body.contains("| analyze | - | 1 | done |")
+                && document.body.contains("| analyze | - | 2 | done |"),
+            "the plan was written, rejected, and written again: {}",
+            document.body
+        );
+        assert!(
+            document
+                .body
+                .contains("| approve-plan | - | 1 | sent-back:analyze:answer_no |"),
+            "{}",
+            document.body
+        );
+        let first = Document::read(&path).expect("first question parses");
+        assert_eq!(
+            first.front.get("state"),
+            Some("consumed"),
+            "the answer was acted on, so it is not read twice"
+        );
+        let second = Document::read(issue.join("questions/02.md")).expect("second question");
+        assert_eq!(second.front.get("state"), Some("open"));
+    }
+
+    #[test]
     fn an_unrecognised_answer_does_not_stand_in_for_permission() {
         let dir = TempDir::new();
         let issue = issue(&dir);
@@ -4426,6 +4551,63 @@ edges = [{ to = "code", when = "gate_failed", max = 2 }]
             calls[2].prompt.contains("repairs/02.md"),
             "each round names its own findings: {}",
             calls[2].prompt
+        );
+    }
+
+    #[test]
+    fn a_gate_that_passes_may_send_the_work_on_its_gate_passed_edge() {
+        // The other half of the exit code was validated but never fired: a
+        // green gate could not route. `gate_passed` now reads the zero exit.
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let workflow = workflow(
+            r#"
+schema = 3
+name = "implement"
+revision = 1
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+
+[[step]]
+id = "test"
+kind = "gate"
+command = "exit 0"
+cwd = "."
+timeout_secs = 5
+depends_on = ["code"]
+edges = [{ to = "code", when = "gate_passed", max = 1, on_exhausted = "continue" }]
+"#,
+        );
+        let mut harness = FakeHarness::new();
+        for _ in 0..2 {
+            harness.script(
+                "code",
+                Scripted::Done {
+                    files: Vec::new(),
+                    text: "coded".to_owned(),
+                },
+            );
+        }
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.workdir = dir.path().to_path_buf();
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+        assert_eq!(
+            run_rows(&issue, &["code", "test"]),
+            vec![
+                "code - 1 done",
+                "test - 1 sent-back:code:gate_passed",
+                "code - 2 done",
+                "test - 1 passed",
+            ],
+            "the pass is a row, then the budget is spent and `continue` keeps the gate's \
+             own outcome: {}",
+            run_md(&issue).body
         );
     }
 

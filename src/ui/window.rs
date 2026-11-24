@@ -182,6 +182,9 @@ pub(crate) struct RunScreenState {
     pub question: Option<DocSlot>,
     /// Ticked labels of an open `multi` question.
     pub multi: Vec<String>,
+    /// The approval question whose `No` was clicked: the card is asking what
+    /// should change, and the answer travels as `no: <detail>`.
+    pub details_for: Option<PathBuf>,
     /// Why the last answer could not be written.
     pub answer_error: Option<String>,
     /// Why the last start, resume, pause or abandon could not run, in the

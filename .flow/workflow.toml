@@ -62,6 +62,11 @@ effort = "max"
 [[step]]
 id = "approve-plan"
 kind = "question"
+# A rejection goes back to the step that wrote the plan. The answer carries
+# the detail (`no: make the API synchronous`), and the new plan reads it, so
+# "no" is a rewrite with instructions rather than a dead stop. Two rounds are
+# the budget; a plan rejected again blocks with a repair naming the loop.
+edges = [{ to = "analyze", when = "answer_no", max = 2 }]
 
 # The code step is the run's long tail: it writes the change, so it gets the
 # highest effort. It is per task, so this is what every task's session runs.

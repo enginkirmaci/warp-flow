@@ -70,6 +70,35 @@ fn seed_repo(home: &Path) -> PathBuf {
     repo
 }
 
+/// A repository with one waiting run and `questions` open question files.
+fn seed_waiting_repo(home: &Path, questions: u32) -> PathBuf {
+    let repo = home.join("repo-a");
+    let issue = repo.join(".scratch/demo-run");
+    std::fs::create_dir_all(issue.join("questions")).expect("questions folder");
+    std::fs::write(issue.join("spec.md"), "# A run waiting on a person\n").expect("spec.md");
+    std::fs::write(
+        issue.join("run.md"),
+        "---\nissue: demo-run\nworkflow: implement\nrevision: 1\nstatus: waiting\n\
+         step: approve-plan\n---\n\n# Run\n\n## Log\n\n\
+         | Step | Task | Attempt | Outcome | At |\n\
+         | --- | --- | --- | --- | --- |\n\
+         | approve-plan | - | 1 | waiting | 12:00 |\n",
+    )
+    .expect("run.md");
+    for number in 1..=questions {
+        std::fs::write(
+            issue.join(format!("questions/{number:02}.md")),
+            format!(
+                "---\nkind: approve\noptions: yes, no\nasked_by: approve-plan\n\
+                 state: open\n---\n\n# Question {number:02}: Approve the plan?\n\n\
+                 An answer is written back into this file.\n"
+            ),
+        )
+        .expect("question file");
+    }
+    repo
+}
+
 fn open_app(cx: &mut TestAppContext, repos: Vec<PathBuf>) -> WindowHandle<FlowApp> {
     cx.open_window(size(px(1500.), px(960.)), |window, cx| {
         FlowApp::new(Launch { repos }, window, cx)
@@ -258,6 +287,83 @@ fn the_shell_routes_its_sections_and_a_runs_tabs(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("flow-detail").is_some(),
         "the run stays open across a trip through the rail"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[gpui_kit::gpui::test]
+fn a_rejection_asks_for_the_detail_and_sends_it_with_the_no(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("question-details");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let repo = seed_waiting_repo(&home, 1);
+
+    let handle = open_app(cx, vec![repo.clone()]);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+    click(cx, "flow-card-repo-a-demo-run");
+    assert!(
+        cx.debug_bounds("flow-run-question").is_some(),
+        "the open question draws its card"
+    );
+    assert!(
+        cx.debug_bounds("flow-question-details").is_none(),
+        "the card asks nothing before No is pressed"
+    );
+
+    click(cx, "flow-answer-no");
+    assert!(
+        cx.debug_bounds("flow-question-details").is_some(),
+        "No asks what should change instead of sending a bare rejection"
+    );
+    let path = repo.join(".scratch/demo-run/questions/01.md");
+    let question = std::fs::read_to_string(&path).expect("question file");
+    assert!(
+        !question.contains("answer:"),
+        "nothing was written while the card waits for the detail: {question}"
+    );
+
+    click(cx, "flow-answer-field");
+    cx.simulate_input("the API should stay synchronous");
+    settle(cx);
+    click(cx, "flow-answer-submit");
+    settle(cx);
+
+    let question = std::fs::read_to_string(&path).expect("question file");
+    assert!(
+        question.contains("answer: no: the API should stay synchronous"),
+        "the detail travels with the no: {question}"
+    );
+    assert!(
+        question.contains("state: answered"),
+        "the engine can take the answer up: {question}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[gpui_kit::gpui::test]
+fn several_open_questions_name_the_first_of_them(cx: &mut TestAppContext) {
+    let _guard = hold_home();
+    let home = scratch_home("question-count");
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply_kit_theme);
+    let repo = seed_waiting_repo(&home, 2);
+
+    let handle = open_app(cx, vec![repo]);
+    let cx = VisualTestContext::from_window(handle.into(), cx).into_mut();
+    settle(cx);
+    click(cx, "flow-card-repo-a-demo-run");
+
+    assert!(
+        cx.debug_bounds("flow-run-question").is_some(),
+        "the first open question still draws the one card"
+    );
+    assert!(
+        cx.debug_bounds("flow-question-count").is_some(),
+        "a second open question is named as a count on the card"
     );
 
     let _ = std::fs::remove_dir_all(&home);

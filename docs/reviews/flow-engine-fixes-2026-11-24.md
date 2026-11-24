@@ -143,6 +143,7 @@ sürümüne aittir; bu belge değişiklik sonrası durumu anlatır.
 ## 3. Kalan işler — karar gerektirenler
 
 Aşağıdakiler bilerek yapılmadı; her biri bir ürün/sözleşme kararı istiyor.
+3, 4, 12 ve 17 ikinci turda karara bağlandı ve uygulandı (§4).
 
 | # | Konu | Neden karar gerekiyor | Öneri |
 |---|---|---|---|
@@ -164,9 +165,60 @@ Aşağıdakiler bilerek yapılmadı; her biri bir ürün/sözleşme kararı isti
 | 16 | Repos › Workflow kaydı hâlâ merge'ü bloke ediyor | `.flow/workflow.toml` izlenen bir dosya; kaydetmek `DirtyMain` üretiyor. Ya kayıtta commit atılmalı ya da merge `.flow`'u dışlamalı | Kayıt sırasında `flow: workflow <repo>` commit'i |
 | 17 | Varsayılan `approve-plan` şablonunda `answer_no` kenarı yok | P0-1 düzeltmesinden sonra varsayılan akışta "No" bloke ediyor; plan reddinin nereye döneceği bir ürün kararı | `edges = [{ to = "analyze", when = "answer_no", max = 2 }]` |
 
-## 4. Not
+## 4. Uygulanan kararlar (2026-11-24, ikinci tur)
 
-Bu çalışma **commit edilmedi**. Ağaçta yalnızca bu belge, inceleme belgesi ve
-yukarıdaki kaynak değişiklikleri var. Bir sonraki adım, kalan tablodan
-hangilerinin yapılacağına karar vermek; özellikle 1, 4 ve 6 numaralı maddeler
-motorun sözleşmesini değiştiriyor.
+Kalan tablodan **3, 4, 12 ve 17** karara bağlandı ve uygulandı. Tablodaki
+satırlar tarihsel kayıt olarak bırakıldı; güncel durum bu bölümdedir.
+
+### 17 — Plan reddi analize geri dönüyor, detayıyla
+
+- `.flow/workflow.toml` ve editörün yeni-depo menüsü (`new_graph`):
+  `approve-plan` artık `edges = [{ to = "analyze", when = "answer_no",
+  max = 2 }]` taşıyor. İki tur sonunda bloke olur.
+- UI: "No" tek başına gönderilmiyor. Kart bir detay moduna geçiyor
+  (`flow-question-details`), imleç cevap alanına gidiyor, düğme
+  "Send back" oluyor ve gönderilen cevap `no: <detay>` oluyor.
+- Motor: `answer_word` kelimenin sonundaki noktalama işaretlerini atıyor,
+  böylece `no:` / `no,` / `no.` hep `no` okunuyor ve detay cevapta kalıyor.
+- Prompt: bir edge alındığında hedefin prompt'u, soruyu soranın
+  `consumed` durumundaki dosyasını ve cevabı adlandırıyor; yeni plan
+  reddedilen planı körü körüne tekrarlamıyor.
+- Testler: `a_rejection_with_details_sends_the_plan_back_and_names_them`,
+  `the_repositorys_own_template_takes_a_rejection_back_to_the_plan`,
+  `a_rejection_asks_for_the_detail_and_sends_it_with_the_no`.
+
+### 4 — `gate_passed` ateşleniyor; gate `blocked` doğrulamada reddediliyor
+
+- Sıfır çıkışlı bir gate artık `GatePassed` yükseltiyor; edge yoksa
+  davranış değişmiyor.
+- Bir gate `blocked` yükseltemez: oturumu yok, hatası çıkış kodudur.
+  `Trigger::fits` ve `trigger_owner` buna göre daraltıldı; ADR-0023'ün
+  tetik tablosu güncellendi.
+- Testler: `a_gate_that_passes_may_send_the_work_on_its_gate_passed_edge`,
+  `a_gate_may_loop_on_a_pass_but_not_on_blocked`.
+
+### 3 — Birden çok açık soru tek kartta, sırayla
+
+- Kart, açık soruların kaçıncısını gösterdiğini `1 of 2` çipiyle söylüyor
+  (`flow-question-count`); cevaplanan soru kapanınca sıradaki kart geliyor.
+  `store::Run::open_questions` zaten hepsini taşıyordu, UI yalnızca ilkini
+  çiziyordu.
+- Testler: `several_open_questions_name_the_first_of_them`.
+
+### 12 — Tek uygulama örneği
+
+- Yeni `src/instance.rs`: `<config>/instance.lock` üzerinde `File::try_lock`.
+  İkinci başlatma "warp-flow is already running; leaving its window alone."
+  yazıp çıkıyor; kilit süreç ömrü boyunca tutuluyor ve çekirdek bırakıyor.
+- `--version` kilitten önce yanıtlanıyor, böylece aile About listesi açık bir
+  warp-flow varken de satırını doldurabiliyor.
+- Test: `a_second_instance_is_refused_and_a_dropped_one_frees_the_lock`.
+
+## 5. Doğrulama ve durum
+
+- İlk tur `1b2e382` olarak commit edildi (`fix(engine): a no is not a yes,
+  one lock per run, and a closed record`), sürüm 0.1.67 → 0.1.68.
+- İkinci turda: `cargo test --locked -p warp-flow-core` **212** birim testi +
+  probe'lar; `cargo test --locked` **76** birim testi + probe'lar; her iki
+  crate'te clippy `-D warnings` ve `cargo fmt --all -- --check` temiz.
+- Açık kalan kararlar: tablodaki 1, 2, 5–11 ve 13–16.

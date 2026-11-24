@@ -17,14 +17,16 @@ code**, never from a model's prose:
 | `verdict_changes` / `verdict_ready` | a harness step | the `verdict:` front matter of its `produces` artifact |
 | `gate_failed` / `gate_passed` | a gate step | the command's exit code |
 | `answer_no` / `answer_yes` | a question step | the question file's `answer:` |
-| `blocked` | a harness or gate step | the step's own report |
+| `blocked` | a harness step | the step's own report |
 
 A step may declare several edges with different triggers, and the same edge may
 not be declared twice. Validation refuses four things: an edge whose target is
 not in the graph, a trigger the sender's kind can never raise (a gate cannot
-write a verdict; a harness step has no exit code), a `verdict_*` edge on a step
-that writes no artifact, and a budget below 1. Merge and cleanup steps carry no
-edges — a merge either lands or fails, and the run's housekeeping runs once.
+write a verdict, a harness step has no exit code, and a gate's failure is an
+exit code rather than a session's `blocked` report), a `verdict_*` edge on a
+step that writes no artifact, and a budget below 1. Merge and cleanup steps
+carry no edges — a merge either lands or fails, and the run's housekeeping runs
+once.
 
 The deciding factor is that the old edge was **one shape wearing the costume of
 a general one**. `rework_to` named one target, required the target to be an

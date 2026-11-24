@@ -33,11 +33,14 @@ rules that still matter move into `README.md` or this file.
   `--version`/`-V` is answered before logging or a window: the family's About
   list fills itself by spawning every installed member with `--version` and
   killing it at a two-second deadline, so a launcher that boots the window
-  instead flashes it in a sibling. `src/lib.rs` is the probe boundary, and
-  `src/store.rs` is the filesystem scan behind the board, plus `RunState`: the
-  one typed vocabulary for a run's state. It reads `run.md`, then `spec.md`,
-  then Triage — never a third copy of the strings — and a `RunState` is what
-  the lanes, the pills and the action plan speak.
+  instead flashes it in a sibling. It then takes the one-instance lock
+  (`src/instance.rs`, `<config>/instance.lock`), so a second launch exits with
+  a sentence instead of publishing over the running window's door endpoint.
+  `src/lib.rs` is the probe boundary, and `src/store.rs` is the filesystem scan
+  behind the board, plus `RunState`: the one typed vocabulary for a run's
+  state. It reads `run.md`, then `spec.md`, then Triage — never a third copy of
+  the strings — and a `RunState` is what the lanes, the pills and the action
+  plan speak.
 - `src/host.rs` — the engine host: one blocking `Runner` per issue folder on a
   worker thread, one run per repository, the control value the engine reads at
   a step boundary, the log ring, and the snapshot the window and the door read.

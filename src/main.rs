@@ -5,7 +5,7 @@
     windows_subsystem = "windows"
 )]
 
-use warp_flow::{app, logging};
+use warp_flow::{app, instance, logging};
 
 fn main() {
     // The support contract, before logging or a window: `--version` answers with
@@ -26,6 +26,20 @@ fn main() {
         );
         return;
     }
+    // One window per user. A second launch would publish over the running
+    // instance's door endpoint and the two would disagree about the records
+    // they drive. The kernel releases this lock when the process ends.
+    let _instance = match instance::InstanceLock::acquire() {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => {
+            eprintln!("warp-flow is already running; leaving its window alone.");
+            return;
+        }
+        Err(error) => {
+            eprintln!("warp-flow could not take its instance lock: {error}");
+            None
+        }
+    };
     // The logging guard stays alive for the process lifetime.
     let _log_guard = logging::initialize();
     let launch = app::parse_launch(std::env::args_os().skip(1));

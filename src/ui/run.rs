@@ -108,6 +108,7 @@ impl FlowApp {
         match self.host.answer(&issue, &question.path, &answer) {
             Ok(AnswerOutcome::Resumed | AnswerOutcome::Recorded) => {
                 self.run_ui.answer_error = None;
+                self.run_ui.details_for = None;
                 self.answer_field
                     .update(cx, |state, cx| state.set_value("", window, cx));
                 cx.notify();
@@ -128,6 +129,7 @@ impl FlowApp {
         cx: &mut Context<Self>,
     ) {
         let typed = self.answer_field.read(cx).value().trim().to_owned();
+        let details = self.run_ui.details_for.as_ref() == Some(&question.path);
         let picked: Vec<String> = self
             .run_ui
             .multi
@@ -135,7 +137,18 @@ impl FlowApp {
             .filter(|choice| question.options.iter().any(|option| option == *choice))
             .cloned()
             .collect();
-        let answer = if question.kind == "multi" && !picked.is_empty() {
+        let answer = if details {
+            // The click said `no`; this is the sentence that says what should
+            // change. It stays in the answer after the word so the step the
+            // edge sends the work back to reads it as one value.
+            if typed.is_empty() {
+                self.run_ui.answer_error =
+                    Some("Write what should change before sending it back.".to_owned());
+                cx.notify();
+                return;
+            }
+            format!("no: {typed}")
+        } else if question.kind == "multi" && !picked.is_empty() {
             picked.join(", ")
         } else if !typed.is_empty() {
             typed
@@ -403,6 +416,10 @@ impl FlowApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // A rejection is not sent on the click: the card asks what should
+        // change, and that sentence travels with the `no`. Until one is
+        // written, the card's one verb waits.
+        let details = self.run_ui.details_for.as_ref() == Some(&question.path);
         let picked = picked_option(question, &self.run_ui.multi);
         let typed = self.answer_field.read(cx).value().to_string();
         let ticked = self
@@ -410,7 +427,47 @@ impl FlowApp {
             .multi
             .iter()
             .any(|choice| question.options.iter().any(|option| option == choice));
-        let answer_enabled = picked.is_some() || ticked || !typed.trim().is_empty();
+        let answer_enabled = if details {
+            !typed.trim().is_empty()
+        } else {
+            picked.is_some() || ticked || !typed.trim().is_empty()
+        };
+
+        let mut head = div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(icon(
+                "icons/icon-shield.svg",
+                px(theme::icon_small()),
+                theme::CHANGES,
+            ))
+            .child(
+                div()
+                    .text_size(px(theme::font_body()))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::text())
+                    .child("The engine is waiting on you"),
+            )
+            .child(tag(question.kind.clone()));
+        // Several open questions arrive when a per-task question asks one per
+        // task: the card answers the first and names how many are behind it.
+        let total = run.open_questions.len();
+        if total > 1 {
+            let position = run
+                .open_questions
+                .iter()
+                .position(|open| open.path == question.path)
+                .map_or(1, |index| index + 1);
+            head = head.child(
+                div()
+                    .debug_selector(|| "flow-question-count".into())
+                    .child(tag(format!("{position} of {total}"))),
+            );
+        }
+        head = head
+            .child(div().flex_1())
+            .child(head_mono(run.key.id.clone()));
 
         let mut card = div()
             .id("flow-run-question-card")
@@ -424,27 +481,7 @@ impl FlowApp {
             .bg(theme::surface())
             .px(px(14.))
             .py(px(12.))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(icon(
-                        "icons/icon-shield.svg",
-                        px(theme::icon_small()),
-                        theme::CHANGES,
-                    ))
-                    .child(
-                        div()
-                            .text_size(px(theme::font_body()))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text())
-                            .child("The engine is waiting on you"),
-                    )
-                    .child(tag(question.kind.clone()))
-                    .child(div().flex_1())
-                    .child(head_mono(run.key.id.clone())),
-            )
+            .child(head)
             .child(
                 div()
                     .mt(px(8.))
@@ -488,6 +525,19 @@ impl FlowApp {
                             this.run_ui.abandon_confirm = None;
                             this.run_ui.multi.clear();
                             this.run_ui.multi.push(answer.clone());
+                            if answer == "no" {
+                                // A bare `no` is half an answer: the person
+                                // knows what is wrong with the plan. Ask for
+                                // that sentence instead of sending the
+                                // rejection alone.
+                                this.run_ui.details_for = Some(question.path.clone());
+                                this.run_ui.answer_error = None;
+                                this.answer_field
+                                    .update(cx, |state, cx| state.focus(window, cx));
+                                cx.notify();
+                                return;
+                            }
+                            this.run_ui.details_for = None;
                             this.submit_answer(question.clone(), answer.clone(), window, cx);
                         },
                     );
@@ -549,13 +599,28 @@ impl FlowApp {
         if has_options {
             card = card.child(options);
         }
+        if details {
+            card = card.child(
+                div()
+                    .debug_selector(|| "flow-question-details".into())
+                    .mt(px(10.))
+                    .text_size(px(theme::font_sub()))
+                    .line_height(relative(1.43))
+                    .text_color(theme::CHANGES)
+                    .child(
+                        "Tell the engine what should change. Your sentence travels with the \
+                         rejection, and the work comes back with it.",
+                    ),
+            );
+        }
 
         let question_for_answer = question.clone();
+        let submit_label = if details { "Send back" } else { "Answer" };
         let answer = probed(
             "flow-answer-submit",
             primary_button(
                 "flow-answer-submit-button".to_owned(),
-                "Answer",
+                submit_label,
                 Some("icons/icon-send.svg"),
                 answer_enabled,
                 cx.listener(
