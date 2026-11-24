@@ -1,226 +1,162 @@
-# warp-flow's workflow template, in the `.flow/` folder every driven repository
-# carries.
-#
-# A run copies this file into its issue folder at start, so editing it here
-# never changes a run that already started. The graph is the one the flow
-# design names: analyze the request and write the plan — the spec and the task
-# files (ADR-0022) — let a person approve it, then drive each ready task
-# through code, review and the gates before the merge queue lands it. A
-# conflicted merge hands the branch to its conflict step (ADR-0020), and the
-# run closes with a cleanup beside the summary (ADR-0021).
-#
-# The file is read downwards (ADR-0018): a step that says nothing about its
-# dependencies waits for every step declared before it, so a pipeline needs no
-# edges at all. Naming steps is how a step breaks out of that order — a branch
-# names the step it leaves from, and `depends_on = []` is a root wherever it is
-# declared. Steps marked `per_task` run once for every ready task.
-#
-# A gate is a step (ADR-0015): it carries its own command, folder and timeout,
-# so there is no second file to keep in step with this one.
-#
-# A step may declare back-edges (ADR-0023): `edges` is a list, each entry naming
-# the step the work goes back to, the trigger that sends it, and how many times
-# the edge may be taken. `review` sends the work back to `code` when its
-# artifact's front matter says `verdict: changes`; `test` sends it back when the
-# gate exits non-zero. When an edge's budget is spent the step fails and the run
-# stops, unless the edge says `on_exhausted = "continue"`.
-#
-# A merge may name the step that resolves its conflict (ADR-0020): the named
-# step is a per-task harness step declared after the merge, it runs inside the
-# merge's turn when the rebase conflicts, and the merge retries after it.
-#
-# The run ends with two siblings (ADR-0021): `summary` writes the closing report
-# and `cleanup` removes every merged task's worktree and branch. Both name
-# `merge`, so neither waits for the other; the cleanup never touches the
-# checkout, so it may run beside the summary.
-#
-# What a harness step runs on is picked per step (ADR-0017): `harness`, `model`
-# and `effort` are resolved against warp-agent's catalog when the step's turn
-# comes, and a name nothing publishes blocks the step instead of being swapped
-# for another. Every remaining harness step runs on dsh with
-# `opencode-go/deepseek-v4.1-flash`; the effort is the one thing that differs,
-# because it is the only knob that should: the steps that decide and write get
-# `max`, and the ones that read and report get `high`. `bump` is a gate, and the
-# cleanup is not a session at all: both are declared below.
 schema = 3
 name = "implement"
-revision = 1
+revision = 2
 max_parallel = 2
 
-# The request is read once, at the start, and the whole plan — the spec and the
-# task files — comes out of this step: the hardest thinking in the run, so the
-# highest effort (ADR-0022).
 [[step]]
 id = "analyze"
 kind = "harness"
+enabled = true
 skill = "analyze"
-produces = "spec.md"
 harness = "dsh"
 model = "opencode-go/deepseek-v4.1-flash"
 effort = "max"
+produces = "spec.md"
+per_task = false
+push = false
 
 [[step]]
 id = "approve-plan"
 kind = "question"
-# A rejection goes back to the step that wrote the plan. The answer carries
-# the detail (`no: make the API synchronous`), and the new plan reads it, so
-# "no" is a rewrite with instructions rather than a dead stop. Two rounds are
-# the budget; a plan rejected again blocks with a repair naming the loop.
-edges = [{ to = "analyze", when = "answer_no", max = 2 }]
+enabled = true
+per_task = false
+push = false
 
-# The code step is the run's long tail: it writes the change, so it gets the
-# highest effort. It is per task, so this is what every task's session runs.
+[[step.edges]]
+to = "analyze"
+when = "answer_no"
+max = 2
+
 [[step]]
 id = "code"
 kind = "harness"
+enabled = true
 skill = "code"
-per_task = true
 harness = "dsh"
 model = "opencode-go/deepseek-v4.1-flash"
 effort = "max"
+per_task = true
+push = false
 
-# The review either clears the code or sends it back. Its artifact is per task
-# (`review-01.md`), because every task is reviewed on its own, and its
-# `verdict` front matter is the only thing the engine reads from it.
-#
-# It reads a diff and writes findings — a reading job, not a writing one — so
-# `high` rather than `max`.
 [[step]]
 id = "review"
 kind = "harness"
+enabled = true
 skill = "review"
-per_task = true
-produces = "review.md"
-edges = [{ to = "code", when = "verdict_changes", max = 3 }]
 harness = "dsh"
 model = "opencode-go/deepseek-v4.1-flash"
 effort = "high"
+produces = "review.md"
+per_task = true
+push = false
 
-# The checks fork here and join at `bump`: formatting is one branch, the two
-# build-heavy checks are the other. They measure the same worktree, so they
-# still run one at a time (a step is one folder), but the graph says which
-# checks are independent of each other — and the join is what makes `bump`
-# wait for every one of them. Formatting goes first because it is the cheapest
-# way to fail.
-#
-# `warp-flow-core` is a path dependency, not a workspace member (the suite
-# requires app manifests without `[workspace]`), so each check names it in a
-# second command; `--all` alone does not reach it.
+[[step.edges]]
+to = "code"
+when = "verdict_changes"
+max = 3
+
 [[step]]
 id = "fmt"
 kind = "gate"
+enabled = true
 command = "cargo fmt --all --check && cargo fmt --all --manifest-path crates/warp-flow-core/Cargo.toml --check"
 cwd = "."
 timeout_secs = 300
-per_task = true
 depends_on = ["review"]
+per_task = true
+push = false
 
 [[step]]
 id = "clippy"
 kind = "gate"
+enabled = true
 command = "cargo clippy --locked --all-targets -- -D warnings && cargo clippy --locked --all-targets -p warp-flow-core -- -D warnings"
 cwd = "."
 timeout_secs = 1800
-per_task = true
 depends_on = ["review"]
+per_task = true
+push = false
 
 [[step]]
 id = "test"
 kind = "gate"
+enabled = true
 command = "cargo test --locked && cargo test --locked -p warp-flow-core"
 cwd = "."
 timeout_secs = 1800
-per_task = true
 depends_on = ["clippy"]
-# A failing test sends the work back to `code` (ADR-0023). This is the loop the
-# old single `rework_to` could not express at all: a gate writes no artifact, so
-# there was no verdict for it to read. Its exit code is the trigger, and the
-# budget is what keeps a repository whose tests never pass from spending
-# sessions forever. `fmt` and `clippy` do not loop: a formatting failure is
-# mechanical, and a repair is the right vocabulary for it.
-edges = [{ to = "code", when = "gate_failed", max = 2 }]
+per_task = true
+push = false
 
-# The join. `bump` names nothing, so it waits for every step declared before it
-# — the whole task lane, every check included. It is not per task, so waiting
-# for a per-task step means waiting for every task to have it: exactly what a
-# step after the task lanes should do.
-#
-# The version moves once, before the queue lands anything, and the gate command
-# does the mechanical work itself: `scripts/bump.py` bumps PATCH, runs the
-# writer's check and commits the writer's files. It commits with `--no-verify`,
-# because the per-commit hook would bump PATCH a second time; the script's clean
-# guard is what makes that one commit the writer's files only. One bump per run,
-# never one per task — two task branches that each bumped the same file would
-# conflict on the second merge.
+[[step.edges]]
+to = "code"
+when = "gate_failed"
+max = 2
+
 [[step]]
 id = "bump"
 kind = "gate"
+enabled = true
 command = "python3 scripts/bump.py"
 cwd = "."
 timeout_secs = 300
 per_task = false
+push = false
 
-# The merge lands one task's branch. If the rebase conflicts it writes the
-# conflicted attempt's repair and runs `resolve-conflict` inside its turn, then
-# retries; the merge's attempt budget bounds the rounds (ADR-0020).
 [[step]]
 id = "merge"
 kind = "merge"
+enabled = true
 per_task = true
 mode = "local"
 push = false
 on_conflict = "resolve-conflict"
 on_gate_failed = "fix-gates"
 
-# The conflict step: takes the rebase that failed on the task branch, resolves
-# it and finishes it, so the retry has nothing left to replay. Its input is the
-# newest `repairs/` entry the conflicted attempt wrote; it writes no artifact,
-# because the evidence is the task branch and its session record. It resolves
-# and commits code, so `max`.
 [[step]]
 id = "resolve-conflict"
 kind = "harness"
+enabled = true
 skill = "merge-conflict"
-per_task = true
-depends_on = ["merge"]
 harness = "dsh"
 model = "opencode-go/deepseek-v4.1-flash"
 effort = "max"
+depends_on = ["merge"]
+per_task = true
+push = false
 
-# The gates above the merge re-run on the rebased branch (ADR-0019). When one
-# of them fails, retrying the same merge cannot help: the branch has not
-# changed. This step repairs it inside the merge's turn, then the merge
-# retries (ADR-0024). Its input is the newest repair the failed attempt wrote;
-# it fixes code on the task branch and commits, so `max`.
 [[step]]
 id = "fix-gates"
 kind = "harness"
+enabled = true
 skill = "code"
-per_task = true
-depends_on = ["merge"]
 harness = "dsh"
 model = "opencode-go/deepseek-v4.1-flash"
 effort = "max"
+depends_on = ["merge"]
+per_task = true
+push = false
 
-# The run's closing report: what landed, what did not, and what needs a person.
-# It reads the whole run and writes prose, so `high`. It and `cleanup` are
-# siblings: both name `merge`, so neither waits for the other.
 [[step]]
 id = "summary"
 kind = "harness"
+enabled = true
 skill = "summary"
-produces = "summary.md"
-depends_on = ["merge"]
 harness = "dsh"
 model = "opencode-go/deepseek-v4.1-flash"
 effort = "high"
+depends_on = ["merge"]
+produces = "summary.md"
+per_task = false
+push = false
 
-# The run's own housekeeping, not a session and not per task: it removes every
-# merged task's worktree, deletes its branch and prunes. `main`, the issue
-# folder and unresolved tasks are untouched; the issue folder still outlives
-# the run (ADR-0021).
 [[step]]
 id = "cleanup"
 kind = "cleanup"
+enabled = true
+depends_on = [
+    "merge",
+    "summary",
+]
 per_task = false
-depends_on = ["merge"]
+push = false

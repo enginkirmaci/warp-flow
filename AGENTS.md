@@ -190,6 +190,14 @@ process: the kit ties its `gsettings monitor` to the app's lifetime
   for different tasks overlap, because their worktrees are disjoint. The
   cleanup is engine work outside the checkout, so this rule does not serialize
   it with a session; the rule exists for sessions and the index.
+- **A task's branch is recorded, not guessed.** The title names the branch the
+  first time `TaskWorktree::create` makes the worktree; the engine writes it on
+  the task file's `**Branch:**` line before the session starts, and every later
+  lookup — the next step, a resumed run, the diff screen, the cleanup — reads
+  that line. A worktree whose branch merely shares the task's `agent/<NN>-`
+  prefix belongs to another issue folder and is never adopted; a task with no
+  record gets a fresh worktree (the kit suffixes a taken name) rather than an
+  existing branch.
 - **A merge step is a barrier.** It waits for everything in flight and starts
   nothing while it runs, because `merge()` refuses a checkout with uncommitted
   work and every step writes `run.md` into it. Do not relax the dirty check to
