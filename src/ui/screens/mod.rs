@@ -235,12 +235,22 @@ pub fn write_artifact(
     write_atomic_raw(path, text)
 }
 
-/// Write `text` to `path` through a temporary file and a rename.
-///
-/// The parent folder is created when it is missing: a repository's `.flow/`
-/// does not exist until the first save, and the first save is exactly when a
-/// person expects the file to appear.
+/// Write `text` to `path` through [`write_atomic_bytes`], the one writer this
+/// and the New run form share, so a screen and the form cannot disagree about
+/// how a file appears.
 pub(crate) fn write_atomic_raw(path: &Path, text: &str) -> Result<(), String> {
+    write_atomic_bytes(path, text.as_bytes())
+}
+
+/// Write `bytes` to `path` through a temporary file in the same folder and a
+/// rename.
+///
+/// This is the one writer a screen and the New run form share: [`write_atomic_raw`]
+/// hands it an artifact's text, the form an attachment's bytes. The parent
+/// folder is created when it is missing — a repository's `.flow/` does not
+/// exist until the first save — and the rename means a reader never sees half
+/// a file.
+pub(crate) fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -255,7 +265,7 @@ pub(crate) fn write_atomic_raw(path: &Path, text: &str) -> Result<(), String> {
     let temp = path.with_file_name(format!(".{name}.tmp-warp-flow"));
     let mut file = fs::File::create(&temp)
         .map_err(|error| format!("could not write {}: {error}", temp.display()))?;
-    file.write_all(text.as_bytes())
+    file.write_all(bytes)
         .and_then(|_| file.sync_all())
         .map_err(|error| {
             let _ = fs::remove_file(&temp);

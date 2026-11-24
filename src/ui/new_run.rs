@@ -13,6 +13,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
@@ -40,6 +41,32 @@ pub(crate) struct NewRunForm {
     /// Why the last create did not write a folder, in the filesystem's words.
     pub(crate) error: Option<String>,
 }
+
+/// A request's file, already read: the bytes Create writes into the issue
+/// folder and the image a chip draws, decoded once at attach time.
+pub(crate) struct Attachment {
+    /// The file's base name, made unique against the files already attached.
+    pub(crate) name: String,
+    /// The mime its extension names, for `spec.md` and the chip's glyph.
+    pub(crate) mime: &'static str,
+    /// The bytes exactly as they were read, shared with the write and the chip.
+    pub(crate) bytes: Arc<Vec<u8>>,
+    /// The decoded image when the bytes are a PNG, never decoded per frame.
+    // The attach surface that draws it lands in the next task; until then only
+    // this module's tests read it.
+    #[allow(dead_code)]
+    pub(crate) image: Option<Arc<gpui::RenderImage>>,
+}
+
+/// The most one request file may weigh: its bytes are committed inside the
+/// issue folder, so the cap keeps one screenshot from growing a run's history
+/// with every attempt. It is far larger than warp-agent's 512 KB because there
+/// the bytes travel base64 through the door, while here they are written to
+/// disk once.
+// The attach surface that calls the reader lands in the next task; until then
+// only this module's tests exercise it.
+#[allow(dead_code)]
+const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 
 /// The folder name a title becomes: lowercase ASCII words joined by `-`.
 ///
@@ -152,19 +179,96 @@ pub(crate) fn folder_for(scratch: &Path, request: &str) -> String {
     unique_slug(scratch, &slugify(&title_for(request)))
 }
 
+/// `name`, or `name-2`, `name-3`, … when `taken` already holds it.
+///
+/// The number goes before the extension (`shot.png` → `shot-2.png`), so the
+/// mime still follows the name a person sees. A name with no extension — a
+/// dotfile included — gets the number appended.
+#[allow(dead_code)]
+fn unique_attachment_name(taken: &[String], name: &str) -> String {
+    if !taken.iter().any(|seen| seen == name) {
+        return name.to_owned();
+    }
+    let (stem, extension) = match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() && !extension.is_empty() => {
+            (stem, Some(extension))
+        }
+        _ => (name, None),
+    };
+    let mut number = 2u32;
+    loop {
+        let candidate = match extension {
+            Some(extension) => format!("{stem}-{number}.{extension}"),
+            None => format!("{stem}-{number}"),
+        };
+        if !taken.iter().any(|seen| seen == &candidate) {
+            return candidate;
+        }
+        number += 1;
+    }
+}
+
+/// Read `path` into an [`Attachment`], named uniquely against `taken`.
+///
+/// The file is a copy's source, not a reference: a folder, a path that cannot
+/// be read and a file over [`MAX_ATTACHMENT_BYTES`] are refused with a
+/// sentence naming the file, and the size is checked from the metadata before
+/// anything is allocated.
+#[allow(dead_code)]
+fn read_attachment(path: &Path, taken: &[String]) -> Result<Attachment, String> {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            format!(
+                "{} has no file name, so it was not attached.",
+                store::display_path(path)
+            )
+        })?;
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("`{name}` could not be read: {error}."))?;
+    if metadata.is_dir() {
+        return Err(format!("`{name}` is a folder, so it was not attached."));
+    }
+    if metadata.len() > MAX_ATTACHMENT_BYTES {
+        return Err(format!("`{name}` is over 10 MB, so it was not attached."));
+    }
+    let bytes = fs::read(path).map_err(|error| format!("`{name}` could not be read: {error}."))?;
+    let name = unique_attachment_name(taken, &name);
+    let mime = warpui_kit_core::mime_for_path(&name);
+    let image = if mime.starts_with("image/") {
+        warpui_kit_core::decode_png_render(&bytes)
+    } else {
+        None
+    };
+    Ok(Attachment {
+        name,
+        mime,
+        bytes: Arc::new(bytes),
+        image,
+    })
+}
+
 /// Write a new issue folder for `request` and return the run key.
 ///
-/// The folder is `.scratch/<slug>` and the one file is `spec.md`, written
-/// through a temporary file and a rename: the scan reads the folder twice a
-/// second and must never see half a document. The request's first line becomes
-/// the document's heading, and the rest of the request its body.
+/// The folder is `.scratch/<slug>`: `spec.md` and, when the request carries
+/// files, `attachments/` beside it. Every file is written through a temporary
+/// file and a rename — the scan reads the folder twice a second and must never
+/// see half a document — and `spec.md` is written last, so a folder without a
+/// document is not a half-made run. The request's first line becomes the
+/// document's heading, and the rest of the request its body.
 ///
 /// # Errors
 ///
-/// The request is empty, the repository is not a folder, the folder cannot be
-/// created, or the document cannot be written. A failed write removes the
-/// folder it just made, so the next attempt starts clean.
-pub(crate) fn create_issue(repo: &Path, request: &str) -> Result<RunKey, String> {
+/// The request is empty, an attachment's name is not a plain file name, two
+/// attachments share a name, the repository is not a folder, the folder cannot
+/// be created, or a file cannot be written. A failed write removes the folder
+/// it just made, so the next attempt starts clean.
+pub(crate) fn create_issue(
+    repo: &Path,
+    request: &str,
+    attachments: &[Attachment],
+) -> Result<RunKey, String> {
     let request = request.trim();
     if request.is_empty() {
         return Err("Describe what the run should do.".to_owned());
@@ -181,6 +285,27 @@ pub(crate) fn create_issue(repo: &Path, request: &str) -> Result<RunKey, String>
             store::display_path(repo)
         ));
     }
+    for (index, attachment) in attachments.iter().enumerate() {
+        let name = attachment.name.as_str();
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+        {
+            return Err(format!(
+                "`{name}` is not a file name, so the run was not created."
+            ));
+        }
+        if attachments[..index]
+            .iter()
+            .any(|earlier| earlier.name == attachment.name)
+        {
+            return Err(format!(
+                "`{name}` is attached twice, so the run was not created."
+            ));
+        }
+    }
 
     let title = title_for(request);
     let scratch = repo.join(".scratch");
@@ -191,9 +316,14 @@ pub(crate) fn create_issue(repo: &Path, request: &str) -> Result<RunKey, String>
     fs::create_dir(&issue)
         .map_err(|error| format!("could not create {}: {error}", issue.display()))?;
 
-    let spec = spec_document(&title, request);
-    if let Err(error) = crate::ui::screens::write_atomic_raw(&issue.join("spec.md"), &spec) {
-        let _ = fs::remove_dir(&issue);
+    let spec = spec_document(&title, request, attachments);
+    let written = write_attachments(&issue, attachments).and_then(|()| {
+        crate::ui::screens::write_atomic_bytes(&issue.join("spec.md"), spec.as_bytes())
+    });
+    if let Err(error) = written {
+        // A folder that holds `attachments/` needs `remove_dir_all`; one file
+        // of a run is not a run, so nothing of it is left behind.
+        let _ = fs::remove_dir_all(&issue);
         return Err(error);
     }
 
@@ -203,13 +333,31 @@ pub(crate) fn create_issue(repo: &Path, request: &str) -> Result<RunKey, String>
     })
 }
 
-/// The `spec.md` for `request`, whose first line is `title`.
+/// Write every attachment under `<issue>/attachments`, in attach order.
+fn write_attachments(issue: &Path, attachments: &[Attachment]) -> Result<(), String> {
+    if attachments.is_empty() {
+        return Ok(());
+    }
+    let folder = issue.join(warp_flow_core::artifact::ATTACHMENTS_DIR);
+    fs::create_dir(&folder)
+        .map_err(|error| format!("could not create {}: {error}", folder.display()))?;
+    for attachment in attachments {
+        crate::ui::screens::write_atomic_bytes(&folder.join(&attachment.name), &attachment.bytes)?;
+    }
+    Ok(())
+}
+
+/// The `spec.md` for `request`, whose first line is `title`, and the request's
+/// files when it has any.
 ///
 /// When the first line's [`heading`] is the title (nothing was cut), the line
 /// is not repeated: the body is the request after it. When the line was cut to
 /// [`TITLE_LIMIT`], the whole request stays as the body so nothing typed is
-/// lost. An empty body writes the heading alone.
-fn spec_document(title: &str, request: &str) -> String {
+/// lost. An empty body writes the heading alone. `attachments`, when not empty,
+/// follows the body as an `## Attachments` section — one
+/// `` `attachments/<name>` — <mime> `` line per file in attach order — and with
+/// none the document is byte for byte the one the form has always written.
+fn spec_document(title: &str, request: &str, attachments: &[Attachment]) -> String {
     let request = request.trim();
     let first = request.lines().next().unwrap_or_default();
     let body = if heading(first) == title {
@@ -220,11 +368,23 @@ fn spec_document(title: &str, request: &str) -> String {
     } else {
         request
     };
-    if body.is_empty() {
+    let mut document = if body.is_empty() {
         format!("# {title}\n")
     } else {
         format!("# {title}\n\n{body}\n")
+    };
+    if !attachments.is_empty() {
+        document.push_str("\n## Attachments\n\n");
+        for attachment in attachments {
+            document.push_str(&format!(
+                "- `{}/{}` — {}\n",
+                warp_flow_core::artifact::ATTACHMENTS_DIR,
+                attachment.name,
+                attachment.mime,
+            ));
+        }
     }
+    document
 }
 
 /// The title as a single heading line: the first line, without the `#` a
@@ -368,7 +528,7 @@ impl FlowApp {
         };
         let repo = form.repo.clone();
         let request = form.request.read(cx).value().to_string();
-        match create_issue(&repo, &request) {
+        match create_issue(&repo, &request, &[]) {
             Ok(key) => {
                 self.pending_run = Some(key);
                 self.new_run = None;
@@ -603,6 +763,26 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// A 1×1 RGBA PNG: small enough to inline, real enough for the decoder.
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc,
+        0xcf, 0xc0, 0x50, 0x0f, 0x00, 0x04, 0x85, 0x01, 0x80, 0x84, 0xa9, 0x8c, 0x21, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    /// An attachment named `name`: the create's guards run on names the reader
+    /// itself never makes, so the test builds the value by hand.
+    fn attachment(name: &str) -> Attachment {
+        Attachment {
+            name: name.to_owned(),
+            mime: "text/plain",
+            bytes: Arc::new(b"a file".to_vec()),
+            image: None,
+        }
+    }
+
     /// A throwaway folder under the system temp dir.
     fn scratch(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -676,7 +856,7 @@ mod tests {
         let title = "word ".repeat(13) + "word";
         assert_eq!(title_for(&request), title);
         assert_eq!(
-            spec_document(&title_for(&request), &request),
+            spec_document(&title_for(&request), &request, &[]),
             format!("# {title}\n\n{}\n", request.trim())
         );
 
@@ -684,7 +864,7 @@ mod tests {
         let title = "x".repeat(72);
         assert_eq!(title_for(&request), title);
         assert_eq!(
-            spec_document(&title_for(&request), &request),
+            spec_document(&title_for(&request), &request, &[]),
             format!("# {title}\n\n{request}\n")
         );
     }
@@ -720,6 +900,7 @@ mod tests {
         let key = create_issue(
             &repo,
             "Probe the new run form\nCreate a run from the screen.\n",
+            &[],
         )
         .expect("issue created");
         assert_eq!(key.id, "probe-the-new-run-form");
@@ -731,7 +912,7 @@ mod tests {
         );
 
         // a first line that already is a heading is not doubled
-        let key = create_issue(&repo, "# Fix the login\nBecause the retry loops.\n")
+        let key = create_issue(&repo, "# Fix the login\nBecause the retry loops.\n", &[])
             .expect("heading request");
         assert_eq!(key.id, "fix-the-login");
         assert_eq!(
@@ -740,7 +921,7 @@ mod tests {
         );
 
         // the same title again lands beside the first, never over it
-        let next = create_issue(&repo, "Probe the new run form\n").expect("second issue");
+        let next = create_issue(&repo, "Probe the new run form\n", &[]).expect("second issue");
         assert_eq!(next.id, "probe-the-new-run-form-2");
         assert_eq!(
             fs::read_to_string(repo.join(".scratch/probe-the-new-run-form-2/spec.md"))
@@ -748,7 +929,7 @@ mod tests {
             "# Probe the new run form\n"
         );
 
-        let error = create_issue(&repo, "  ").expect_err("an empty request is refused");
+        let error = create_issue(&repo, "  ", &[]).expect_err("an empty request is refused");
         assert_eq!(error, "Describe what the run should do.");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -761,7 +942,7 @@ mod tests {
         git(&repo, &["init", "--quiet"]);
         let request = "Probe the new run form\nCreate a run from the screen.";
         let preview = folder_for(&repo.join(".scratch"), request);
-        let key = create_issue(&repo, request).expect("issue created");
+        let key = create_issue(&repo, request, &[]).expect("issue created");
         assert_eq!(preview, key.id);
         assert!(
             repo.join(".scratch")
@@ -769,6 +950,192 @@ mod tests {
                 .join("spec.md")
                 .is_file()
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_becomes_an_attachment() {
+        let dir = scratch("attachment");
+        let notes = dir.join("notes.txt");
+        fs::write(&notes, "the failing log").expect("notes");
+        let attachment = read_attachment(&notes, &[]).expect("text read");
+        assert_eq!(attachment.name, "notes.txt");
+        assert_eq!(attachment.mime, "text/plain");
+        assert_eq!(attachment.bytes.as_slice(), b"the failing log");
+        assert!(attachment.image.is_none());
+
+        let shot = dir.join("shot.png");
+        fs::write(&shot, TINY_PNG).expect("png");
+        let attachment = read_attachment(&shot, &[]).expect("png read");
+        assert_eq!(attachment.name, "shot.png");
+        assert_eq!(attachment.mime, "image/png");
+        assert_eq!(attachment.bytes.as_slice(), TINY_PNG);
+        // decoded once here, so the chip draws a frame without decoding it
+        assert!(attachment.image.is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_file_with_the_same_name_gets_a_number() {
+        let mut taken = Vec::new();
+        assert_eq!(unique_attachment_name(&taken, "shot.png"), "shot.png");
+        taken.push("shot.png".to_owned());
+        assert_eq!(unique_attachment_name(&taken, "shot.png"), "shot-2.png");
+        taken.push("shot-2.png".to_owned());
+        assert_eq!(unique_attachment_name(&taken, "shot.png"), "shot-3.png");
+
+        // a name with no extension, a dotfile included, gets the number appended
+        let no_extension = vec!["notes".to_owned(), "notes-2".to_owned()];
+        assert_eq!(unique_attachment_name(&no_extension, "notes"), "notes-3");
+        assert_eq!(
+            unique_attachment_name(&[".env".to_owned()], ".env"),
+            ".env-2"
+        );
+    }
+
+    #[test]
+    fn a_folder_and_an_oversized_file_are_refused() {
+        let dir = scratch("refused");
+        let folder = dir.join("folder");
+        fs::create_dir(&folder).expect("folder");
+        let error = read_attachment(&folder, &[])
+            .err()
+            .expect("a folder is refused");
+        assert_eq!(error, "`folder` is a folder, so it was not attached.");
+
+        let oversized = dir.join("big.bin");
+        let file = fs::File::create(&oversized).expect("big file");
+        file.set_len(MAX_ATTACHMENT_BYTES + 1).expect("extend");
+        drop(file);
+        // The cap is read from the metadata, so the bytes are never touched:
+        // the refusal is the size sentence, not a read error, even though a
+        // sparse file this size would read fine.
+        let error = read_attachment(&oversized, &[])
+            .err()
+            .expect("an oversized file is refused");
+        assert_eq!(error, "`big.bin` is over 10 MB, so it was not attached.");
+
+        let error = read_attachment(&dir.join("absent.txt"), &[])
+            .err()
+            .expect("missing file");
+        assert!(
+            error.starts_with("`absent.txt` could not be read: "),
+            "{error}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_attachment_section_follows_an_empty_body() {
+        assert_eq!(
+            spec_document("A heading", "A heading", &[attachment("notes.txt")]),
+            "# A heading\n\n## Attachments\n\n- `attachments/notes.txt` — text/plain\n"
+        );
+    }
+
+    #[test]
+    fn a_new_issue_folder_carries_its_attachments() {
+        let dir = scratch("attachments-create");
+        let repo = dir.join("repo");
+        fs::create_dir(&repo).expect("repository");
+        git(&repo, &["init", "--quiet"]);
+
+        let notes = dir.join("notes.txt");
+        fs::write(&notes, "the failing log").expect("notes");
+        let shot = dir.join("shot.png");
+        fs::write(&shot, TINY_PNG).expect("png");
+        let attachments = vec![
+            read_attachment(&notes, &[]).expect("notes read"),
+            read_attachment(&shot, &[]).expect("png read"),
+        ];
+
+        let key = create_issue(
+            &repo,
+            "Attach the log\nSo the step can read it.",
+            &attachments,
+        )
+        .expect("issue created");
+        let issue = repo.join(".scratch").join(&key.id);
+        assert_eq!(
+            fs::read(issue.join("attachments/notes.txt")).expect("notes bytes"),
+            b"the failing log"
+        );
+        assert_eq!(
+            fs::read(issue.join("attachments/shot.png")).expect("png bytes"),
+            TINY_PNG
+        );
+        assert_eq!(
+            fs::read_to_string(issue.join("spec.md")).expect("spec.md"),
+            "# Attach the log\n\nSo the step can read it.\n\n## Attachments\n\n- `attachments/notes.txt` — text/plain\n- `attachments/shot.png` — image/png\n"
+        );
+        assert_eq!(
+            warp_flow_core::artifact::attachments(&issue),
+            vec![
+                issue
+                    .join(warp_flow_core::artifact::ATTACHMENTS_DIR)
+                    .join("notes.txt"),
+                issue
+                    .join(warp_flow_core::artifact::ATTACHMENTS_DIR)
+                    .join("shot.png"),
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_attachment_name_that_is_a_path_is_refused() {
+        let dir = scratch("attachment-path");
+        let repo = dir.join("repo");
+        fs::create_dir(&repo).expect("repository");
+        git(&repo, &["init", "--quiet"]);
+
+        for name in ["", ".", "..", "x/y", "x\\y"] {
+            let error = create_issue(&repo, "A guarded request", &[attachment(name)])
+                .expect_err("a name that is not a file name is refused");
+            assert_eq!(
+                error,
+                format!("`{name}` is not a file name, so the run was not created.")
+            );
+        }
+        assert!(!repo.join(".scratch/a-guarded-request").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_same_attachment_name_twice_is_refused() {
+        let dir = scratch("attachment-twice");
+        let repo = dir.join("repo");
+        fs::create_dir(&repo).expect("repository");
+        git(&repo, &["init", "--quiet"]);
+
+        let error = create_issue(
+            &repo,
+            "A doubled request",
+            &[attachment("notes.txt"), attachment("notes.txt")],
+        )
+        .expect_err("a name attached twice is refused");
+        assert_eq!(
+            error,
+            "`notes.txt` is attached twice, so the run was not created."
+        );
+        assert!(!repo.join(".scratch/a-doubled-request").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_attachment_write_removes_the_folder() {
+        let dir = scratch("failed-write");
+        let repo = dir.join("repo");
+        fs::create_dir(&repo).expect("repository");
+        git(&repo, &["init", "--quiet"]);
+
+        // 300 characters is over the filesystem's name limit, so the write
+        // fails after the folder and its attachments directory exist.
+        let name = format!("{}.txt", "a".repeat(300));
+        let error = create_issue(&repo, "An unwritable request", &[attachment(&name)])
+            .expect_err("the write fails");
+        assert!(error.contains("could not write"), "{error}");
+        assert!(!repo.join(".scratch/an-unwritable-request").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

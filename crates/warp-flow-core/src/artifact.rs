@@ -506,6 +506,30 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+/// The folder inside an issue folder that holds the request's attachments.
+pub const ATTACHMENTS_DIR: &str = "attachments";
+
+/// The request's attachments: the files under `<issue>/attachments`, in name
+/// order.
+///
+/// The list is derived from the folder rather than from `spec.md`, so a file a
+/// person drops into `attachments/` by hand is named to the next step too. A
+/// missing or unreadable folder is an empty list, and a subdirectory is
+/// skipped: only a file can be read as an input.
+pub fn attachments(issue: impl AsRef<Path>) -> Vec<PathBuf> {
+    let folder = issue.as_ref().join(ATTACHMENTS_DIR);
+    let Ok(entries) = fs::read_dir(&folder) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect();
+    files.sort();
+    files
+}
+
 /// One issue folder: the tasks under its `issues/` directory.
 #[derive(Debug, Clone)]
 pub struct Issue {
@@ -1119,5 +1143,29 @@ mod tests {
             error.to_string().contains("task 09, which does not exist"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn attachments_are_the_folders_files_in_name_order() {
+        let dir = TempDir::new();
+        let issue = dir.path().join("demo");
+        let folder = issue.join(ATTACHMENTS_DIR);
+        fs::create_dir_all(folder.join("zz-subdirectory")).expect("attachments");
+        fs::write(folder.join("shot.png"), b"png").expect("png");
+        fs::write(folder.join("notes.txt"), b"notes").expect("notes");
+
+        assert_eq!(
+            attachments(&issue),
+            vec![folder.join("notes.txt"), folder.join("shot.png")]
+        );
+    }
+
+    #[test]
+    fn an_issue_without_attachments_has_none() {
+        let dir = TempDir::new();
+        let issue = dir.path().join("demo");
+        fs::create_dir_all(&issue).expect("issue folder");
+        assert!(attachments(&issue).is_empty());
+        assert!(attachments(dir.path().join("absent")).is_empty());
     }
 }
