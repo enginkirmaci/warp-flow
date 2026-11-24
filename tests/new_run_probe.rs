@@ -1,6 +1,7 @@
 //! Headless probe for the New run form: the run column's one primary opens
-//! the form, a title and a request write `.scratch/<slug>/spec.md`, and the
-//! scan that follows opens the new run with Start run in reach.
+//! the form, the request's first line names the run and writes
+//! `.scratch/<slug>/spec.md`, and the scan that follows opens the new run with
+//! Start run in reach.
 //!
 //! The repository is a throwaway git checkout under a scratch `HOME`, so the
 //! scan and the settings document never touch the person's own.
@@ -128,18 +129,20 @@ fn new_run_writes_the_issue_folder_and_opens_the_run(cx: &mut TestAppContext) {
 
     click(cx, "flow-runs-new");
     assert!(cx.debug_bounds("flow-new-run").is_some(), "the form is up");
-    assert!(cx.debug_bounds("flow-new-run-title").is_some());
+    assert!(
+        cx.debug_bounds("flow-new-run-title").is_none(),
+        "the form asks for no title"
+    );
     assert!(cx.debug_bounds("flow-new-run-request").is_some());
     assert!(cx.debug_bounds("flow-new-run-create").is_some());
 
-    click(cx, "flow-new-run-title");
+    // the form opens with the request focused: this types without clicking it
     cx.simulate_input("Probe the new run form");
-    settle(cx);
-    click(cx, "flow-new-run-request");
+    cx.simulate_keystrokes("enter");
     cx.simulate_input("Create a run from the screen.");
     settle(cx);
 
-    // the folder line follows the title, before the folder exists
+    // the folder line follows the request's first line, before the folder exists
     let folder = repo.join(".scratch/probe-the-new-run-form");
     assert!(!folder.exists(), "nothing is written until Create run");
 
@@ -209,10 +212,9 @@ fn new_run_picks_its_repository_when_several_are_configured(cx: &mut TestAppCont
     assert!(cx.debug_bounds("flow-new-run-repo-repo-b").is_some());
 
     click(cx, "flow-new-run-repo-repo-b");
-    click(cx, "flow-new-run-title");
-    cx.simulate_input("A run for the second repository");
-    settle(cx);
     click(cx, "flow-new-run-request");
+    cx.simulate_input("A run for the second repository");
+    cx.simulate_keystrokes("enter");
     cx.simulate_input("Create it in repo-b.");
     settle(cx);
     click(cx, "flow-new-run-create");

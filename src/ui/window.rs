@@ -284,8 +284,8 @@ pub struct FlowApp {
     /// Settings › About.
     pub(crate) about_license_open: bool,
     pub(crate) about_license: Option<Entity<LiveEditorState>>,
-    /// The New run form, while it is open. It owns its two fields and the
-    /// folder name the title currently resolves to.
+    /// The New run form, while it is open. It owns the request — its one field
+    /// — and the folder name that request currently resolves to.
     pub(crate) new_run: Option<crate::ui::new_run::NewRunForm>,
     /// The run a just-created issue folder becomes. The next scan that holds
     /// it selects and opens it, so a create lands on the run, not the board.

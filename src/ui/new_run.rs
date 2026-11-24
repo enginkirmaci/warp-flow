@@ -1,14 +1,15 @@
 //! The New run form: a request becomes the issue folder the board scans.
 //!
 //! The issue folder is the protocol (ADR-0009), so creating a run is creating
-//! `.scratch/<slug>/spec.md`. The run column's one filled primary asks for a
-//! title and the request, writes that file atomically, and hands the window
-//! the run's key; the next scan lands the run in Triage and the window opens
-//! it, with Start run one click away.
+//! `.scratch/<slug>/spec.md`. The run column's one filled primary asks only for
+//! the request; its first line names the run, that file is written atomically,
+//! and the window is handed the run's key; the next scan lands the run in
+//! Triage and the window opens it, with Start run one click away.
 //!
-//! The slug is derived, not typed: a title becomes an ASCII folder name, and a
-//! name the checkout already uses gets `-2`, `-3`, … so a second run never
-//! overwrites the first. The folder is shown in the form before it is made.
+//! The slug is derived, not typed: the request's first line becomes the run's
+//! heading and an ASCII folder name, and a name the checkout already uses gets
+//! `-2`, `-3`, … so a second run never overwrites the first. The folder is
+//! shown in the form before it is made.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use gpui::{
     AnyElement, Context, Entity, Focusable, FontWeight, KeyDownEvent, MouseButton, SharedString,
     Window, div, px, relative,
 };
-use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::component::input::{InputEvent, TextareaState};
 use warpui_kit_core::tooltip::tooltip_text;
 use warpui_kit_core::{controls, field};
 
@@ -26,16 +27,15 @@ use crate::store::{self, RunKey};
 use crate::theme;
 use crate::ui::window::{FlowApp, repo_label};
 
-/// The form a New run is filled in: the repository it lands in, the two fields
-/// and what the title currently resolves to.
+/// The form a New run is filled in: the repository it lands in, the request —
+/// the only field — and the folder the request currently resolves to.
 pub(crate) struct NewRunForm {
     /// The repository whose `.scratch/` receives the issue folder.
     pub(crate) repo: PathBuf,
-    /// The title, which becomes `spec.md`'s first heading.
-    pub(crate) title: Entity<InputState>,
-    /// The request itself: the body of `spec.md`.
+    /// The request itself: its first line becomes `spec.md`'s heading and the
+    /// rest of the document its body.
     pub(crate) request: Entity<TextareaState>,
-    /// The folder name the title resolves to right now, unique in the checkout.
+    /// The folder name the request resolves to right now, unique in the checkout.
     pub(crate) slug: String,
     /// Why the last create did not write a folder, in the filesystem's words.
     pub(crate) error: Option<String>,
@@ -102,23 +102,70 @@ pub(crate) fn unique_slug(scratch: &Path, base: &str) -> String {
     format!("{base}-{seconds}")
 }
 
-/// Write a new issue folder for `title` and `request` and return the run key.
+/// The longest a title the form derives from a request's first line may be.
+const TITLE_LIMIT: usize = 72;
+
+/// The run's title: the request's first non-empty line, cut to [`TITLE_LIMIT`].
+///
+/// A leading `#` is stripped, as [`heading`] does, so a request that already
+/// opens with a markdown heading is not doubled. A line longer than the limit
+/// is cut at its last whitespace inside the limit, or hard at the limit when it
+/// has none. An empty request, or a first line that is only `#`s, becomes
+/// `Run`.
+pub(crate) fn title_for(request: &str) -> String {
+    let first = request
+        .trim()
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let title = cut_title(&heading(first));
+    if title.is_empty() {
+        "Run".to_owned()
+    } else {
+        title
+    }
+}
+
+/// Cut `title` to [`TITLE_LIMIT`] characters, at a word boundary when it has
+/// one inside the limit and hard when it does not.
+fn cut_title(title: &str) -> String {
+    let mut chars = title.chars();
+    let mut kept: String = chars.by_ref().take(TITLE_LIMIT).collect();
+    if chars.next().is_none() {
+        return kept;
+    }
+    let cut = kept
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+        .map(|(at, _)| at);
+    if let Some(cut) = cut {
+        kept.truncate(cut);
+    }
+    kept.trim_end().to_owned()
+}
+
+/// The folder [`create_issue`] writes for `request`, unique in `scratch`: the
+/// same value the form shows before the folder exists.
+pub(crate) fn folder_for(scratch: &Path, request: &str) -> String {
+    unique_slug(scratch, &slugify(&title_for(request)))
+}
+
+/// Write a new issue folder for `request` and return the run key.
 ///
 /// The folder is `.scratch/<slug>` and the one file is `spec.md`, written
 /// through a temporary file and a rename: the scan reads the folder twice a
-/// second and must never see half a document.
+/// second and must never see half a document. The request's first line becomes
+/// the document's heading, and the rest of the request its body.
 ///
 /// # Errors
 ///
-/// The request or the title is empty, the repository is not a folder, the
-/// folder cannot be created, or the document cannot be written. A failed write
-/// removes the folder it just made, so the next attempt starts clean.
-pub(crate) fn create_issue(repo: &Path, title: &str, request: &str) -> Result<RunKey, String> {
-    let title = heading(title);
+/// The request is empty, the repository is not a folder, the folder cannot be
+/// created, or the document cannot be written. A failed write removes the
+/// folder it just made, so the next attempt starts clean.
+pub(crate) fn create_issue(repo: &Path, request: &str) -> Result<RunKey, String> {
     let request = request.trim();
-    if title.is_empty() {
-        return Err("Give the run a title.".to_owned());
-    }
     if request.is_empty() {
         return Err("Describe what the run should do.".to_owned());
     }
@@ -135,15 +182,16 @@ pub(crate) fn create_issue(repo: &Path, title: &str, request: &str) -> Result<Ru
         ));
     }
 
+    let title = title_for(request);
     let scratch = repo.join(".scratch");
     fs::create_dir_all(&scratch)
         .map_err(|error| format!("could not create {}: {error}", scratch.display()))?;
-    let slug = unique_slug(&scratch, &slugify(&title));
+    let slug = folder_for(&scratch, request);
     let issue = scratch.join(&slug);
     fs::create_dir(&issue)
         .map_err(|error| format!("could not create {}: {error}", issue.display()))?;
 
-    let spec = format!("# {title}\n\n{request}\n");
+    let spec = spec_document(&title, request);
     if let Err(error) = crate::ui::screens::write_atomic_raw(&issue.join("spec.md"), &spec) {
         let _ = fs::remove_dir(&issue);
         return Err(error);
@@ -153,6 +201,30 @@ pub(crate) fn create_issue(repo: &Path, title: &str, request: &str) -> Result<Ru
         repo: repo.to_path_buf(),
         id: slug,
     })
+}
+
+/// The `spec.md` for `request`, whose first line is `title`.
+///
+/// When the first line's [`heading`] is the title (nothing was cut), the line
+/// is not repeated: the body is the request after it. When the line was cut to
+/// [`TITLE_LIMIT`], the whole request stays as the body so nothing typed is
+/// lost. An empty body writes the heading alone.
+fn spec_document(title: &str, request: &str) -> String {
+    let request = request.trim();
+    let first = request.lines().next().unwrap_or_default();
+    let body = if heading(first) == title {
+        request
+            .split_once('\n')
+            .map_or("", |(_, rest)| rest)
+            .trim_start()
+    } else {
+        request
+    };
+    if body.is_empty() {
+        format!("# {title}\n")
+    } else {
+        format!("# {title}\n\n{body}\n")
+    }
 }
 
 /// The title as a single heading line: the first line, without the `#` a
@@ -237,7 +309,7 @@ impl FlowApp {
         row.into_any_element()
     }
 
-    /// Open the New run form for `repo`, on the first field.
+    /// Open the New run form for `repo`, on the request.
     pub(crate) fn open_new_run(
         &mut self,
         repo: PathBuf,
@@ -247,27 +319,22 @@ impl FlowApp {
         if self.new_run.is_some() {
             return;
         }
-        let title =
-            cx.new(|cx| InputState::new(window, cx).placeholder("A short name for this run"));
         let request =
             cx.new(|cx| TextareaState::new(window, cx).placeholder("What should the run do?"));
         // a keystroke changes the derived folder and arms Create
-        cx.subscribe(&title, |this, _, _: &InputEvent, cx| {
+        cx.subscribe(&request, |this, _, _: &InputEvent, cx| {
             this.refresh_new_run_slug(cx);
             cx.notify();
         })
         .detach();
-        cx.subscribe(&request, |_, _, _: &InputEvent, cx| cx.notify())
-            .detach();
-        let slug = unique_slug(&repo.join(".scratch"), &slugify(""));
+        let slug = folder_for(&repo.join(".scratch"), "");
         self.new_run = Some(NewRunForm {
             repo,
-            title: title.clone(),
-            request,
+            request: request.clone(),
             slug,
             error: None,
         });
-        let handle = title.read(cx).focus_handle(cx);
+        let handle = request.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
         cx.notify();
     }
@@ -279,14 +346,14 @@ impl FlowApp {
         }
     }
 
-    /// Keep the shown folder in step with the title.
+    /// Keep the shown folder in step with the request's first line.
     fn refresh_new_run_slug(&mut self, cx: &mut Context<Self>) {
         let Some(form) = self.new_run.as_ref() else {
             return;
         };
-        let title = form.title.read(cx).value().to_string();
+        let request = form.request.read(cx).value().to_string();
         let scratch = form.repo.join(".scratch");
-        let slug = unique_slug(&scratch, &slugify(&title));
+        let slug = folder_for(&scratch, &request);
         if let Some(form) = self.new_run.as_mut() {
             form.slug = slug;
         }
@@ -300,9 +367,8 @@ impl FlowApp {
             return;
         };
         let repo = form.repo.clone();
-        let title = form.title.read(cx).value().to_string();
         let request = form.request.read(cx).value().to_string();
-        match create_issue(&repo, &title, &request) {
+        match create_issue(&repo, &request) {
             Ok(key) => {
                 self.pending_run = Some(key);
                 self.new_run = None;
@@ -327,14 +393,13 @@ impl FlowApp {
         let Some(form) = self.new_run.as_ref() else {
             return div().into_any_element();
         };
-        let title = form.title.clone();
         let request = form.request.clone();
         let slug = form.slug.clone();
         let error = form.error.clone();
         let repo = form.repo.clone();
-        let title_value = title.read(cx).value().to_string();
-        let armed = !title_value.trim().is_empty() && !request.read(cx).value().trim().is_empty();
-        let folder = if title_value.trim().is_empty() {
+        let request_value = request.read(cx).value().to_string();
+        let armed = !request_value.trim().is_empty();
+        let folder = if request_value.trim().is_empty() {
             ".scratch/…".to_owned()
         } else {
             format!(".scratch/{slug}")
@@ -352,8 +417,12 @@ impl FlowApp {
             .py(px(14.))
             .child(label("Repository"))
             .child(self.new_run_repositories(&repo, cx))
-            .child(label("Title"))
-            .child(field::text("flow-new-run-title", &title, window, cx))
+            .child(label("Request"))
+            .child(
+                field::area("flow-new-run-request", &request, window, cx)
+                    .h(px(theme::scaled(140.)))
+                    .min_h(px(0.)),
+            )
             .child(
                 div()
                     .debug_selector(|| "flow-new-run-folder".into())
@@ -361,12 +430,6 @@ impl FlowApp {
                     .text_size(px(theme::font_mono_meta()))
                     .text_color(theme::text_muted())
                     .child(folder),
-            )
-            .child(label("Request"))
-            .child(
-                field::area("flow-new-run-request", &request, window, cx)
-                    .h(px(theme::scaled(140.)))
-                    .min_h(px(0.)),
             );
         let body = match error {
             Some(error) => body.child(
@@ -472,7 +535,7 @@ impl FlowApp {
                                     .truncate()
                                     .text_size(px(theme::font_sub()))
                                     .text_color(theme::text_muted())
-                                    .child("Creates the issue folder; Start run drives it."),
+                                    .child("The first line names the run; Start run drives it."),
                             )
                             .child(field::kbd("Esc"))
                             .child(div().debug_selector(|| "flow-new-run-create".into()).child(
@@ -595,23 +658,117 @@ mod tests {
     }
 
     #[test]
+    fn a_requests_first_line_names_the_run() {
+        assert_eq!(
+            title_for("# Fix the login\nBecause the retry loops."),
+            "Fix the login"
+        );
+        assert_eq!(title_for("\n\n  Second line  \nthird line"), "Second line");
+        assert_eq!(title_for(""), "Run");
+        assert_eq!(title_for(" \n\t\n"), "Run");
+        assert_eq!(title_for("#"), "Run");
+        assert_eq!(title_for("#   \nbody"), "Run");
+    }
+
+    #[test]
+    fn a_long_first_line_is_cut_at_a_word() {
+        let request = "word ".repeat(20);
+        let title = "word ".repeat(13) + "word";
+        assert_eq!(title_for(&request), title);
+        assert_eq!(
+            spec_document(&title_for(&request), &request),
+            format!("# {title}\n\n{}\n", request.trim())
+        );
+
+        let request = "x".repeat(80);
+        let title = "x".repeat(72);
+        assert_eq!(title_for(&request), title);
+        assert_eq!(
+            spec_document(&title_for(&request), &request),
+            format!("# {title}\n\n{request}\n")
+        );
+    }
+
+    #[test]
+    fn a_turkish_request_keeps_its_words() {
+        let dir = scratch("turkish-request");
+        assert_eq!(title_for("Giriş ekranını düzelt"), "Giriş ekranını düzelt");
+        assert_eq!(
+            folder_for(&dir, "Giriş ekranını düzelt"),
+            "giris-ekranini-duzelt"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_untransliterable_request_gets_a_unique_folder() {
+        let dir = scratch("japanese-request");
+        assert_eq!(title_for("日本語の依頼"), "日本語の依頼");
+        assert_eq!(folder_for(&dir, "日本語の依頼"), "run");
+        fs::create_dir(dir.join("run")).expect("the first run folder");
+        assert_eq!(folder_for(&dir, "日本語の依頼"), "run-2");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_new_issue_folder_carries_the_request() {
         let dir = scratch("create");
         let repo = dir.join("repo");
         fs::create_dir(&repo).expect("repository");
         git(&repo, &["init", "--quiet"]);
-        let key = create_issue(&repo, "# A title", "Do the thing.\n").expect("issue created");
-        assert_eq!(key.id, "a-title");
-        let spec = fs::read_to_string(repo.join(".scratch/a-title/spec.md")).expect("spec.md");
-        assert_eq!(spec, "# A title\n\nDo the thing.\n");
+
+        let key = create_issue(
+            &repo,
+            "Probe the new run form\nCreate a run from the screen.\n",
+        )
+        .expect("issue created");
+        assert_eq!(key.id, "probe-the-new-run-form");
+        let spec = fs::read_to_string(repo.join(".scratch/probe-the-new-run-form/spec.md"))
+            .expect("spec.md");
+        assert_eq!(
+            spec,
+            "# Probe the new run form\n\nCreate a run from the screen.\n"
+        );
+
+        // a first line that already is a heading is not doubled
+        let key = create_issue(&repo, "# Fix the login\nBecause the retry loops.\n")
+            .expect("heading request");
+        assert_eq!(key.id, "fix-the-login");
+        assert_eq!(
+            fs::read_to_string(repo.join(".scratch/fix-the-login/spec.md")).expect("spec.md"),
+            "# Fix the login\n\nBecause the retry loops.\n"
+        );
 
         // the same title again lands beside the first, never over it
-        let next = create_issue(&repo, "A title", "Again.").expect("second issue");
-        assert_eq!(next.id, "a-title-2");
-        assert!(repo.join(".scratch/a-title-2/spec.md").is_file());
+        let next = create_issue(&repo, "Probe the new run form\n").expect("second issue");
+        assert_eq!(next.id, "probe-the-new-run-form-2");
+        assert_eq!(
+            fs::read_to_string(repo.join(".scratch/probe-the-new-run-form-2/spec.md"))
+                .expect("spec.md"),
+            "# Probe the new run form\n"
+        );
 
-        assert!(create_issue(&repo, "", "no title").is_err());
-        assert!(create_issue(&repo, "A title", "  ").is_err());
+        let error = create_issue(&repo, "  ").expect_err("an empty request is refused");
+        assert_eq!(error, "Describe what the run should do.");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_preview_and_the_write_share_the_folder() {
+        let dir = scratch("share");
+        let repo = dir.join("repo");
+        fs::create_dir(&repo).expect("repository");
+        git(&repo, &["init", "--quiet"]);
+        let request = "Probe the new run form\nCreate a run from the screen.";
+        let preview = folder_for(&repo.join(".scratch"), request);
+        let key = create_issue(&repo, request).expect("issue created");
+        assert_eq!(preview, key.id);
+        assert!(
+            repo.join(".scratch")
+                .join(&key.id)
+                .join("spec.md")
+                .is_file()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
