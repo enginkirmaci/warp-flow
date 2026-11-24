@@ -5,11 +5,12 @@
 //! on the background executor and only adopts a snapshot that differs from the
 //! one it already shows.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use warp_flow_core::artifact::{Document, Issue, Status, Task};
@@ -842,66 +843,221 @@ impl Snapshot {
     }
 }
 
-/// Read every configured repository. This touches the filesystem, so the
-/// window calls it on the background executor, never inside a frame.
-pub fn scan(repos: &[PathBuf]) -> Snapshot {
-    Snapshot {
-        repos: repos
-            .iter()
-            .map(|path| scan_repo(&absolute(path)))
-            .collect(),
+/// How long a repository's dirty mark is reused. `git status` is the scan's
+/// most expensive child, and a ten-second-old dot is not a wrong answer for a
+/// board read every two seconds.
+const DIRTY_TTL: Duration = Duration::from_secs(10);
+
+/// The metadata of one file, as the cache compares it.
+type FileStamp = Option<(u64, Option<SystemTime>)>;
+
+/// One issue folder's last reading, and the fingerprint it was read from.
+struct CachedRun {
+    fingerprint: u64,
+    note: Option<String>,
+    run: Run,
+}
+
+/// One repository's slow answers: its dirty mark and its gate count.
+#[derive(Default)]
+struct CachedRepo {
+    dirty: Option<(Instant, bool)>,
+    gates: Option<(FileStamp, usize)>,
+}
+
+/// A scan that remembers what it read, so a poll that changed nothing does not
+/// parse the same folders again.
+///
+/// The window owns one for its lifetime. An issue folder is fingerprinted by
+/// its files' names, sizes and mtimes; an unchanged folder reuses the `Run`
+/// it produced last time. The repository's gate count is cached by the
+/// workflow file's metadata, and its dirty mark by a short timeout: those are
+/// the two answers that cost a process or a parse on every scan, and neither
+/// is a live-updating value on the board.
+pub struct Scanner {
+    runs: HashMap<PathBuf, CachedRun>,
+    repos: HashMap<PathBuf, CachedRepo>,
+}
+
+impl Scanner {
+    /// A scanner with no memory.
+    pub fn new() -> Self {
+        Self {
+            runs: HashMap::new(),
+            repos: HashMap::new(),
+        }
+    }
+
+    /// Read every configured repository. This touches the filesystem, so the
+    /// window calls it on the background executor, never inside a frame.
+    pub fn scan(&mut self, repos: &[PathBuf]) -> Snapshot {
+        Snapshot {
+            repos: repos
+                .iter()
+                .map(|path| self.scan_repo(&absolute(path)))
+                .collect(),
+        }
+    }
+
+    fn scan_repo(&mut self, path: &Path) -> RepoView {
+        let name = folder_name(path);
+        let (root, mut note) = match Repo::open(path) {
+            Ok(repo) => (Some(repo.root), None),
+            // A configured folder that is not a git repository is still shown: it
+            // is the owner's configuration, and hiding it would explain nothing.
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let scan_root = root.clone().unwrap_or_else(|| path.to_path_buf());
+        let dirty = root.as_deref().is_some_and(|root| self.dirty(root));
+        // the repository's own gate steps, read once per scan: the Repos list shows
+        // the count, and a bad file is a note on the rows rather than a failed scan
+        let gates = self.gate_count(&scan_root);
+
+        let scratch = scan_root.join(".scratch");
+        let mut runs = Vec::new();
+        let mut seen = BTreeSet::new();
+        match fs::read_dir(&scratch) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let dir = entry.path();
+                    if !dir.is_dir() || !is_issue_folder(&dir) {
+                        continue;
+                    }
+                    let dir = canonical_dir(&dir);
+                    seen.insert(dir.clone());
+                    runs.push(self.run(&dir, path, root.as_deref(), note.as_deref()));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                note.get_or_insert_with(|| format!("cannot read {}: {error}", scratch.display()));
+            }
+        }
+        // A folder that left the repository is no longer a cached reading. The
+        // check is scoped to this repository's `.scratch/`, so forgetting a
+        // repository does not evict another one's entries by accident.
+        let scratch = canonical_dir(&scratch);
+        self.runs
+            .retain(|dir, _| !dir.starts_with(&scratch) || seen.contains(dir));
+        runs.sort_by(|a, b| a.key.id.cmp(&b.key.id));
+
+        RepoView {
+            path: path.to_path_buf(),
+            name,
+            root,
+            dirty,
+            note,
+            gates,
+            runs,
+        }
+    }
+
+    /// One issue folder, from the cache when its files have not moved.
+    fn run(
+        &mut self,
+        dir: &Path,
+        repo_path: &Path,
+        repo_root: Option<&Path>,
+        note: Option<&str>,
+    ) -> Run {
+        let fingerprint = fingerprint(dir);
+        if let Some(cached) = self.runs.get(dir)
+            && cached.fingerprint == fingerprint
+            && cached.note.as_deref() == note
+        {
+            return cached.run.clone();
+        }
+        let run = scan_run(dir, repo_path, repo_root, note);
+        self.runs.insert(
+            dir.to_path_buf(),
+            CachedRun {
+                fingerprint,
+                note: note.map(str::to_owned),
+                run: run.clone(),
+            },
+        );
+        run
+    }
+
+    /// Whether the checkout is dirty, asked at most once per [`DIRTY_TTL`].
+    fn dirty(&mut self, root: &Path) -> bool {
+        let entry = self.repos.entry(root.to_path_buf()).or_default();
+        if let Some((at, dirty)) = entry.dirty
+            && at.elapsed() < DIRTY_TTL
+        {
+            return dirty;
+        }
+        let dirty = git_dirty(root);
+        entry.dirty = Some((Instant::now(), dirty));
+        dirty
+    }
+
+    /// How many gate steps the repository's template declares.
+    fn gate_count(&mut self, scan_root: &Path) -> usize {
+        let file = layout::workflow_file(scan_root);
+        let stamp = fs::metadata(&file)
+            .ok()
+            .map(|meta| (meta.len(), meta.modified().ok()));
+        let entry = self.repos.entry(scan_root.to_path_buf()).or_default();
+        if let Some((known, count)) = entry.gates
+            && known == stamp
+        {
+            return count;
+        }
+        let count = Workflow::read(&file)
+            .map(|workflow| {
+                workflow
+                    .steps
+                    .iter()
+                    .filter(|step| step.kind == StepKind::Gate)
+                    .count()
+            })
+            .unwrap_or(0);
+        entry.gates = Some((stamp, count));
+        count
     }
 }
 
-fn scan_repo(path: &Path) -> RepoView {
-    let name = folder_name(path);
-    let (root, mut note) = match Repo::open(path) {
-        Ok(repo) => (Some(repo.root), None),
-        // A configured folder that is not a git repository is still shown: it
-        // is the owner's configuration, and hiding it would explain nothing.
-        Err(error) => (None, Some(error.to_string())),
-    };
-    let scan_root = root.clone().unwrap_or_else(|| path.to_path_buf());
-    let dirty = root.as_deref().is_some_and(git_dirty);
-    // the repository's own gate steps, read once per scan: the Repos list shows
-    // the count, and a bad file is a note on the rows rather than a failed scan
-    let gates = Workflow::read(layout::workflow_file(&scan_root))
-        .map(|workflow| {
-            workflow
-                .steps
-                .iter()
-                .filter(|step| step.kind == StepKind::Gate)
-                .count()
-        })
-        .unwrap_or(0);
-
-    let scratch = scan_root.join(".scratch");
-    let mut runs = Vec::new();
-    match fs::read_dir(&scratch) {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                let dir = entry.path();
-                if !dir.is_dir() || !is_issue_folder(&dir) {
-                    continue;
-                }
-                runs.push(scan_run(&dir, path, root.as_deref(), note.as_deref()));
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            note.get_or_insert_with(|| format!("cannot read {}: {error}", scratch.display()));
-        }
+impl Default for Scanner {
+    fn default() -> Self {
+        Self::new()
     }
-    runs.sort_by(|a, b| a.key.id.cmp(&b.key.id));
+}
 
-    RepoView {
-        path: path.to_path_buf(),
-        name,
-        root,
-        dirty,
-        note,
-        gates,
-        runs,
+/// Read every configured repository, with no memory between calls.
+pub fn scan(repos: &[PathBuf]) -> Snapshot {
+    Scanner::new().scan(repos)
+}
+
+/// A folder's identity for the cache: every descendant's path, size and
+/// modified time, hashed in a stable order.
+///
+/// Reading metadata is the cheap half of a scan; parsing markdown and TOML is
+/// the half this avoids. A file added, removed or written moves the
+/// fingerprint, and so does a rewrite that keeps its size.
+fn fingerprint(dir: &Path) -> u64 {
+    let mut state = std::collections::hash_map::DefaultHasher::new();
+    fingerprint_into(dir, &mut state);
+    state.finish()
+}
+
+fn fingerprint_into(dir: &Path, state: &mut impl Hasher) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        false.hash(state);
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
+    for path in paths {
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        path.hash(state);
+        metadata.len().hash(state);
+        metadata.modified().ok().hash(state);
+        if metadata.is_dir() {
+            fingerprint_into(&path, state);
+        }
     }
 }
 
@@ -2225,6 +2381,37 @@ depends_on = []
             "the done and blocked rows are the attempts; an edge round, a \
              question and a disabled step are not"
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_scanner_reuses_an_unchanged_folder_and_reads_a_changed_one() {
+        let dir = scratch_dir("scanner");
+        let issue = dir.join(".scratch/demo");
+        fs::create_dir_all(&issue).expect("issue folder");
+        fs::write(issue.join("spec.md"), "# Demo\n").expect("spec");
+        let record = |status: &str| {
+            format!(
+                "---\nissue: demo\nworkflow: implement\nrevision: 1\nstatus: {status}\n\
+                 started: 2026-01-01T00:00:00Z\n---\n\n# Run\n"
+            )
+        };
+        fs::write(issue.join("run.md"), record("running")).expect("run.md");
+
+        let mut scanner = Scanner::new();
+        let first = scanner.scan(std::slice::from_ref(&dir));
+        assert_eq!(first.repos[0].runs[0].status, RunState::Running);
+        let same = scanner.scan(std::slice::from_ref(&dir));
+        assert_eq!(
+            first.repos, same.repos,
+            "an unchanged poll is the same reading, from the cache"
+        );
+
+        // A write changes the fingerprint even though the folder did not move.
+        fs::write(issue.join("run.md"), format!("{} \n", record("blocked"))).expect("run.md");
+        let changed = scanner.scan(std::slice::from_ref(&dir));
+        assert_eq!(changed.repos[0].runs[0].status, RunState::Blocked);
 
         let _ = fs::remove_dir_all(dir);
     }

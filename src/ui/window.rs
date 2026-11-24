@@ -501,12 +501,22 @@ impl FlowApp {
         self.scanning = true;
         self.scan_generation = self.scan_generation.wrapping_add(1);
         let generation = self.scan_generation;
+        // One scanner per loop: the memory is what makes the two-second poll
+        // cheap, and a restarted loop starts cold rather than carrying another
+        // repository list's readings.
+        let scanner = std::sync::Arc::new(std::sync::Mutex::new(store::Scanner::new()));
         cx.spawn(async move |this, cx| {
             loop {
                 let scan_repos = repos.clone();
+                let scanner = std::sync::Arc::clone(&scanner);
                 let next = cx
                     .background_executor()
-                    .spawn(async move { store::scan(&scan_repos) })
+                    .spawn(async move {
+                        let mut scanner = scanner
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        scanner.scan(&scan_repos)
+                    })
                     .await;
                 let keep_going = this.update(cx, |this, cx| {
                     if this.scan_generation != generation {

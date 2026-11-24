@@ -1044,14 +1044,23 @@ impl Workflow {
     /// yet.
     ///
     /// A target that is not an ancestor of the sender (a sibling branch, or a
-    /// step reachable only through the edge) has no such path. The span is then
-    /// the target alone: the work goes back to it, and the ordinary scheduler
-    /// walks forward from there, re-running whatever the target's own
-    /// dependents are.
+    /// step reachable only through the edge) has no such path. The span is the
+    /// target **and every step that reads it**, transitively: un-completing the
+    /// target alone would leave the steps it already fed marked done, so the
+    /// round would change a file none of them re-read. The sender is not
+    /// marked done when it takes an edge, so it re-enters on its own
+    /// dependencies rather than being named here.
     pub fn edge_span(&self, sender: &str, target: &str) -> Vec<String> {
         let upstream = self.upstream_of(sender);
         if !upstream.contains(target) {
-            return vec![target.to_owned()];
+            let mut span: Vec<String> = self.downstream_of(target).into_iter().collect();
+            span.sort_by_key(|id| {
+                self.steps
+                    .iter()
+                    .position(|step| &step.id == id)
+                    .unwrap_or(usize::MAX)
+            });
+            return span;
         }
         // Declaration order, so the span reads the way the file does and a
         // resumed run replays it in the same order it was first cleared.
@@ -1081,6 +1090,37 @@ impl Workflow {
             }
         }
         reached
+    }
+
+    /// Every step that reads `id`, transitively — `id` itself included.
+    ///
+    /// The reverse of [`Workflow::upstream_of`], read through
+    /// [`Workflow::resolve`] so a disabled step is transparent: a step that
+    /// waits on a disabled step is downstream of what that step waited for.
+    /// The edge span is the reader: when a branch is redone, everything that
+    /// consumed it has to see the new result.
+    fn downstream_of(&self, id: &str) -> BTreeSet<String> {
+        let mut reached = BTreeSet::new();
+        reached.insert(id.to_owned());
+        loop {
+            let mut added = false;
+            for step in &self.steps {
+                if reached.contains(&step.id) {
+                    continue;
+                }
+                if self
+                    .resolve(step)
+                    .iter()
+                    .any(|dependency| reached.contains(dependency))
+                {
+                    reached.insert(step.id.clone());
+                    added = true;
+                }
+            }
+            if !added {
+                return reached;
+            }
+        }
     }
 
     /// Collect every step `step` depends on, transitively, into `reached`.
@@ -2018,6 +2058,29 @@ depends-on = ["b"]
             graph.edge_span("review", "analyze"),
             vec!["analyze".to_owned(), "code".to_owned(), "review".to_owned()],
             "analyze is upstream, so the whole chain re-runs"
+        );
+    }
+
+    #[test]
+    fn a_sibling_edge_reruns_the_target_and_everything_that_read_it() {
+        // `left` and `right` are siblings under `root`, and `join` reads both.
+        // An edge from `left` to `right` is not a path back: the round has to
+        // re-run `right` and the join that consumed it, or the join would stay
+        // done over a `right.md` nobody rewrote.
+        let mut root = step("root", StepKind::Harness, &[]);
+        root.produces = Some("root.md".to_owned());
+        let mut left = step("left", StepKind::Harness, &["root"]);
+        left.produces = Some("left.md".to_owned());
+        left.edges = vec![edge("right", Trigger::VerdictChanges, Some(2))];
+        let mut right = step("right", StepKind::Harness, &["root"]);
+        right.produces = Some("right.md".to_owned());
+        let mut join = step("join", StepKind::Harness, &["left", "right"]);
+        join.produces = Some("join.md".to_owned());
+        let graph = workflow(vec![root, left, right, join]);
+        assert_eq!(
+            graph.edge_span("left", "right"),
+            vec!["right".to_owned(), "join".to_owned()],
+            "the target and its reader, in declaration order"
         );
     }
 

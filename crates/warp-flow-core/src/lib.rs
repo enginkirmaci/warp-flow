@@ -10,8 +10,8 @@
 //!   a model call of our own (ADR-0008, ADR-0011).
 //!
 //! This crate holds no UI and no model client. Gates run through `sh -c` on
-//! Unix; the Windows shell is a later step, and the gate module carries the
-//! `cfg` stub.
+//! Unix and `cmd /C` on Windows, one code path for the engine and for the
+//! screen's one-shot run.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

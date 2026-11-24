@@ -1,12 +1,11 @@
 //! Gates: a shell check a step's result must pass.
 //!
 //! A gate is nothing language-specific: a command, a working directory, a
-//! timeout and an exit code. On Unix the command runs through `sh -c`. The
-//! engine's own Windows path is deliberately a stub for now (its Windows
-//! release comes later) and returns [`Error::Unsupported`]; [`run_once`], the
-//! one-shot run the desktop screen offers, runs through `cmd /C` with
-//! `CREATE_NO_WINDOW` on Windows, so the screen works on both platforms while
-//! the engine's Windows path is still to come.
+//! timeout and an exit code. On Unix the command runs through `sh -c`; on
+//! Windows through `cmd /C` with `CREATE_NO_WINDOW`, and a timeout reaches the
+//! children `cmd` started with `taskkill /T`. The dispatched gate and the
+//! one-shot [`run_once`] the desktop screen offers share that path, so a gate
+//! that passes on one platform is measured by the same code as the other.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -75,8 +74,9 @@ impl Gate {
     ///
     /// On Unix this spawns `sh -c <command>` with both output streams captured
     /// together, polls for exit every 50 ms, and kills the whole process group
-    /// on timeout so a shell's children cannot outlive it. The Windows shell is
-    /// not implemented yet; that path returns [`Error::Unsupported`].
+    /// on timeout so a shell's children cannot outlive it. On Windows it
+    /// spawns `cmd /C` without a console window and kills the process tree
+    /// with `taskkill /T` on timeout.
     pub fn run(&self) -> Result<GateOutcome> {
         if !self.cwd.is_dir() {
             return Err(Error::Gate {
@@ -87,29 +87,20 @@ impl Gate {
                 ),
             });
         }
-        #[cfg(unix)]
-        {
-            let executed = execute(self, &self.cwd)?;
-            Ok(match executed.status {
-                None => GateOutcome::TimedOut {
-                    took: executed.took,
-                },
-                Some(status) if status.success() => GateOutcome::Passed {
-                    took: executed.took,
-                },
-                Some(status) => GateOutcome::Failed {
-                    code: status.code().unwrap_or(-1),
-                    took: executed.took,
-                    tail: tail_lines(&executed.output, TAIL_LINES),
-                },
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            Err(Error::Unsupported(
-                "gates run through `sh -c`; the Windows shell is not implemented yet",
-            ))
-        }
+        let executed = execute(self, &self.cwd)?;
+        Ok(match executed.status {
+            None => GateOutcome::TimedOut {
+                took: executed.took,
+            },
+            Some(status) if status.success() => GateOutcome::Passed {
+                took: executed.took,
+            },
+            Some(status) => GateOutcome::Failed {
+                code: status.code().unwrap_or(-1),
+                took: executed.took,
+                tail: tail_lines(&executed.output, TAIL_LINES),
+            },
+        })
     }
 }
 
