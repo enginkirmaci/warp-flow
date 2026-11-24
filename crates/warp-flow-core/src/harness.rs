@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use crate::artifact;
 use crate::graph::Step;
@@ -27,6 +28,30 @@ pub struct StepRequest {
     pub task: Option<u32>,
     /// Which attempt at this step this is, from 1.
     pub attempt: u32,
+    /// Where the harness leaves its session record, if it ran one.
+    ///
+    /// The harness does **not** write `sessions/` itself: the scheduler thread
+    /// is the issue folder's only writer, so the door leaves the record here
+    /// and the engine writes it with the step's own step, task and attempt. The
+    /// slot is shared through the request's clones, and the engine empties it
+    /// once it has written the file.
+    pub session: Arc<Mutex<Option<SessionRecord>>>,
+}
+
+/// What a harness session did, for the engine to write into `sessions/`.
+///
+/// The step, task and attempt are not here: the engine knows the job it
+/// dispatched, and a session file is named after that job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecord {
+    /// The harness the session ran in.
+    pub harness: String,
+    /// The harness's own session id.
+    pub session: String,
+    /// How the session ended: `done`, `failed` or `timed-out`.
+    pub status: String,
+    /// The transcript's text, or why it could not be read.
+    pub text: String,
 }
 
 /// What a harness reports for one step.
@@ -234,6 +259,7 @@ mod tests {
             prompt: "do the step".to_owned(),
             task: None,
             attempt: 1,
+            session: Arc::new(Mutex::new(None)),
         }
     }
 

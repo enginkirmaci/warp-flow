@@ -28,6 +28,7 @@ mod lock;
 pub mod merge;
 pub mod prepare;
 pub mod run;
+mod session;
 pub mod skill;
 pub mod worktree;
 

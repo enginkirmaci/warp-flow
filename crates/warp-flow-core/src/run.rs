@@ -46,7 +46,9 @@ use crate::artifact::{Document, FrontMatter, Issue, Status, Task};
 use crate::control::{Control, KeepGoing, Signal};
 use crate::gate::{Gate, GateOutcome};
 use crate::graph::{Edge, OnExhausted, Step, StepKind, Trigger, Workflow};
-use crate::harness::{Harness, HarnessFactory, SharedHarness, StepOutcome, StepRequest};
+use crate::harness::{
+    Harness, HarnessFactory, SessionRecord, SharedHarness, StepOutcome, StepRequest,
+};
 use crate::merge::{MergeOutcome, MergeRequest};
 use crate::worktree::{Repo, TaskWorktree};
 use crate::{Error, Result, skill};
@@ -282,6 +284,9 @@ struct StepReport {
     failure_outcome: FailureOutcome,
     /// The outcome, or the error that stopped the session.
     result: Result<StepOutcome>,
+    /// The session the harness ran, for the scheduler to write. `None` for a
+    /// gate, a cleanup, or a harness that failed before it opened a session.
+    session: Option<SessionRecord>,
 }
 
 /// Drives a workflow over one issue folder.
@@ -843,34 +848,52 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 .name(format!("warp-flow-step-{}", job.step.id))
                 .spawn(move || {
                     let failure_outcome = job.work.failure_outcome();
-                    let result = match job.work {
-                        StepWork::Gate { gate } => gate.run().map(|outcome| match outcome {
-                            GateOutcome::Passed { .. } => StepOutcome::Done {
-                                wrote: Vec::new(),
-                                text: "passed".to_owned(),
-                            },
-                            GateOutcome::Failed { code, tail, .. } => StepOutcome::Blocked {
-                                reason: format!(
-                                    "gate `{}` exited with code {code}\n{tail}",
-                                    gate.name
-                                ),
-                            },
-                            GateOutcome::TimedOut { took } => StepOutcome::Blocked {
-                                reason: format!("gate `{}` timed out after {took:?}", gate.name),
-                            },
-                        }),
-                        StepWork::Harness { prompt } => match factory.build() {
-                            Ok(mut harness) => harness.run(&StepRequest {
-                                step: job.step.clone(),
-                                issue,
-                                workdir: job.workdir.clone(),
-                                prompt,
-                                task: job.task.as_ref().map(|task| task.number),
-                                attempt: job.attempt,
+                    let (result, session) = match job.work {
+                        StepWork::Gate { gate } => (
+                            gate.run().map(|outcome| match outcome {
+                                GateOutcome::Passed { .. } => StepOutcome::Done {
+                                    wrote: Vec::new(),
+                                    text: "passed".to_owned(),
+                                },
+                                GateOutcome::Failed { code, tail, .. } => StepOutcome::Blocked {
+                                    reason: format!(
+                                        "gate `{}` exited with code {code}\n{tail}",
+                                        gate.name
+                                    ),
+                                },
+                                GateOutcome::TimedOut { took } => StepOutcome::Blocked {
+                                    reason: format!(
+                                        "gate `{}` timed out after {took:?}",
+                                        gate.name
+                                    ),
+                                },
                             }),
-                            Err(error) => Err(error),
-                        },
-                        StepWork::Cleanup { repo, tasks } => run_cleanup(&repo, &tasks),
+                            None,
+                        ),
+                        StepWork::Harness { prompt } => {
+                            // The harness leaves its session here; the scheduler
+                            // writes the file, because it is the issue folder's
+                            // only writer.
+                            let slot = Arc::new(Mutex::new(None));
+                            let result = match factory.build() {
+                                Ok(mut harness) => harness.run(&StepRequest {
+                                    step: job.step.clone(),
+                                    issue,
+                                    workdir: job.workdir.clone(),
+                                    prompt,
+                                    task: job.task.as_ref().map(|task| task.number),
+                                    attempt: job.attempt,
+                                    session: Arc::clone(&slot),
+                                }),
+                                Err(error) => Err(error),
+                            };
+                            let record = slot
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take();
+                            (result, record)
+                        }
+                        StepWork::Cleanup { repo, tasks } => (run_cleanup(&repo, &tasks), None),
                     };
                     // The scheduler thread is the only writer, so a worker
                     // hands its report over rather than recording it. A closed
@@ -882,6 +905,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
                         attempt: job.attempt,
                         failure_outcome,
                         result,
+                        session,
                     });
                 });
             match spawned {
@@ -961,6 +985,13 @@ impl<H: Harness + Send + 'static> Runner<H> {
         let Some(step) = self.workflow.step(&report.step).cloned() else {
             return Ok(None);
         };
+        // A session's transcript is written here, on the scheduler thread,
+        // before the report moves the record: the worker may not have been
+        // able to open a session at all, and a failed attempt's transcript is
+        // what the next one reads.
+        if let Some(session) = &report.session {
+            self.write_session(&step, report.task, report.attempt, session);
+        }
         // A per-task report that names no task, or names one whose file has
         // gone, cannot be applied to the graph: marking the step done without
         // a task would open every join above it. The report blocks instead.
@@ -1937,6 +1968,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
         attempt: u32,
     ) -> Result<Option<Failure>> {
         let workdir = self.step_workdir(step, task)?;
+        let session = Arc::new(Mutex::new(None));
         let request = StepRequest {
             step: step.clone(),
             issue: self.issue.clone(),
@@ -1944,6 +1976,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
             prompt: self.prompt(step, task)?,
             task: task.map(|task| task.number),
             attempt,
+            session: Arc::clone(&session),
         };
         let mut harness = match self.harness_factory.build() {
             Ok(harness) => harness,
@@ -1965,6 +1998,13 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 }));
             }
         };
+        let record = session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(record) = &record {
+            self.write_session(step, task.map(|task| task.number), attempt, record);
+        }
         match outcome {
             StepOutcome::Done { .. } => Ok(None),
             StepOutcome::Blocked { reason } => Ok(Some(Failure {
@@ -2653,6 +2693,26 @@ impl<H: Harness + Send + 'static> Runner<H> {
     }
 
     /// Write one repair record and return its path.
+    /// Write one harness session's record, best effort.
+    ///
+    /// A run must not fail because a finished session's transcript could not
+    /// be stored; the record line is how a person finds out it was not.
+    fn write_session(
+        &mut self,
+        step: &Step,
+        task: Option<u32>,
+        attempt: u32,
+        record: &SessionRecord,
+    ) {
+        if let Err(error) = crate::session::write(&self.issue, &step.id, task, attempt, record) {
+            let line = format!(
+                "session `{}` for `{}` could not be written: {error}",
+                record.session, step.id
+            );
+            self.log_line(&line);
+        }
+    }
+
     fn write_repair(
         &self,
         step: &Step,

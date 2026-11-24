@@ -587,6 +587,7 @@ fn step_request(prompt: &str) -> StepRequest {
         prompt: prompt.to_owned(),
         task: None,
         attempt: 1,
+        session: Arc::new(Mutex::new(None)),
     }
 }
 
@@ -595,22 +596,27 @@ fn a_round_trip_returns_the_assistant_text_only() {
     let fake = FakeDoor::start(Mode::RoundTrip);
     let mut harness = DoorHarness::connect(fake.port(), TOKEN).expect("connect to the fake door");
 
+    let request = step_request(PROMPT);
     let outcome = harness
-        .run(&step_request(PROMPT))
+        .run(&request)
         .expect("the fake door completes the step");
 
     match outcome {
         StepOutcome::Done { wrote, text } => {
-            // the one file a door step reports is the session it recorded
-            assert_eq!(
-                wrote.len(),
-                1,
-                "a door step reports its session file: {wrote:?}"
-            );
             assert!(
-                wrote[0].ends_with("sessions/code.md"),
-                "the session file is named for the step: {wrote:?}"
+                wrote.is_empty(),
+                "the harness writes no issue-folder file; the scheduler does: {wrote:?}"
             );
+            let record = request
+                .session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("the door leaves its session record on the request");
+            assert!(!record.harness.is_empty(), "the harness is recorded");
+            assert!(!record.session.is_empty(), "the session id is recorded");
+            assert_eq!(record.status, "done");
+            assert_eq!(record.text, "ok");
             assert_eq!(text, "ok", "the transcript's assistant text is the answer");
             assert_ne!(text, PROMPT, "the echoed prompt must not be returned");
         }
