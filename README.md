@@ -55,9 +55,9 @@ repositories and opens the selected one's workflow graph; it is also where a
 repository is added, starred and forgotten.
 
 The runs list's **New run** is the one screen action that creates an issue
-folder: a title and the request become `.scratch/<slug>/spec.md` (a title
-already in use gets `-2`, `-3`, …), the next scan lands the run in Triage, and
-the window opens it with **Start run** in reach.
+folder: the request becomes `.scratch/<slug>/spec.md`, its first line is the
+run's title, and a folder already in use gets `-2`, `-3`, …. The next scan
+lands the run in Triage, and the window opens it with **Start run** in reach.
 
 The run's head offers one verb at a time, decided from the record's own state:
 **Start run** for a run with no record, **Resume** for a paused, failed or

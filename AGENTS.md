@@ -76,8 +76,9 @@ rules that still matter move into `README.md` or this file.
   screens overflowed. Keep the state grouping: a lane
   band per non-empty `store::Column`, Waiting on you in `CHANGES`, Blocked in
   `DANGER`, the rest quiet. `new_run.rs` is the runs list's one filled primary: it
-  asks for a title and a request, writes `.scratch/<slug>/spec.md`, and hands
-  the window the run key to open once the next scan holds it.
+  asks only for the request, names the run from its first line, writes
+  `.scratch/<slug>/spec.md`, and hands the window the run key to open once the
+  next scan holds it.
 - `src/ui/actions.rs` — **the one answer to "what may this run be asked to do
   now"**: `plan(run, phase)` returns the one filled verb (`Start`, `Resume`,
   `Retry`), its reason when it has none, and whether Pause or Abandon apply.
