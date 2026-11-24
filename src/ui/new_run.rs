@@ -1026,6 +1026,16 @@ mod tests {
     }
 
     #[test]
+    fn a_path_without_a_file_name_is_refused() {
+        // `..` names no file, so there is no name to land the copy under and
+        // the refusal says what was passed rather than naming a made-up file.
+        let error = read_attachment(Path::new(".."), &[])
+            .err()
+            .expect("a path with no file name is refused");
+        assert_eq!(error, ".. has no file name, so it was not attached.");
+    }
+
+    #[test]
     fn an_attachment_section_follows_an_empty_body() {
         assert_eq!(
             spec_document("A heading", "A heading", &[attachment("notes.txt")]),
