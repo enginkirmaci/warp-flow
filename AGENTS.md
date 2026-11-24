@@ -142,7 +142,10 @@ process: the kit ties its `gsettings monitor` to the app's lifetime
   blocks the step with a repair naming it, and the engine never substitutes the
   harness it would have preferred (ADR-0017). The prompt is the skill
   document plus the step's inputs; a step's time budget is a silence window
-  that progress resets, not a cap on the whole turn. The one place a step's
+  that progress resets, not a cap on the whole turn. A session may stop and ask
+  instead of guessing: it writes `questions/ask-<step>[-task-NN].md` and
+  returns, the engine records a `waiting` row and starts the step again with
+  the answer once a person writes it (ADR-0025). The one place a step's
   judgement moves a run is an **edge** (ADR-0023): a step declares a list of
   back-edges, each with a trigger the engine reads from a *file or an exit
   code* — a harness step's `produces` front matter (`verdict: ready` /

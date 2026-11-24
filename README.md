@@ -111,6 +111,13 @@ un-completes the steps between the target and the sender and lets the ordinary
 readiness walk go forward again. A budget spent with no round clearing it fails
 the step and stops the run, unless the edge says `on_exhausted = "continue"`.
 
+A harness session may stop and ask too (ADR-0025): the prompt tells every
+session the shape of a question file, and a session that meets a decision only
+a person can make writes one and stops instead of guessing. The engine records
+a `waiting` row, starts no second session, and on the answer starts the step
+again with the question and answer as inputs. The answer lives in the file, so
+the run survives the app restarting.
+
 A merge step can name the step that resolves its conflict: `on_conflict` runs
 that step in the task's worktree when the rebase conflicts, and the merge
 retries. It can also name the step that repairs a failed per-task gate

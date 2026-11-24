@@ -559,6 +559,17 @@ impl<H: Harness + Send + 'static> Runner<H> {
                     work.push((step, None));
                 }
             }
+            // A harness step that asked a question is not dispatched again: the
+            // session stopped for a person, and the next session starts only
+            // once the answer is in the file (ADR-0025). The `waiting` row is
+            // what tells this run's ask from a stale file an older run left.
+            let mut runnable = Vec::with_capacity(work.len());
+            for (step, task) in work {
+                if self.session_waiting(&step, task.as_ref())?.is_none() {
+                    runnable.push((step, task));
+                }
+            }
+            let work = runnable;
             for (step, task) in work {
                 // The one control read of this boundary: before the step runs,
                 // never inside it. A pause therefore stops between two steps and
@@ -706,9 +717,15 @@ impl<H: Harness + Send + 'static> Runner<H> {
                             tasks,
                         }
                     }
-                    _ => StepWork::Harness {
-                        prompt: self.prompt(&step, task.as_ref())?,
-                    },
+                    _ => {
+                        // A session that asked on an earlier pass reads the
+                        // answer through its prompt; consuming it first is
+                        // what makes the prompt's input block find it.
+                        self.consume_answer(&step, task.as_ref())?;
+                        StepWork::Harness {
+                            prompt: self.prompt(&step, task.as_ref())?,
+                        }
+                    }
                 };
                 jobs.push(StepJob {
                     step,
@@ -753,6 +770,16 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 // `waiting` — and write it — once nothing else in the graph
                 // can advance.
                 if let Some(path) = self.pending_questions.values().next().cloned() {
+                    self.note = Some(format!("waiting on {}", path.display()));
+                    self.status = RunStatus::Waiting;
+                    self.write_run()?;
+                    self.log_line("run waiting on a question");
+                    return Ok(RunStatus::Waiting);
+                }
+                // A harness session's question is the same turn: no step
+                // dispatched, no question step in `pending_questions`, and the
+                // person still owes an answer.
+                if let Some(path) = self.waiting_session_question(&issue)? {
                     self.note = Some(format!("waiting on {}", path.display()));
                     self.status = RunStatus::Waiting;
                     self.write_run()?;
@@ -1034,6 +1061,40 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 }
             }
         };
+        // A dispatched session that wrote a question is waiting, not done: the
+        // answer arrives in the file, and the step is not marked (ADR-0025).
+        // Only a report that claims Done can have asked — a blocked session is
+        // a failure its repair describes.
+        if step.kind == StepKind::Harness && matches!(report.result, Ok(StepOutcome::Done { .. })) {
+            match self.open_question(&step, task.as_ref()) {
+                Ok(Some(path)) => {
+                    self.record_row(&step, task.as_ref(), report.attempt, "waiting")?;
+                    self.note = Some(format!("waiting on {}", path.display()));
+                    self.status = RunStatus::Waiting;
+                    self.write_run()?;
+                    let line = format!(
+                        "{} attempt {}: waiting on {}",
+                        step_label(&step, task.as_ref()),
+                        report.attempt,
+                        path.display()
+                    );
+                    self.log_line(&line);
+                    return Ok(Some(RunStatus::Waiting));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let failure = Failure {
+                        outcome: FailureOutcome::Blocked,
+                        summary: format!(
+                            "a question written by `{}` could not be read: {error}",
+                            step.id
+                        ),
+                        detail: None,
+                    };
+                    return self.block_report(&step, task.as_ref(), report.attempt, failure);
+                }
+            }
+        }
         // The verdict is read only where a step declares a verdict edge: it is
         // the one place a session's own judgement moves the run, and it moves
         // it through a declared file, never through the report's prose.
@@ -1736,17 +1797,22 @@ impl<H: Harness + Send + 'static> Runner<H> {
 
         let mut attempt = 1;
         loop {
-            let failure = self.attempt_harness(step, task, attempt)?;
-
-            match failure {
-                None => {
+            match self.attempt_harness(step, task, attempt)? {
+                Attempt::Done => {
                     let outcome = "done";
                     self.record_row(step, task, attempt, outcome)?;
                     let line = format!("{label} attempt {attempt}: {outcome}");
                     self.log_line(&line);
                     return Ok(StepRun::Done);
                 }
-                Some(failure) => {
+                Attempt::Waiting(path) => {
+                    self.record_row(step, task, attempt, "waiting")?;
+                    self.note = Some(format!("waiting on {}", path.display()));
+                    let line = format!("{label} attempt {attempt}: waiting on {}", path.display());
+                    self.log_line(&line);
+                    return Ok(StepRun::Waiting(path));
+                }
+                Attempt::Failed(failure) => {
                     if self.register_failure(step, task, attempt, &failure, Retry::WhileBudget)? {
                         return Ok(StepRun::Blocked);
                     }
@@ -1966,8 +2032,12 @@ impl<H: Harness + Send + 'static> Runner<H> {
         step: &Step,
         task: Option<&Task>,
         attempt: u32,
-    ) -> Result<Option<Failure>> {
+    ) -> Result<Attempt> {
         let workdir = self.step_workdir(step, task)?;
+        // A session that asked on an earlier pass reads the answer now. The
+        // question is consumed so the same answer cannot be read twice, and
+        // the prompt below names it (ADR-0025).
+        self.consume_answer(step, task)?;
         let session = Arc::new(Mutex::new(None));
         let request = StepRequest {
             step: step.clone(),
@@ -1981,7 +2051,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
         let mut harness = match self.harness_factory.build() {
             Ok(harness) => harness,
             Err(error) => {
-                return Ok(Some(Failure {
+                return Ok(Attempt::Failed(Failure {
                     outcome: FailureOutcome::Blocked,
                     summary: error.to_string(),
                     detail: None,
@@ -1991,7 +2061,7 @@ impl<H: Harness + Send + 'static> Runner<H> {
         let outcome = match harness.run(&request) {
             Ok(outcome) => outcome,
             Err(error) => {
-                return Ok(Some(Failure {
+                return Ok(Attempt::Failed(Failure {
                     outcome: FailureOutcome::Blocked,
                     summary: error.to_string(),
                     detail: None,
@@ -2005,9 +2075,26 @@ impl<H: Harness + Send + 'static> Runner<H> {
         if let Some(record) = &record {
             self.write_session(step, task.map(|task| task.number), attempt, record);
         }
+        // A session that could not decide writes a question and stops. That is
+        // a wait, not a failure and not a done: the step is not marked, and
+        // the answer arrives in the file rather than in `run.md` (ADR-0025).
+        match self.open_question(step, task) {
+            Ok(Some(path)) => return Ok(Attempt::Waiting(path)),
+            Ok(None) => {}
+            Err(error) => {
+                return Ok(Attempt::Failed(Failure {
+                    outcome: FailureOutcome::Blocked,
+                    summary: format!(
+                        "a question written by `{}` could not be read: {error}",
+                        step.id
+                    ),
+                    detail: None,
+                }));
+            }
+        }
         match outcome {
-            StepOutcome::Done { .. } => Ok(None),
-            StepOutcome::Blocked { reason } => Ok(Some(Failure {
+            StepOutcome::Done { .. } => Ok(Attempt::Done),
+            StepOutcome::Blocked { reason } => Ok(Attempt::Failed(Failure {
                 outcome: FailureOutcome::Blocked,
                 summary: format!("harness blocked: {reason}"),
                 detail: None,
@@ -2020,12 +2107,78 @@ impl<H: Harness + Send + 'static> Runner<H> {
         self.question_in_state(step, task, "answered")
     }
 
+    /// Mark the newest answered question for this step consumed.
+    ///
+    /// The prompt reads a `consumed` question back as one of the step's inputs;
+    /// the state is also what stops the same answer steering a second session.
+    fn consume_answer(&mut self, step: &Step, task: Option<&Task>) -> Result<Option<PathBuf>> {
+        let Some(path) = self.answered_question(step, task)? else {
+            return Ok(None);
+        };
+        let mut document = Document::read(&path)?;
+        document.front.set("state", "consumed");
+        document.write_atomic(&path)?;
+        Ok(Some(path))
+    }
+
     /// The newest question for this step and task that is still open.
     ///
     /// This is how a run that found an unanswered question waits on it instead
     /// of asking it again.
     fn open_question(&self, step: &Step, task: Option<&Task>) -> Result<Option<PathBuf>> {
         self.question_in_state(step, task, "open")
+    }
+
+    /// The question a harness session stopped on, if this run recorded the
+    /// wait.
+    ///
+    /// The `waiting` row is the guard against a stale question file: an older
+    /// run may have left one open, and it must not stop a run that never asked
+    /// it. A question step has its own `pending_questions` set; this is the
+    /// harness step's equivalent (ADR-0025).
+    fn session_waiting(&self, step: &Step, task: Option<&Task>) -> Result<Option<PathBuf>> {
+        if step.kind != StepKind::Harness {
+            return Ok(None);
+        }
+        let Some(row) = self.newest_row(&step.id, task.map(|task| task.number)) else {
+            return Ok(None);
+        };
+        if row.outcome != "waiting" {
+            return Ok(None);
+        }
+        self.open_question(step, task)
+    }
+
+    /// The first question any harness session of this run is waiting on.
+    fn waiting_session_question(&self, issue: &Issue) -> Result<Option<PathBuf>> {
+        for step in self
+            .workflow
+            .enabled_steps()
+            .filter(|step| step.kind == StepKind::Harness)
+        {
+            if step.per_task {
+                for task in issue.tasks() {
+                    if task.status.is_resolved() {
+                        continue;
+                    }
+                    if let Some(path) = self.session_waiting(step, Some(task))? {
+                        return Ok(Some(path));
+                    }
+                }
+            } else if let Some(path) = self.session_waiting(step, None)? {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The newest log row for one step and task.
+    fn newest_row(&self, step: &str, task: Option<u32>) -> Option<LogRow> {
+        self.rows
+            .iter()
+            .filter_map(|line| LogRow::parse(line))
+            .filter(|row| row.step == step && row.task == task)
+            .last()
     }
 
     /// The newest question for this step and task whose `state:` is `state`.
@@ -2577,6 +2730,52 @@ impl<H: Harness + Send + 'static> Runner<H> {
                 task.path.display()
             ));
         }
+        if step.kind == StepKind::Harness {
+            // A session may stop and ask instead of guessing. The protocol is
+            // the same question file a question step writes, and the engine
+            // waits on it exactly as it waits on a question step's (ADR-0025).
+            let name = match task {
+                Some(task) => format!("ask-{}-task-{:02}.md", step.id, task.number),
+                None => format!("ask-{}.md", step.id),
+            };
+            let task_line = match task {
+                Some(task) => format!("task: {:02}\n", task.number),
+                None => String::new(),
+            };
+            prompt.push_str(&format!(
+                "\nIf only a person can decide something you cannot, write one question and \
+                 stop instead of guessing. The file is `{}` and its front matter is:\n\n\
+                 ---\nkind: question\nasked_by: {}\nstate: open\n{task_line}---\n\n\
+                 # Question: <what you need decided>\n\n<why it matters and the options you \
+                 see>\n\nThen stop without writing {}; the run waits for the answer and starts \
+                 this step again with it. Do not ask and keep working in the same session.\n",
+                self.issue.join("questions").join(&name).display(),
+                step.id,
+                step.produces.as_deref().unwrap_or("your result"),
+            ));
+            // A session that asked before reads its answer as an input.
+            if let Some(path) = self.question_in_state(step, task, "consumed")? {
+                let document = Document::read(&path)?;
+                let title = document
+                    .body
+                    .lines()
+                    .find(|line| line.trim_start().starts_with('#'))
+                    .map(|line| line.trim_start_matches('#').trim().to_owned())
+                    .unwrap_or_else(|| "your earlier question".to_owned());
+                let answer = document
+                    .front
+                    .get("answer")
+                    .map(str::trim)
+                    .unwrap_or_default();
+                if !answer.is_empty() {
+                    prompt.push_str(&format!(
+                        "\nOn an earlier attempt you asked the person: {title}\nThey answered: \
+                         {answer}\nThe question and answer are in `{}`. Act on the answer.\n",
+                        path.strip_prefix(&self.issue).unwrap_or(&path).display()
+                    ));
+                }
+            }
+        }
         // A step that is the target of an edge reads the findings of the step
         // that sent its work back. The paragraph appears only after a return —
         // naming a file no step had written would send the session looking for
@@ -2861,6 +3060,17 @@ enum StepRun {
     /// The step took one of its edges: the work went back to the target, and
     /// the step itself is not done — the span it cleared includes it.
     Looped,
+}
+
+/// One harness attempt's result, before the step's loop turns it into a row.
+enum Attempt {
+    /// The session finished and wrote whatever the step asked for.
+    Done,
+    /// The session wrote a question and stopped: the run waits on a person,
+    /// and the step is not done (ADR-0025).
+    Waiting(PathBuf),
+    /// The session could not finish.
+    Failed(Failure),
 }
 
 /// One failed attempt, as the repair record and the log need it.
@@ -3689,6 +3899,104 @@ per_task = true
         assert_eq!(runner.run().expect("run"), RunStatus::Waiting);
         let question = Document::read(issue.join("questions/01.md")).expect("question parses");
         assert!(question.body.contains("task 01"), "{}", question.body);
+    }
+
+    #[test]
+    fn a_harness_session_may_stop_and_ask_and_reads_the_answer_when_it_resumes() {
+        // ADR-0025: a harness step may write a question and stop instead of
+        // guessing. The run waits like a question step, the step is not marked
+        // done, and the next session reads the answer in its prompt.
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        let question = issue.join("questions/ask-code.md");
+        let mut harness = FakeHarness::new();
+        harness.script(
+            "code",
+            writes(
+                &issue,
+                "questions/ask-code.md",
+                "---\nkind: question\nasked_by: code\nstate: open\n---\n\n\
+                 # Question: How should the API behave?\n\n\
+                 The spec does not say whether the call may block.\n"
+                    .to_owned(),
+            ),
+        );
+        let workflow = workflow(
+            r#"
+schema = 3
+name = "implement"
+revision = 1
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+produces = "code.md"
+"#,
+        );
+        let mut config = RunnerConfig::new(&issue, workflow.clone(), harness);
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("first run"), RunStatus::Waiting);
+        let document = run_md(&issue);
+        assert!(
+            document.body.contains("| code | - | 1 | waiting |"),
+            "{}",
+            document.body
+        );
+        assert!(question.is_file(), "the session wrote the question");
+        let first = runner.harness().calls();
+        assert_eq!(first.len(), 1);
+        assert!(
+            first[0].prompt.contains("ask-code.md"),
+            "the protocol names the file: {}",
+            first[0].prompt
+        );
+
+        // An open question keeps the step from starting a second session when
+        // the record is resumed as it stands.
+        drop(runner);
+        let mut config = RunnerConfig::new(&issue, workflow.clone(), FakeHarness::new());
+        config.log = Box::new(MemoryLog::new());
+        let mut still = Runner::resume(config).expect("resume");
+        assert_eq!(still.run().expect("still waiting"), RunStatus::Waiting);
+        assert!(
+            still.harness().calls().is_empty(),
+            "no second session while the question is open"
+        );
+        drop(still);
+
+        // What the CLI's `answer` command writes into the question file.
+        let mut asked = Document::read(&question).expect("question parses");
+        asked.front.set("answer", "it may block");
+        asked.front.set("state", "answered");
+        asked.write_atomic(&question).expect("answer is written");
+
+        let mut harness = FakeHarness::new();
+        harness.script("code", writes(&issue, "code.md", "# Code\n".to_owned()));
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.log = Box::new(MemoryLog::new());
+        let mut resumed = Runner::resume(config).expect("resume");
+        assert_eq!(resumed.run().expect("resumed run"), RunStatus::Done);
+        let calls = resumed.harness().calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].prompt.contains("They answered: it may block"),
+            "the answer is an input to the next session: {}",
+            calls[0].prompt
+        );
+        let asked = Document::read(&question).expect("question parses");
+        assert_eq!(
+            asked.front.get("state"),
+            Some("consumed"),
+            "the answer was acted on, so it is not read twice"
+        );
+        assert!(
+            run_md(&issue).body.contains("| code | - | 2 | done |"),
+            "{}",
+            run_md(&issue).body
+        );
     }
 
     #[test]

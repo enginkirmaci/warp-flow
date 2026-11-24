@@ -143,8 +143,8 @@ sürümüne aittir; bu belge değişiklik sonrası durumu anlatır.
 ## 3. Kalan işler — karar gerektirenler
 
 Aşağıdakiler bilerek yapılmadı; her biri bir ürün/sözleşme kararı istiyor.
-3, 4, 12 ve 17 ikinci turda (§4), 1, 2, 8 ve 16 üçüncü turda (§6) karara
-bağlandı ve uygulandı.
+3, 4, 12 ve 17 ikinci turda (§4), 1, 2, 8 ve 16 üçüncü turda (§6), kalanı
+dördüncü turda (§7) karara bağlandı; 6 ve 7 bilinçli olarak ertelendi.
 
 | # | Konu | Neden karar gerekiyor | Öneri |
 |---|---|---|---|
@@ -291,3 +291,84 @@ satırlar tarihsel kayıt olarak bırakıldı; güncel durum bu bölümdedir.
   7 (worktree tazeleme), 9 (`edge_span` torunları), 10 (UI thread'inde
   `prepare`), 11 (oturum yazıcısı), 13 (`run.md` performansı),
   14 (artımlı tarama), 15 (AI'nın akışı şekillendirmesi).
+
+## 7. Dördüncü tur — kalan dokuz karar (2026-11-24)
+
+### 5 — Windows kapıları
+
+- `Gate::run` artık platform ayrımı yapmıyor: Unix'te `sh -c`, Windows'ta
+  `cmd /C` + `CREATE_NO_WINDOW`, zaman aşımında `kill_tree` Windows'ta
+  `taskkill /T` kullanıyor. Motorun kapısı ile ekranın tek seferlik
+  `run_once` yolu aynı `execute` fonksiyonundan geçiyor.
+- Burada Windows çalıştırılamadı; `cargo check -p warp-flow-core --target
+  x86_64-pc-windows-msvc` temiz (cfg(windows) kodu derleniyor).
+
+### 6 — `max_parallel` ayrımı: bırakıldı
+
+- Karar: tek bütçe ve door'un küresel sessizlik/tavan değerleri kalıyor.
+  Küçük grafiklerde fark etmiyor; ayrım ancak gerçek bir darboğaz görülürse
+  yapılacak.
+- 7 — worktree tazeleme de bırakıldı: kuyruk zaten rebase ediyor ve yeni
+  `on_gate_failed` düşen kapıyı onarıyor (ADR-0024).
+
+### 9 — `edge_span` torunları
+
+- Hedef sender'ın atası değilse kapsam artık yalnız hedef değil, hedef **ve
+  onu okuyan her adım** (`Workflow::downstream_of`, `resolve` üzerinden
+  dolayısıyla disabled adımlar şeffaf). Eski davranış hedefi yeniden
+  koşturup okuyucuları "done" bırakıyordu.
+- Test: `a_sibling_edge_reruns_the_target_and_everything_that_read_it`.
+
+### 10 + 11 — Host sahipliği
+
+- `prepare`, `pin_workflow` ve `require_clean` artık worker'da: `start` /
+  `resume` yalnız ucuz ve senkron kararları veriyor (kanonik klasör,
+  done/resume/fresh kayıt kontrolü, depo başına tek koşu — depo `.git`
+  dosyasından bulunuyor). Worker'ın reddi koşunun `Failed` fazı ve hatası
+  oluyor; pencere bunu zaten çiziyor.
+- `RunState`'in `repo` ve `title` alanları mutex: slot oluştuktan sonra
+  worker dolduruyor, snapshot yanlış tahmin okumuyor.
+- Oturum dosyaları artık door tarafından değil **scheduler** tarafından
+  yazılıyor: `StepRequest` paylaşılan bir `SessionRecord` yuvası taşıyor,
+  worker raporu `session` alanıyla dönüyor, `session::write` scheduler
+  thread'inde çalışıyor (merge'in kendi turunda çalıştırdığı adımlar dahil).
+- Testler: `host_probe` retleri artık faz/hata üzerinden bekliyor,
+  `actions_probe` UI hatasını failed fazında okuyor, `door_probe` kaydın
+  istek üzerinde bırakıldığını doğruluyor.
+
+### 13 + 14 — Performans: artımlı tarama
+
+- `store::Scanner`: issue klasörleri dosya adı/boyut/mtime parmak iziyle
+  önbellekleniyor; değişmeyen klasör son `Run`'ı klonluyor. Kapı sayısı
+  workflow dosyasının metadata'sıyla, kirli işareti 10 saniyelik TTL ile
+  önbellekte. Pencere tarama döngüsü tek bir `Scanner` sahibi; `store::scan`
+  probe'lar için tek seferlik sarmalayıcı olarak kaldı.
+- `run.md`'nin satır başına yeniden yazılması bu turda ele alınmadı: ölçüm
+  olmadan yan dosya formatı değiştirmek erken bir karmaşıklık olurdu.
+- Test: `a_scanner_reuses_an_unchanged_folder_and_reads_a_changed_one`.
+
+### 15 — Oturum içinde soru: `ask` protokolü
+
+- Her harness adımının prompt'u protokolü taşıyor: karar veremiyorsa
+  `questions/ask-<step>[-task-NN].md` dosyasını `kind: question`,
+  `asked_by: <step>`, `state: open` (per-task'ta `task: NN`) ile yazar ve
+  durur; `produces` dosyasını yazmaz.
+- Motor oturum döndükten sonra açık soruyu görürse `waiting` satırı yazar,
+  adımı "done" yapmaz ve koşu `Waiting` olur. Açık soru varken adım yeniden
+  gönderilmez.
+- Cevap gelince (`state: answered`) motor soruyu `consumed` yapar, cevabı
+  prompt'a koyar ve adımı yeniden çalıştırır. `waiting` satırı, eski bir
+  soru dosyasının hiç sormamış bir koşuyu kilitlemesini engelliyor.
+- Merge'in adlandırdığı adım soru sorarsa merge turu beklemez: bloke eder
+  ve repair soruyu adlandırır; sonraki merge denemesi cevabı okur.
+- ADR-0025 yazıldı; README ve AGENTS protokolü anıyor.
+- Test: `a_harness_session_may_stop_and_ask_and_reads_the_answer_when_it_resumes`.
+
+### Dördüncü tur doğrulaması
+
+- `cargo test --locked -p warp-flow-core`: **218** birim testi + probe'lar.
+- `cargo test --locked`: **78** birim testi + probe'lar.
+- Her iki crate'te clippy `-D warnings` ve `cargo fmt --all -- --check` temiz;
+  `warp-flow-core` Windows hedefiyle `cargo check` temiz.
+- Açık karar kalmadı; 6 ve 7 bilinçli olarak ertelendi, 13'ün `run.md`
+  kısmı ölçüm bekliyor.
