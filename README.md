@@ -122,10 +122,11 @@ A merge step can name the step that resolves its conflict: `on_conflict` runs
 that step in the task's worktree when the rebase conflicts, and the merge
 retries. It can also name the step that repairs a failed per-task gate
 (`on_gate_failed`): the gate measured the rebased branch, so retrying the same
-merge cannot help until that branch changes (ADR-0024). The run closes with two
-sibling steps — `summary` writes the report, `cleanup` removes each merged
-task's worktree and branch — so the issue folder outlives the run while the
-working debris does not (ADR-0020, ADR-0021).
+merge cannot help until that branch changes (ADR-0024). The run closes with
+`summary`, which writes the report, then `cleanup`, which names both the merge
+and the summary and removes each merged task's worktree and branch — so the
+report is written while those branches still exist, and the issue folder
+outlives the run while the working debris does not (ADR-0020, ADR-0021).
 
 The engine owns an issue folder while it drives a run: Artifacts refuses an
 edit then (one line says why), while the repository's Workflow template may

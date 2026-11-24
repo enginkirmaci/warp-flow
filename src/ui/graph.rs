@@ -1948,34 +1948,55 @@ skill = "a"
 
     #[test]
     fn a_fork_shares_one_stem() {
+        // The merge forks into the conflict step, the gate fixer and the
+        // summary. The cleanup names the summary as well as the merge, so it
+        // sits one rank below the fork instead of joining its bar.
         let layout = layout(&shipped());
         let merge = layout.node("merge").unwrap();
         let mut bars = Vec::new();
-        for name in ["resolve-conflict", "fix-gates", "summary", "cleanup"] {
+        for name in ["resolve-conflict", "fix-gates", "summary"] {
             let link = link(&layout, "merge", name);
             assert!(!link.back && !link.long);
             let drawn = stroke(&layout, link);
-            assert_eq!(
-                drawn.points.len(),
-                4,
-                "stem, run, drop: one corner each way"
-            );
             assert_eq!(
                 drawn.points[0],
                 (merge.x + NODE_W / 2., merge.y + NODE_H),
                 "`{name}`'s line leaves the merge's bottom middle"
             );
-            assert_eq!(drawn.points[1].0, drawn.points[0].0, "straight down");
+            let end = layout.node(name).unwrap();
             assert_eq!(
-                drawn.points[2].0, drawn.points[3].0,
-                "and straight down again"
+                drawn.points.last().copied(),
+                Some((end.x + NODE_W / 2., end.y)),
+                "and drops into `{name}`'s top middle"
             );
-            assert_eq!(drawn.points[3].1, layout.node(name).unwrap().y);
-            bars.push(drawn.points[1].1);
+            // The middle step is directly under the merge, so its line is the
+            // straight stem; the outer two turn out and back in on one bar.
+            match drawn.points.len() {
+                2 => assert_eq!(name, "fix-gates", "only the middle line is straight"),
+                4 => {
+                    assert_eq!(drawn.points[1].0, drawn.points[0].0, "straight down");
+                    assert_eq!(
+                        drawn.points[2].0, drawn.points[3].0,
+                        "and straight down again"
+                    );
+                    bars.push(drawn.points[1].1);
+                }
+                len => panic!("`{name}`'s line has {len} points"),
+            }
         }
+        assert_eq!(
+            bars.len(),
+            2,
+            "two turning lines and one straight stem: {bars:?}"
+        );
+        assert_eq!(
+            bars[0], bars[1],
+            "the two turning runs are one bar: {bars:?}"
+        );
+        let to_cleanup = link(&layout, "summary", "cleanup");
         assert!(
-            bars.windows(2).all(|pair| pair[0] == pair[1]),
-            "the four runs are one bar: {bars:?}"
+            !to_cleanup.back && !to_cleanup.long,
+            "the cleanup waits for the summary: one rank, no skipped line"
         );
     }
 
@@ -2201,7 +2222,7 @@ depends_on = ["one"]
 
     #[test]
     fn a_loop_takes_the_nearest_lane_inside_the_picture() {
-        // The widest rank is the four siblings at the bottom. A loop used to
+        // The widest rank is the three siblings at the bottom. A loop used to
         // run out past it whatever it passed, which put the chain's three
         // loops 400 points from the chain and each in a lane of its own.
         let layout = layout(&shipped());
@@ -2227,7 +2248,7 @@ depends_on = ["one"]
         );
         assert_eq!(
             layout.width,
-            4. * NODE_W + 3. * GAP_X,
+            3. * NODE_W + 2. * GAP_X,
             "no lane is outside the picture, so no room is charged"
         );
         for link in [to_analyze, to_code, from_test] {

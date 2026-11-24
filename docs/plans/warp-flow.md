@@ -226,7 +226,7 @@ run (ADR-0021); both are declared in this one file like every other step.
 ## The graph
 
 `analyze → approve-plan → [ready tasks: code → review → fmt → clippy → test] →
-bump → merge → [resolve-conflict] → summary ∥ cleanup`, with two node kinds the
+bump → merge → [resolve-conflict] → summary → cleanup`, with two node kinds the
 engine may still insert: `research` (when `analyze` finds an open question) and
 `repair` (after a failed attempt). The conflict step is declared and named by
 its merge, not inserted (ADR-0020); the cleanup is a step like any other
@@ -235,18 +235,18 @@ its merge, not inserted (ADR-0020); the cleanup is a step like any other
 `bump`, `summary` and `cleanup` are not per task: they wait for a per-task step,
 which means they run once, after every task has it. `bump` moves the version
 before the queue lands anything; `summary` writes the run's closing report;
-`cleanup` removes the working debris. `summary` and `cleanup` are siblings —
-both name `merge`, so neither waits for the other, and the engine may run them
-in one wave.
+`cleanup` removes the working debris after it — it names both `merge` and
+`summary`, so the report is written before the branches it describes are
+deleted.
 
 The engine runs a wave at once, bounded by the workflow's `max_parallel`, with
 two rules that are not choices: two steps that would run in the same folder
 never run together, and a merge step is a barrier — it waits for everything in
 flight and starts nothing while it runs, because the merge queue refuses a
 checkout with uncommitted work. The cleanup is engine work that never touches
-the checkout, so the one-folder rule does not hold it back from the summary. A
-harness cannot serve two sessions, so each dispatched step gets its own door
-connection.
+the checkout, so the one-folder rule alone would let it run beside the summary;
+the template names the summary so the report is written first. A harness cannot
+serve two sessions, so each dispatched step gets its own door connection.
 
 ## The UI
 

@@ -230,9 +230,9 @@ fn the_repositorys_own_template_names_its_conflict_step() {
 
 #[test]
 fn the_repositorys_own_template_cleans_up_after_the_merge() {
-    // The run closes with two siblings (ADR-0021): the summary writes the
-    // report and the cleanup removes the merged tasks' worktrees and branches.
-    // Both name `merge`, so neither waits for the other.
+    // The run closes with the summary, then the cleanup (ADR-0021): the
+    // cleanup names both `merge` and `summary`, so the report about each
+    // landed task's branch is written before the branch is removed.
     let graph = template();
     let cleanup = graph
         .step("cleanup")
@@ -241,14 +241,22 @@ fn the_repositorys_own_template_cleans_up_after_the_merge() {
     assert!(!cleanup.per_task, "one cleanup belongs to the run");
     assert_eq!(
         cleanup.depends_on.as_deref(),
-        Some(&["merge".to_owned()][..])
+        Some(&["merge".to_owned(), "summary".to_owned()][..]),
+        "the cleanup names the summary it runs after"
     );
 
     let summary = graph.step("summary").expect("summary is in the template");
     assert_eq!(
         summary.depends_on.as_deref(),
         Some(&["merge".to_owned()][..]),
-        "the summary names the merge too: the two are siblings"
+        "the summary names the merge"
+    );
+    let ids: Vec<&str> = graph.steps.iter().map(|step| step.id.as_str()).collect();
+    let summary_at = ids.iter().position(|id| *id == "summary").expect("summary");
+    let cleanup_at = ids.iter().position(|id| *id == "cleanup").expect("cleanup");
+    assert!(
+        cleanup_at > summary_at,
+        "the cleanup is declared after the summary it waits for"
     );
 }
 

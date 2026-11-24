@@ -3,12 +3,13 @@
 _Status: accepted. 2026-11-23. Supersedes the plan's decision 14 in one
 respect: a merged task's branch does not outlive the run._
 
-A `cleanup` step, not per task, ends a run after its last merge and beside its
-summary: both name the merge (`depends_on = ["merge"]`), so neither waits for
-the other and the engine may run them in one wave. For every task the run
-resolved, the engine removes the task's worktree — force, so the build output a
-gate left in it goes with the folder — deletes the branch, and prunes what git
-still lists. `main`, the issue folder and every unresolved task are untouched.
+A `cleanup` step, not per task, ends a run after its last merge and after its
+summary: it names both (`depends_on = ["merge", "summary"]`), so the closing
+report is written while each landed task's branch still exists and the cleanup
+removes the worktrees and branches afterwards. For every task the run resolved,
+the engine removes the task's worktree — force, so the build output a gate left
+in it goes with the folder — deletes the branch, and prunes what git still
+lists. `main`, the issue folder and every unresolved task are untouched.
 A cleanup that cannot finish blocks the run with a repair, and the step is
 idempotent: a resume runs it again.
 
@@ -37,12 +38,15 @@ run's close is the place to say so); leaving all of it to `flow gc` (that
 command is for old issue folders and for the debris a blocked run leaves, not
 for the run that just landed).
 
-Consequences: a finished run's close is two sibling steps, `summary` and
-`cleanup`. The summary cannot report the cleanup it runs beside; the run's log
-is where the cleanup's outcome is read. A done run's Task & diff has no branch,
-so the screen should say the task landed and its branch was cleaned rather than
-that it never had one. The issue folder still outlives the run, so decision 14's
-promise holds where a person's record is concerned; `flow gc` stays the separate
-command for old issue folders and for a blocked run's debris. The one-folder
-rule does not serialize the cleanup with the summary: it never touches the
-checkout, only `<repo>/.worktrees/` and git's refs.
+Consequences: a finished run's close is the summary and then the cleanup that
+names it. The summary is written before the cleanup runs, so it cannot report
+the cleanup's outcome; the run's log is where that is read. A done run's Task &
+diff has no branch, so the screen should say the task landed and its branch was
+cleaned rather than that it never had one. The issue folder still outlives the
+run, so decision 14's promise holds where a person's record is concerned;
+`flow gc` stays the separate command for old issue folders and for a blocked
+run's debris. The cleanup never touches the checkout — only
+`<repo>/.worktrees/` and git's refs — so the one-folder rule alone would not
+hold it back from the summary; naming the summary orders the two anyway,
+because a report about a branch should not be written after the branch is
+deleted.
