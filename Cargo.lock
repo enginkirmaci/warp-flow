@@ -7832,7 +7832,7 @@ dependencies = [
 
 [[package]]
 name = "warp-flow"
-version = "0.1.81"
+version = "0.1.82"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -7854,7 +7854,7 @@ dependencies = [
 
 [[package]]
 name = "warp-flow-core"
-version = "0.1.81"
+version = "0.1.82"
 dependencies = [
  "serde",
  "serde_json",
