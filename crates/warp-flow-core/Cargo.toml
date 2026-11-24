@@ -1,6 +1,6 @@
 [package]
 name = "warp-flow-core"
-version = "0.1.84"
+version = "0.1.85"
 edition = "2024"
 description = "The warp-flow engine: issue folder protocol, workflow graph, scheduler, gates"
 license = "GPL-3.0"

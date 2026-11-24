@@ -1542,8 +1542,9 @@ depends_on = ["left", "middle", "right"]
     }
 
     /// The pipeline this repository ships: a chain, a fork into two gates and
-    /// the join under them, two loops, and the four siblings after the merge.
-    /// It is the picture the run screen draws for this repository's own runs.
+    /// the join under them, two loops, and the three siblings after the merge
+    /// with the cleanup under them. It is the picture the run screen draws for
+    /// this repository's own runs.
     fn shipped() -> Workflow {
         graph(include_str!("../../.flow/workflow.toml"))
     }
