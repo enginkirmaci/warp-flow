@@ -21,7 +21,7 @@ use std::cell::RefCell;
 use gpui::prelude::*;
 use gpui::{
     AnyElement, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight, MouseButton,
-    ScrollHandle, SharedString, Window, div, px,
+    ScrollHandle, SharedString, Window, div, px, relative,
 };
 use gpui_kit::component::input::InputState;
 use warpui_kit_core::list_nav::ListKey;
@@ -33,10 +33,12 @@ use warpui_kit_markdown::LiveEditorState;
 use crate::app::{Launch, Quit, QuitOnDrop};
 use crate::door::SharedBoard;
 use crate::host::{self, Host, HostSnapshot};
-use crate::store::{self, Column, RunFilter, RunKey, Snapshot};
+use crate::notify::{self, NoticeKind};
+use crate::store::{self, Column, RunFilter, RunKey, RunState, Snapshot};
 use crate::theme;
 use crate::ui::screens::settings::SettingsGroup;
 use crate::ui::screens::{Screen, ScreenRepo, ScreenRun, Screens};
+use warpui_kit_core::icon;
 
 gpui::actions!(
     flow,
@@ -216,10 +218,27 @@ impl DocSlot {
 /// board's lanes fill during prepaint.
 type CardBounds = Rc<RefCell<Vec<(RunKey, Bounds<gpui::Pixels>)>>>;
 
+/// One in-app notice: the run, the event, and the two lines the card draws.
+pub(crate) struct Notice {
+    id: u64,
+    kind: NoticeKind,
+    title: String,
+    body: String,
+    key: RunKey,
+}
+
 pub struct FlowApp {
     pub(crate) settings: store::Settings,
     pub(crate) snapshot: Snapshot,
     pub(crate) scanning: bool,
+    /// Every run's state at the last scan, so a transition is announced once.
+    announced: std::collections::HashMap<RunKey, (RunState, bool)>,
+    /// The first scan only seeds `announced`: the runs it finds were already
+    /// there, and greeting a person with their whole board is noise.
+    announce_ready: bool,
+    /// The in-app notices, oldest first. The desktop channel is `notify`.
+    pub(crate) notices: Vec<Notice>,
+    next_notice: u64,
     /// Which run of the scan loop is current, so a restart retires the old one.
     scan_generation: u64,
     /// The engine host: one blocking run per repository, in memory.
@@ -415,6 +434,10 @@ impl FlowApp {
             settings,
             snapshot: Snapshot::default(),
             scanning: false,
+            announced: std::collections::HashMap::new(),
+            announce_ready: false,
+            notices: Vec::new(),
+            next_notice: 0,
             scan_generation: 0,
             host,
             board,
@@ -521,6 +544,8 @@ impl FlowApp {
             }
             return;
         }
+        // What moved is news; the snapshot being replaced is the "before".
+        self.announce(&next, cx);
         self.snapshot = next;
         // The board the door answers with is the snapshot this window just
         // adopted: one source of truth, and the door never runs a scan.
@@ -528,6 +553,104 @@ impl FlowApp {
         self.reconcile_selection(cx);
         self.select_pending_run(cx);
         self.refresh_screens(cx);
+        cx.notify();
+    }
+
+    /// Announce the runs whose state changed since the last scan.
+    ///
+    /// The first scan only seeds the map: a window opening on a board full of
+    /// waiting runs should not greet the person with a card for each. After
+    /// that, a change is news — a run that asks a question, blocks or finishes
+    /// — and the settings document says which of those to announce and whether
+    /// the desktop is told as well.
+    fn announce(&mut self, next: &Snapshot, cx: &mut Context<Self>) {
+        if !self.announce_ready {
+            self.announce_ready = true;
+            self.announced = next
+                .runs()
+                .map(|run| (run.key.clone(), (run.status, run.question.is_some())))
+                .collect();
+            return;
+        }
+        let preferences = store::Settings::load().notifications;
+        let mut fresh = Vec::new();
+        for run in next.runs() {
+            let now = (run.status, run.question.is_some());
+            if self.announced.get(&run.key).copied() == Some(now) {
+                continue;
+            }
+            let Some(kind) = notify::kind_of(now.0, now.1) else {
+                continue;
+            };
+            let enabled = match kind {
+                NoticeKind::Waiting => preferences.waiting,
+                NoticeKind::Blocked => preferences.blocked,
+                NoticeKind::Finished => preferences.finished,
+            };
+            if !enabled {
+                continue;
+            }
+            let body = match kind {
+                NoticeKind::Waiting => run
+                    .question
+                    .as_ref()
+                    .map(|question| question.title.clone())
+                    .unwrap_or_else(|| "A question is waiting.".to_owned()),
+                NoticeKind::Blocked => run
+                    .stop_reason
+                    .clone()
+                    .unwrap_or_else(|| format!("stopped at `{}`", run.step)),
+                NoticeKind::Finished => "The run finished.".to_owned(),
+            };
+            if preferences.desktop {
+                notify::desktop(
+                    format!("warp-flow · {}", kind.label()),
+                    format!("{} — {}", run.title, body),
+                );
+            }
+            fresh.push(Notice {
+                id: 0,
+                kind,
+                title: run.title.clone(),
+                body,
+                key: run.key.clone(),
+            });
+        }
+        self.announced = next
+            .runs()
+            .map(|run| (run.key.clone(), (run.status, run.question.is_some())))
+            .collect();
+        for notice in fresh {
+            self.push_notice(notice, cx);
+        }
+    }
+
+    /// Show one notice, keep the newest few, and take it away after its while.
+    fn push_notice(&mut self, mut notice: Notice, cx: &mut Context<Self>) {
+        self.next_notice = self.next_notice.wrapping_add(1);
+        notice.id = self.next_notice;
+        let id = notice.id;
+        self.notices.push(notice);
+        while self.notices.len() > 3 {
+            self.notices.remove(0);
+        }
+        // A notice that outlives its event is clutter: it goes on its own,
+        // and a click takes it away sooner.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(8))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.notices.retain(|notice| notice.id != id);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn dismiss_notice(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.notices.retain(|notice| notice.id != id);
         cx.notify();
     }
 
@@ -1035,10 +1158,16 @@ impl FlowApp {
     fn sync_window_title(&mut self, window: &mut Window) {
         // One activity phrase for both the OS title and the chip: a driven run
         // is the more telling work, and the scan is the fallback.
-        let activity = self
+        let mut activity = self
             .host_snapshot
             .driving_label()
             .or_else(|| self.scanning.then(|| "Scanning repositories".to_owned()));
+        // With nothing driving, the one thing the title should say is that a
+        // run is waiting on the person, who may be in another window.
+        let waiting = self.snapshot.need_you_count(None);
+        if activity.is_none() && waiting > 0 {
+            activity = Some(format!("{waiting} waiting on you"));
+        }
         let title = warpui_kit_core::activity::activity_title("Warp Flow", activity.as_deref());
         if self.window_title != title {
             window.set_window_title(&title);
@@ -1406,10 +1535,108 @@ impl Render for FlowApp {
                     .child(stage.child(detail)),
             )
             .children(new_run)
+            .when(!self.notices.is_empty(), |root| {
+                root.child(self.render_notices(cx))
+            })
             .when(self.shortcuts_open, |root| {
                 root.child(self.render_shortcuts(cx))
             })
             .child(self.text_menu.clone())
+    }
+}
+
+impl FlowApp {
+    /// The window's notices, newest first, in the corner the window's own
+    /// overlays use. A card is the in-app channel; the desktop one is
+    /// [`crate::notify::desktop`], and both are fed by the same setting.
+    fn render_notices(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut stack = div()
+            .debug_selector(|| "flow-notices".into())
+            .absolute()
+            .right(px(theme::scaled(24.)))
+            .bottom(px(theme::scaled(24.)))
+            .flex()
+            .flex_col()
+            .gap(px(theme::scaled(8.)))
+            .w(px(theme::scaled(340.)));
+        for notice in self.notices.iter().rev() {
+            stack = stack.child(self.render_notice(notice, cx));
+        }
+        stack.into_any_element()
+    }
+
+    fn render_notice(&self, notice: &Notice, cx: &mut Context<Self>) -> AnyElement {
+        let (hue, glyph) = match notice.kind {
+            NoticeKind::Waiting => (theme::CHANGES, "icons/icon-shield.svg"),
+            NoticeKind::Blocked => (theme::DANGER, "icons/icon-close.svg"),
+            NoticeKind::Finished => (theme::ADD, "icons/icon-check.svg"),
+        };
+        let key = notice.key.clone();
+        let id = notice.id;
+        div()
+            .id(SharedString::from(format!("flow-notice-{id}")))
+            .debug_selector(move || format!("flow-notice-{id}"))
+            .flex()
+            .flex_col()
+            .gap(px(3.))
+            .w_full()
+            .px(px(14.))
+            .py(px(12.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(hue)
+            .bg(theme::surface())
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_run(key.clone(), window, cx);
+                this.dismiss_notice(id, cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(icon(glyph, px(theme::icon_small()), hue))
+                    .child(
+                        div()
+                            .text_size(px(theme::font_meta()))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(hue)
+                            .child(notice.kind.label()),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("flow-notice-close-{id}")))
+                            .debug_selector(move || format!("flow-notice-close-{id}"))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.dismiss_notice(id, cx);
+                            }))
+                            .child(icon(
+                                "icons/icon-close.svg",
+                                px(theme::icon_small()),
+                                theme::text_muted(),
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(theme::font_body()))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .line_height(relative(1.35))
+                    .text_color(theme::text())
+                    .child(notice.title.clone()),
+            )
+            .child(
+                div()
+                    .text_size(px(theme::font_meta()))
+                    .line_height(relative(1.43))
+                    .text_color(theme::text_muted())
+                    .child(notice.body.clone()),
+            )
+            .into_any_element()
     }
 }
 

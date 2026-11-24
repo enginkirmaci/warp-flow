@@ -7,6 +7,7 @@ pub mod door;
 pub mod host;
 pub mod instance;
 pub mod logging;
+pub mod notify;
 pub mod paths;
 pub mod store;
 pub mod theme;

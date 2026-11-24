@@ -143,7 +143,8 @@ sürümüne aittir; bu belge değişiklik sonrası durumu anlatır.
 ## 3. Kalan işler — karar gerektirenler
 
 Aşağıdakiler bilerek yapılmadı; her biri bir ürün/sözleşme kararı istiyor.
-3, 4, 12 ve 17 ikinci turda karara bağlandı ve uygulandı (§4).
+3, 4, 12 ve 17 ikinci turda (§4), 1, 2, 8 ve 16 üçüncü turda (§6) karara
+bağlandı ve uygulandı.
 
 | # | Konu | Neden karar gerekiyor | Öneri |
 |---|---|---|---|
@@ -221,4 +222,72 @@ satırlar tarihsel kayıt olarak bırakıldı; güncel durum bu bölümdedir.
 - İkinci turda: `cargo test --locked -p warp-flow-core` **212** birim testi +
   probe'lar; `cargo test --locked` **76** birim testi + probe'lar; her iki
   crate'te clippy `-D warnings` ve `cargo fmt --all -- --check` temiz.
-- Açık kalan kararlar: tablodaki 1, 2, 5–11 ve 13–16.
+- İkinci tur sonunda açık kalan kararlar: tablodaki 1, 2, 5–11 ve 13–16.
+
+## 6. Üçüncü tur — kalan dört karar (2026-11-24)
+
+### 1 — `on_gate_failed`: merge düşen kapının tamircisini adlandırıyor
+
+- `Step.on_gate_failed` eklendi; `on_conflict` ile aynı şekle sahip olmalı:
+  enabled, per_task harness, merge'den sonra tanımlı ve merge'i bekliyor.
+  `Workflow::validate_named_repair_step` iki alanı tek yerden doğruluyor.
+- Merge'in rebase sonrası kapısı düşünce motor repair'ı yazıyor, adlandırılan
+  adımı merge'in turu içinde çalıştırıyor (bariyer duruyor) ve bir sonraki
+  denemeyi yeni commit'lerle yapıyor. Adımın prompt'u merge'in en yeni
+  repair'ını adlandırıyor.
+- Şablon `.flow/workflow.toml`: merge `on_gate_failed = "fix-gates"` taşıyor
+  ve `fix-gates` adlı per-task `code` adımı merge'den sonra tanımlı. Editörün
+  yeni-depo menüsü adımı sunuyor ama merge'i onunla adlandırmıyor (menüde her
+  adım kapalı; adlandırma için ikisi de açılmalı).
+- Editör: merge formunda "On gate failure" alanı var.
+- ADR-0024 yazıldı; AGENTS ve README merge kuralını güncelliyor.
+- Testler: `a_failed_merge_gate_runs_the_named_fixer_and_lands_on_the_retry`,
+  `a_merge_may_name_the_step_that_fixes_its_gates`,
+  `a_gate_failure_step_must_wait_for_its_merge`,
+  `the_repositorys_own_template_names_the_step_that_fixes_a_failed_gate`.
+
+### 8 — Duran koşu bütün çözülmemiş task'ları durumlarıyla yazıyor
+
+- `stall_reason` artık ilk task'ı değil hepsini adlandırıyor:
+  `tasks 01 ... (needs-info), 02 ... (wontfix) are not resolved ...`.
+- Tek task'lı durum da durum sözcüğünü taşıyor; `run.md`'nin
+  `**Run stopped:**` satırı bloke kartında okunuyor.
+- Testler: `a_stalled_run_names_every_unresolved_task_and_its_status`,
+  `run_probe::a_task_never_starts_while_its_blocker_is_unresolved` güncellendi.
+
+### 16 — Workflow kaydı: kod değişmedi, uyarı eklendi
+
+- Karar: kayıt aynı anda commit etmiyor (UI git yazmıyor, merge commit'iyle
+  yarışmıyor). Bunun yerine editör uyarıyor: kirli başlık satırı
+  "commit before a merge" diyor ve başarılı kayıt mesajı `.flow/workflow.toml`
+  commit edilene kadar merge'ün reddedileceğini söylüyor.
+- Yeni bir kutu eklenmedi: başlığa satır eklemek formun ilk satırlarını
+  kaydırıp tıklamaları kaydırıyordu; uyarı var olan durum satırlarına yazıldı.
+- Davranış değişmedi: dosya commit edilene kadar `git status` kirli ve merge
+  reddediyor.
+
+### 2 — Bildirimler: iki kanal, olay bazlı ayarlar
+
+- `store::Notifications`: `waiting`, `blocked`, `finished` olayları ve
+  `desktop` kanalı. Yeni Settings › Notifications grubu bu dört anahtarı
+  taşıyor; her olay için pencere kartı, istenirse masaüstü bildirimi.
+- Uygulama içi: sağ altta en fazla üç kart (`flow-notices`, 8 saniye sonra
+  kendiliğinden kapanır), çalışan koşuda başlık "N waiting on you", rail
+  pip'i zaten `need_you_count` gösteriyor.
+- Masaüstü: `notify-rust` (gpui'nin Linux tarafında zaten ağaçta), ayrı kısa
+  ömürlü thread'de; DBus yoksa yalnızca debug satırı. Varsayılan kapalı:
+  pencere kartı yeterli, masaüstü istenirse açılıyor.
+- İlk tarama yalnızca durum haritasını dolduruyor; açılışta eski koşular için
+  kart üretilmiyor.
+- Testler: `notify::tests::a_question_outranks_the_state_but_not_a_finished_run`,
+  `settings_probe` dört satırı ve kalıcılığı doğruluyor.
+
+### Üçüncü tur doğrulaması
+
+- `cargo test --locked -p warp-flow-core`: **216** birim testi + probe'lar.
+- `cargo test --locked`: **77** birim testi + probe'lar.
+- Her iki crate'te clippy `-D warnings` ve `cargo fmt --all -- --check` temiz.
+- Açık kalan kararlar: 5 (Windows kapıları), 6 (`max_parallel` ayrımı),
+  7 (worktree tazeleme), 9 (`edge_span` torunları), 10 (UI thread'inde
+  `prepare`), 11 (oturum yazıcısı), 13 (`run.md` performansı),
+  14 (artımlı tarama), 15 (AI'nın akışı şekillendirmesi).

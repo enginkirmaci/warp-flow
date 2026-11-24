@@ -284,7 +284,12 @@ fn a_task_never_starts_while_its_blocker_is_unresolved() {
     );
     assert!(!run.body.contains("| test | 02 |"), "{}", run.body);
     assert!(!run.body.contains("| merge | 02 |"), "{}", run.body);
-    assert!(run.body.contains("task 01"), "{}", run.body);
+    assert!(
+        run.body
+            .contains("tasks 01 `First` (ready-for-agent), 02 `Second` (ready-for-agent)"),
+        "the blocked sentence names both tasks and their status: {}",
+        run.body
+    );
 
     let issue = Issue::open(&world.issue).expect("issue reopens");
     assert_eq!(issue.task(1).expect("task 1").status, Status::ReadyForAgent);

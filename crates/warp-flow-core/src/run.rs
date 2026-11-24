@@ -1537,14 +1537,32 @@ impl<H: Harness + Send + 'static> Runner<H> {
         }
     }
 
-    /// Why no step can advance, naming the task that holds the run back.
+    /// Why no step can advance, naming every task that holds the run back.
+    ///
+    /// A stalled join usually means the plan left work the engine will not do
+    /// by itself: a `needs-info` task, a `wontfix`, or a task no step covered.
+    /// The note names each one and its status, because a person deciding what
+    /// to do next needs to see all of them, not the first one twice.
     fn stall_reason(&self, issue: &Issue) -> String {
-        match issue.tasks().iter().find(|task| !task.status.is_resolved()) {
-            Some(task) => format!(
-                "task {:02} `{}` is not resolved and no step can advance it",
-                task.number, task.title
+        let unresolved: Vec<&Task> = issue
+            .tasks()
+            .iter()
+            .filter(|task| !task.status.is_resolved())
+            .collect();
+        match unresolved.as_slice() {
+            [] => "no step can run".to_owned(),
+            [task] => format!(
+                "task {:02} `{}` is not resolved ({}) and no step can advance it",
+                task.number, task.title, task.status
             ),
-            None => "no step can run".to_owned(),
+            tasks => {
+                let named = tasks
+                    .iter()
+                    .map(|task| format!("{:02} `{}` ({})", task.number, task.title, task.status))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("tasks {named} are not resolved and no step can advance them")
+            }
         }
     }
 
@@ -2284,6 +2302,37 @@ impl<H: Harness + Send + 'static> Runner<H> {
                     )? {
                         return Ok(StepRun::Blocked);
                     }
+                    // Retrying the identical merge can only fail again: the
+                    // branch has not changed since the gate measured it. A
+                    // merge may name the step that repairs the branch, and it
+                    // runs inside the merge's turn so the next attempt
+                    // measures the new commits (ADR-0024).
+                    if let Some(target) = step.on_gate_failed.as_deref() {
+                        let fixer = self.workflow.step(target).cloned().ok_or_else(|| {
+                            Error::Run(format!(
+                                "merge step `{}` names the gate-failure step `{target}`, which \
+                                 is not in the graph",
+                                step.id
+                            ))
+                        })?;
+                        let merge_label = running_label(&step.id, Some(task.number));
+                        let fixer_label = running_label(&fixer.id, Some(task.number));
+                        // The merge's turn is not over until its fixer reports:
+                        // the record names both, so neither band reads as
+                        // failed while the gate's repair is being written.
+                        self.current_step = Some(format!("{merge_label}, {fixer_label}"));
+                        self.write_run()?;
+                        let outcome = self.run_step_inner(&fixer, Some(task), &fixer_label);
+                        self.current_step = Some(merge_label);
+                        self.write_run()?;
+                        match outcome? {
+                            StepRun::Done => {}
+                            StepRun::Blocked
+                            | StepRun::Waiting(_)
+                            | StepRun::Stopped(_)
+                            | StepRun::Looped => return Ok(StepRun::Blocked),
+                        }
+                    }
                 }
                 MergeOutcome::DirtyMain { paths } => {
                     // A dirty main is a refusal, not a failed merge: retrying
@@ -2540,6 +2589,31 @@ impl<H: Harness + Send + 'static> Runner<H> {
                         sender.id
                     ));
                 }
+            }
+        }
+        // A step a merge names runs inside the merge's turn (ADR-0020,
+        // ADR-0024), so it reads the repair of the attempt that sent it there:
+        // the conflicted files, or the failing gate's output.
+        for merger in &self.workflow.steps {
+            if merger.kind != StepKind::Merge {
+                continue;
+            }
+            let named = merger.on_conflict.as_deref() == Some(step.id.as_str())
+                || merger.on_gate_failed.as_deref() == Some(step.id.as_str());
+            if !named {
+                continue;
+            }
+            if let Some(repair) = self.latest_repair(&merger.id, task) {
+                let name = repair
+                    .strip_prefix(&self.issue)
+                    .unwrap_or(&repair)
+                    .display();
+                prompt.push_str(&format!(
+                    "\n`{}` handed this work here because the merge needed it. Read `{name}` \
+                     for what the failed attempt measured, and fix what it names before you \
+                     finish.\n",
+                    merger.id
+                ));
             }
         }
         prompt.push_str("\nWrite your files and report what you did.\n");
@@ -3809,6 +3883,165 @@ depends_on = ["test"]
         assert_eq!(calls[1].workdir, worktree.path);
     }
 
+    #[test]
+    fn a_failed_merge_gate_runs_the_named_fixer_and_lands_on_the_retry() {
+        // The gate passes before the merge and fails on the rebased branch:
+        // retrying the identical merge can only fail again, because the branch
+        // has not changed. The merge names `fix`, which repairs the branch
+        // inside the merge's turn; the next attempt measures the new commit and
+        // lands (ADR-0024).
+        #[derive(Clone, Default)]
+        struct FixingHarness {
+            seen: Arc<Mutex<Vec<StepRequest>>>,
+        }
+
+        impl FixingHarness {
+            fn calls(&self) -> Vec<StepRequest> {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            }
+        }
+
+        impl Harness for FixingHarness {
+            fn run(&mut self, request: &StepRequest) -> Result<StepOutcome> {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(request.clone());
+                match request.step.id.as_str() {
+                    "analyze" => {
+                        fs::write(request.issue.join("spec.md"), "# Spec\n").map_err(|error| {
+                            crate::Error::io(request.issue.join("spec.md"), error)
+                        })?;
+                        Ok(StepOutcome::Done {
+                            wrote: Vec::new(),
+                            text: "analyzed".to_owned(),
+                        })
+                    }
+                    "code" => Ok(StepOutcome::Done {
+                        wrote: Vec::new(),
+                        text: "coded".to_owned(),
+                    }),
+                    "fix" => {
+                        let path = request.workdir.join("fix.txt");
+                        fs::write(&path, "fixed\n")
+                            .map_err(|error| crate::Error::io(&path, error))?;
+                        run_git(&request.workdir, &["add", "fix.txt"]);
+                        run_git(
+                            &request.workdir,
+                            &["commit", "--quiet", "-m", "fix the gate"],
+                        );
+                        Ok(StepOutcome::Done {
+                            wrote: vec![path],
+                            text: "fixed the failing check".to_owned(),
+                        })
+                    }
+                    other => Err(crate::Error::Harness(format!("unexpected step `{other}`"))),
+                }
+            }
+        }
+
+        let dir = TempDir::new();
+        let root = repository(&dir);
+        let issue = issue_in(&root);
+        let repo = Repo::open(&root).expect("repo opens");
+        let opened = Issue::open(&issue).expect("issue opens");
+        let worktree =
+            TaskWorktree::create(&repo, opened.task(1).expect("task 1")).expect("worktree created");
+        fs::write(worktree.path.join("feature.txt"), "done\n").expect("feature file");
+        run_git(&worktree.path, &["add", "feature.txt"]);
+        run_git(&worktree.path, &["commit", "--quiet", "-m", "task work"]);
+
+        let workflow = workflow(
+            r#"
+schema = 3
+name = "implement"
+revision = 1
+
+[[step]]
+id = "analyze"
+kind = "harness"
+skill = "analyze"
+produces = "spec.md"
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+per_task = true
+depends_on = ["analyze"]
+
+[[step]]
+id = "test"
+kind = "gate"
+command = "if [ -f gate-ran ]; then test -f fix.txt; else touch gate-ran; fi"
+cwd = "."
+timeout_secs = 5
+per_task = true
+depends_on = ["code"]
+
+[[step]]
+id = "merge"
+kind = "merge"
+per_task = true
+mode = "local"
+depends_on = ["test"]
+on_gate_failed = "fix"
+
+[[step]]
+id = "fix"
+kind = "harness"
+skill = "code"
+per_task = true
+depends_on = ["merge"]
+"#,
+        );
+        let mut config = RunnerConfig::new(&issue, workflow, FixingHarness::default());
+        config.workdir = root.clone();
+        config.repo = Some(repo);
+        config.max_attempts = 3;
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Done);
+        let document = run_md(&issue);
+        assert!(
+            document.body.contains("| merge | 01 | 1 | gate-failed |"),
+            "{}",
+            document.body
+        );
+        assert!(
+            document.body.contains("| merge | 01 | 2 | merged |"),
+            "{}",
+            document.body
+        );
+        assert!(
+            document.body.contains("| fix | 01 | 1 | done |"),
+            "{}",
+            document.body
+        );
+        let calls = runner.harness().calls();
+        let fix = calls
+            .iter()
+            .find(|call| call.step.id == "fix")
+            .expect("the named fixer ran");
+        assert!(
+            fix.prompt.contains("repairs/01.md"),
+            "the fixer reads the gate's repair: {}",
+            fix.prompt
+        );
+        assert_eq!(fix.workdir, worktree.path);
+        assert!(root.join("fix.txt").is_file(), "the fix landed on main");
+        let issue = Issue::open(&issue).expect("issue reopens");
+        assert_eq!(
+            issue.task(1).expect("task 1").status,
+            Status::Resolved,
+            "the merge resolved the task after its gate went green"
+        );
+    }
+
     const CLEANUP_WORKFLOW: &str = r#"
 schema = 3
 name = "implement"
@@ -4612,7 +4845,63 @@ edges = [{ to = "code", when = "gate_passed", max = 1, on_exhausted = "continue"
     }
 
     #[test]
+    fn a_stalled_run_names_every_unresolved_task_and_its_status() {
+        // The join waits for every task to be resolved. A plan may leave
+        // `needs-info` or `wontfix` behind, and the run cannot finish them by
+        // itself: the sentence a person reads names all of them, with the
+        // status that says why each one is still open.
+        let dir = TempDir::new();
+        let issue = issue(&dir);
+        fs::write(
+            issue.join("issues/01-first.md"),
+            task_text(1, "First task", "needs-info"),
+        )
+        .expect("first task");
+        fs::write(
+            issue.join("issues/02-second.md"),
+            task_text(2, "Second task", "wontfix"),
+        )
+        .expect("second task");
+        let workflow = workflow(
+            r#"
+schema = 3
+name = "implement"
+revision = 1
+
+[[step]]
+id = "analyze"
+kind = "harness"
+skill = "analyze"
+produces = "spec.md"
+
+[[step]]
+id = "code"
+kind = "harness"
+skill = "code"
+per_task = true
+"#,
+        );
+        let mut harness = FakeHarness::new();
+        harness.script("analyze", writes(&issue, "spec.md", "# Plan\n".to_owned()));
+        let mut config = RunnerConfig::new(&issue, workflow, harness);
+        config.log = Box::new(MemoryLog::new());
+        let mut runner = Runner::new(config).expect("runner");
+
+        assert_eq!(runner.run().expect("run"), RunStatus::Blocked);
+        let document = run_md(&issue);
+        let note = document
+            .body
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("**Run stopped:**"))
+            .expect("the blocked run carries its sentence");
+        assert!(note.contains("01 `First task` (needs-info)"), "{note}");
+        assert!(note.contains("02 `Second task` (wontfix)"), "{note}");
+    }
+
+    #[test]
     fn a_retry_resets_the_edge_window() {
+        // The run blocked after spending its edge budget. A person's retry
+        // opens a new attempt window, and the edge rounds belong to it too:
         // The run blocked after spending its edge budget. A person's retry
         // opens a new attempt window, and the edge rounds belong to it too:
         // the first gate failure after the retry must be able to send the work

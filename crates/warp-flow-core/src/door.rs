@@ -1342,6 +1342,7 @@ mod session_tests {
                 mode: None,
                 push: false,
                 on_conflict: None,
+                on_gate_failed: None,
             },
             issue: dir.clone(),
             workdir: dir,
@@ -1701,6 +1702,7 @@ mod tests {
             mode: None,
             push: false,
             on_conflict: None,
+            on_gate_failed: None,
         }
     }
 

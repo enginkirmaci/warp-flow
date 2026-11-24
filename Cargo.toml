@@ -1,6 +1,6 @@
 [package]
 name = "warp-flow"
-version = "0.1.69"
+version = "0.1.70"
 edition = "2024"
 description = "warp-flow — workflow engine for the warp-suite"
 license = "GPL-3.0"
@@ -34,6 +34,9 @@ warp-flow-core = { path = "crates/warp-flow-core" }
 
 # third-party
 anyhow = "1"
+# desktop notifications; the gpui stack already pulls this in on Linux, so the
+# dependency adds no build to the tree
+notify-rust = "4"
 # debug-embed: embed assets at compile time in debug builds too — without it
 # rust-embed resolves "assets" against the process CWD at runtime, so the app
 # only finds its icons when launched from the repo root

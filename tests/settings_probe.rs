@@ -86,6 +86,7 @@ fn the_settings_rows_and_the_motion_switch(cx: &mut TestAppContext) {
         favorites: Vec::new(),
         list_width: None,
         catalog: Vec::new(),
+        notifications: warp_flow::store::Notifications::default(),
     };
     settings.save();
     assert!(!warpui_kit_core::motion::reduced());
@@ -124,6 +125,23 @@ fn the_settings_rows_and_the_motion_switch(cx: &mut TestAppContext) {
         Some(1),
         "the repository list survives the switch: {written}"
     );
+
+    // The notification switches are one row per event plus the desktop
+    // channel, and a flip is the same save path.
+    for row in ["waiting", "blocked", "finished", "desktop"] {
+        assert!(
+            cx.debug_bounds(selector(&format!("settings-row-notify-{row}")))
+                .is_some(),
+            "{row} has a notification row"
+        );
+    }
+    click(cx, "switch-Questions");
+    let written = std::fs::read_to_string(home.join(".warp/flow/settings.json"))
+        .expect("the notification switch saves the document");
+    let value: serde_json::Value = serde_json::from_str(&written).expect("settings.json is JSON");
+    assert_eq!(value["notifications"]["waiting"], false, "{written}");
+    assert_eq!(value["notifications"]["desktop"], false, "{written}");
+    click(cx, "switch-Questions");
 
     // and back
     click(cx, "switch-Reduce motion");

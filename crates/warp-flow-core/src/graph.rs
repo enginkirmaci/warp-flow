@@ -157,6 +157,15 @@ pub struct Step {
     /// makes that safe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_conflict: Option<String>,
+    /// The per-task harness step that fixes a failed per-task gate, if any.
+    ///
+    /// The merge queue re-runs the per-task gates above a merge on the rebased
+    /// task branch (ADR-0019). When one fails, retrying the identical merge can
+    /// only fail again: the branch has not changed. A merge may name the step
+    /// that repairs it (ADR-0024), and the engine runs that step inside the
+    /// merge's turn before the next attempt — the same shape as `on_conflict`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_gate_failed: Option<String>,
 }
 
 /// What makes a step take one of its back-edges.
@@ -594,6 +603,7 @@ impl Workflow {
                     ("produces", step.produces.is_some()),
                     ("edges", !step.edges.is_empty()),
                     ("on_conflict", step.on_conflict.is_some()),
+                    ("on_gate_failed", step.on_gate_failed.is_some()),
                 ];
                 if let Some((field, _)) = carried.iter().find(|(_, carried)| *carried) {
                     return Err(Error::Workflow(format!(
@@ -665,105 +675,21 @@ impl Workflow {
 
         self.check_acyclic()?;
 
-        // A merge may name the step that resolves its conflict (ADR-0020). The
-        // named step never gets an ordinary job, so the graph must leave the
-        // scheduler nothing to give it: it is declared after the merge and no
-        // step the merge waits for. The target is checked here rather than in
-        // the structural loop because both its own shape and the merge's place
-        // are needed, and a step may be named by at most one merge.
+        // A merge may name the step that resolves its conflict (ADR-0020) and
+        // the step that repairs a failed per-task gate (ADR-0024). Neither is
+        // ever an ordinary candidate: each runs inside the merge's turn, so
+        // the graph must leave the scheduler nothing to give it. The checks
+        // are here rather than in the structural loop because both the target's
+        // shape and the merge's place are needed, and a step is named by at
+        // most one merge per role.
         let mut conflict_named_by: BTreeMap<&str, &str> = BTreeMap::new();
+        let mut gate_named_by: BTreeMap<&str, &str> = BTreeMap::new();
         for step in &self.steps {
-            let Some(target) = step.on_conflict.as_deref() else {
-                continue;
-            };
-            if step.kind != StepKind::Merge {
-                return Err(Error::Workflow(format!(
-                    "step `{}` names a conflict step but is not a merge step; only a merge has \
-                     conflicts to resolve",
-                    step.id
-                )));
+            if let Some(target) = step.on_conflict.as_deref() {
+                self.validate_named_repair_step(step, target, "conflict", &mut conflict_named_by)?;
             }
-            let Some((target_index, target_step)) = self
-                .steps
-                .iter()
-                .enumerate()
-                .find(|(_, candidate)| candidate.id == target)
-            else {
-                return Err(Error::Workflow(format!(
-                    "merge step `{}` names conflict step `{target}`, which is not in the graph",
-                    step.id
-                )));
-            };
-            if target_step.id == step.id {
-                return Err(Error::Workflow(format!(
-                    "merge step `{}` names itself as its conflict step",
-                    step.id
-                )));
-            }
-            if !target_step.enabled {
-                return Err(Error::Workflow(format!(
-                    "merge step `{}` names conflict step `{target}`, which is disabled; the \
-                     step that resolves a conflict must be enabled",
-                    step.id
-                )));
-            }
-            if !target_step.per_task {
-                return Err(Error::Workflow(format!(
-                    "conflict step `{target}` must be per_task, because a conflict is resolved \
-                     for one task"
-                )));
-            }
-            if target_step.kind != StepKind::Harness {
-                return Err(Error::Workflow(format!(
-                    "conflict step `{target}` must be a harness step, because the conflict is \
-                     resolved in a session"
-                )));
-            }
-            if !step.enabled {
-                return Err(Error::Workflow(format!(
-                    "conflict step `{target}` is enabled but merge step `{}` is disabled; \
-                     enabling the conflict step alone would run it as an ordinary step",
-                    step.id
-                )));
-            }
-            let merge_index = self
-                .steps
-                .iter()
-                .position(|candidate| candidate.id == step.id)
-                .unwrap_or(self.steps.len());
-            if target_index <= merge_index {
-                return Err(Error::Workflow(format!(
-                    "conflict step `{target}` must be declared after merge step `{}`, so the \
-                     scheduler has no task to give it",
-                    step.id
-                )));
-            }
-            if !self
-                .dependencies(target_step)
-                .iter()
-                .any(|dependency| dependency == &step.id)
-            {
-                return Err(Error::Workflow(format!(
-                    "conflict step `{target}` must wait for merge step `{}`; otherwise the \
-                     scheduler would give it ordinary work",
-                    step.id
-                )));
-            }
-            let mut ancestors = BTreeSet::new();
-            self.ancestors_into(step, &mut ancestors);
-            if ancestors.contains(target) {
-                return Err(Error::Workflow(format!(
-                    "merge step `{}` names conflict step `{target}`, which is a step it waits \
-                     for; the conflict step runs inside the merge's turn",
-                    step.id
-                )));
-            }
-            if let Some(first) = conflict_named_by.insert(target, &step.id) {
-                return Err(Error::Workflow(format!(
-                    "conflict step `{target}` is named by merge steps `{first}` and `{}`; a \
-                     step resolves one merge's conflicts",
-                    step.id
-                )));
+            if let Some(target) = step.on_gate_failed.as_deref() {
+                self.validate_named_repair_step(step, target, "gate-failure", &mut gate_named_by)?;
             }
         }
 
@@ -875,6 +801,109 @@ impl Workflow {
                     step.id
                 )));
             }
+        }
+        Ok(())
+    }
+
+    /// One merge's named repair step, checked against the shape that lets it
+    /// run inside the merge's turn.
+    ///
+    /// ADR-0020 names the step for a conflict and ADR-0024 for a failed
+    /// per-task gate; the shape is the same, so it is checked once. `role` is
+    /// the word a person reads in the refusal.
+    fn validate_named_repair_step<'a>(
+        &'a self,
+        step: &'a Step,
+        target: &'a str,
+        role: &str,
+        named_by: &mut BTreeMap<&'a str, &'a str>,
+    ) -> Result<()> {
+        if step.kind != StepKind::Merge {
+            return Err(Error::Workflow(format!(
+                "step `{}` names a {role} step but is not a merge step; only a merge can name \
+                 one",
+                step.id
+            )));
+        }
+        let Some((target_index, target_step)) = self
+            .steps
+            .iter()
+            .enumerate()
+            .find(|(_, candidate)| candidate.id == target)
+        else {
+            return Err(Error::Workflow(format!(
+                "merge step `{}` names {role} step `{target}`, which is not in the graph",
+                step.id
+            )));
+        };
+        if target_step.id == step.id {
+            return Err(Error::Workflow(format!(
+                "merge step `{}` names itself as its {role} step",
+                step.id
+            )));
+        }
+        if !target_step.enabled {
+            return Err(Error::Workflow(format!(
+                "merge step `{}` names {role} step `{target}`, which is disabled; the step that \
+                 handles a {role} must be enabled",
+                step.id
+            )));
+        }
+        if !target_step.per_task {
+            return Err(Error::Workflow(format!(
+                "{role} step `{target}` must be per_task, because it runs for one task"
+            )));
+        }
+        if target_step.kind != StepKind::Harness {
+            return Err(Error::Workflow(format!(
+                "{role} step `{target}` must be a harness step, because it runs in a session"
+            )));
+        }
+        if !step.enabled {
+            return Err(Error::Workflow(format!(
+                "{role} step `{target}` is enabled but merge step `{}` is disabled; enabling \
+                 it alone would run it as an ordinary step",
+                step.id
+            )));
+        }
+        let merge_index = self
+            .steps
+            .iter()
+            .position(|candidate| candidate.id == step.id)
+            .unwrap_or(self.steps.len());
+        if target_index <= merge_index {
+            return Err(Error::Workflow(format!(
+                "{role} step `{target}` must be declared after merge step `{}`, so the \
+                 scheduler has no task to give it",
+                step.id
+            )));
+        }
+        if !self
+            .dependencies(target_step)
+            .iter()
+            .any(|dependency| dependency == &step.id)
+        {
+            return Err(Error::Workflow(format!(
+                "{role} step `{target}` must wait for merge step `{}`; otherwise the scheduler \
+                 would give it ordinary work",
+                step.id
+            )));
+        }
+        let mut ancestors = BTreeSet::new();
+        self.ancestors_into(step, &mut ancestors);
+        if ancestors.contains(target) {
+            return Err(Error::Workflow(format!(
+                "merge step `{}` names {role} step `{target}`, which is a step it waits for; \
+                 the {role} step runs inside the merge's turn",
+                step.id
+            )));
+        }
+        if let Some(first) = named_by.insert(target, &step.id) {
+            return Err(Error::Workflow(format!(
+                "{role} step `{target}` is named by merge steps `{first}` and `{}`; a merge \
+                 names one {role} step",
+                step.id
+            )));
         }
         Ok(())
     }
@@ -1310,6 +1339,7 @@ mod tests {
             mode: None,
             push: false,
             on_conflict: None,
+            on_gate_failed: None,
         }
     }
 
@@ -2310,6 +2340,43 @@ depends-on = ["b"]
             .validate()
             .expect_err("an enabled resolver beside a disabled merge runs alone");
         assert!(error.to_string().contains("is disabled"), "{error}");
+    }
+
+    /// A merge and the step that fixes a failed gate: the shape ADR-0024 asks
+    /// for.
+    fn merge_with_gate_fix_step(fixer: Step) -> Workflow {
+        let mut graph = workflow(vec![
+            linked("code", StepKind::Harness),
+            linked("merge", StepKind::Merge),
+            fixer,
+        ]);
+        graph.steps[1].per_task = true;
+        graph.steps[1].on_gate_failed = Some("fix".to_owned());
+        graph
+    }
+
+    #[test]
+    fn a_merge_may_name_the_step_that_fixes_its_gates() {
+        let mut fixer = linked("fix", StepKind::Harness);
+        fixer.per_task = true;
+        merge_with_gate_fix_step(fixer)
+            .validate()
+            .expect("the gate-failure step has the shape ADR-0024 asks for");
+    }
+
+    #[test]
+    fn a_gate_failure_step_must_wait_for_its_merge() {
+        // A root fixer would be an ordinary candidate for every ready task,
+        // which is the one thing its declaration must prevent.
+        let mut fixer = step("fix", StepKind::Harness, &[]);
+        fixer.per_task = true;
+        let error = merge_with_gate_fix_step(fixer)
+            .validate()
+            .expect_err("a fixer that does not wait for the merge gets ordinary work");
+        assert!(
+            error.to_string().contains("must wait for merge step"),
+            "{error}"
+        );
     }
 
     #[test]

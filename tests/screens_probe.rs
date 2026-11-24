@@ -534,7 +534,7 @@ fn the_rails_settings_item_is_named_at_its_foot_and_opens_its_groups(cx: &mut Te
         cx.debug_bounds("flow-screen-settings").is_some(),
         "a press at the Settings tab's named point opened the Settings page"
     );
-    for group in ["appearance", "engine", "files", "about"] {
+    for group in ["appearance", "notifications", "engine", "files", "about"] {
         assert!(
             cx.debug_bounds(selector(&format!("flow-settings-{group}")))
                 .is_some(),

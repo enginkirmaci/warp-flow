@@ -36,6 +36,8 @@ pub enum SettingsGroup {
     /// Type, palette and motion.
     #[default]
     Appearance,
+    /// Which run events the window announces, and the desktop channel.
+    Notifications,
     /// The door, and the run it drives.
     Engine,
     /// Where the app keeps its files, and this build.
@@ -45,14 +47,34 @@ pub enum SettingsGroup {
     About,
 }
 
+/// One switch in the Notifications group: the labels, the current value and
+/// the field it writes. A struct because seven pieces would otherwise be a
+/// seven-argument call with no name for any of them.
+struct NotificationRow {
+    switch: &'static str,
+    label: &'static str,
+    row: &'static str,
+    description: &'static str,
+    on: bool,
+    first: bool,
+    set: fn(&mut store::Notifications, bool),
+}
+
 impl SettingsGroup {
     /// Every group, in the list's order.
-    pub const ALL: [Self; 4] = [Self::Appearance, Self::Engine, Self::Files, Self::About];
+    pub const ALL: [Self; 5] = [
+        Self::Appearance,
+        Self::Notifications,
+        Self::Engine,
+        Self::Files,
+        Self::About,
+    ];
 
     /// A stable key for debug selectors and state.
     pub fn key(self) -> &'static str {
         match self {
             Self::Appearance => "appearance",
+            Self::Notifications => "notifications",
             Self::Engine => "engine",
             Self::Files => "files",
             Self::About => "about",
@@ -63,6 +85,7 @@ impl SettingsGroup {
     pub fn label(self) -> &'static str {
         match self {
             Self::Appearance => "Appearance",
+            Self::Notifications => "Notifications",
             Self::Engine => "Engine",
             Self::Files => "Files",
             Self::About => "About",
@@ -73,6 +96,9 @@ impl SettingsGroup {
     pub fn blurb(self) -> &'static str {
         match self {
             Self::Appearance => "Text size, palette and motion.",
+            Self::Notifications => {
+                "Which run events the window announces, and whether the desktop hears them."
+            }
             Self::Engine => "The door warp-agent reads, and the runs this window drives.",
             Self::Files => "Where the settings and logs live, and this build.",
             Self::About => "The installed family, this build and the license.",
@@ -185,6 +211,27 @@ impl SettingsScreen {
         )
     }
 
+    /// One notification switch: take effect at once, then persist.
+    ///
+    /// The window reads the document when it has something to announce, so a
+    /// switch flipped here changes the very next event, not only the next
+    /// launch.
+    fn notification_row(&mut self, row: NotificationRow, cx: &mut Context<Self>) -> AnyElement {
+        kit::switch_row_with_desc(
+            row.switch,
+            row.label,
+            row.row,
+            row.description,
+            row.on,
+            row.first,
+            cx.listener(move |this, checked: &bool, _window, cx| {
+                (row.set)(&mut this.settings.notifications, *checked);
+                this.settings.save();
+                cx.notify();
+            }),
+        )
+    }
+
     fn folder_row(&self) -> AnyElement {
         let folder = AppPaths::config_dir();
         kit::row_with_desc(
@@ -263,6 +310,9 @@ impl Render for SettingsScreen {
         let appearance = self
             .group
             .is_none_or(|group| group == SettingsGroup::Appearance);
+        let notifications = self
+            .group
+            .is_none_or(|group| group == SettingsGroup::Notifications);
         let engine = self
             .group
             .is_none_or(|group| group == SettingsGroup::Engine);
@@ -272,6 +322,53 @@ impl Render for SettingsScreen {
             rows.push(self.text_size_row());
             rows.push(self.palette_row());
             rows.push(self.motion_row(cx));
+        }
+        if notifications {
+            let prefs = self.settings.notifications.clone();
+            for row in [
+                NotificationRow {
+                    switch: "settings-switch-notify-waiting",
+                    label: "Questions",
+                    row: "settings-row-notify-waiting",
+                    description: "A run that stopped to ask you something draws a card in the \
+                                  window.",
+                    on: prefs.waiting,
+                    first: true,
+                    set: |prefs, on| prefs.waiting = on,
+                },
+                NotificationRow {
+                    switch: "settings-switch-notify-blocked",
+                    label: "Blocked runs",
+                    row: "settings-row-notify-blocked",
+                    description: "A run that stopped and cannot advance until someone looks at \
+                                  it.",
+                    on: prefs.blocked,
+                    first: false,
+                    set: |prefs, on| prefs.blocked = on,
+                },
+                NotificationRow {
+                    switch: "settings-switch-notify-finished",
+                    label: "Finished runs",
+                    row: "settings-row-notify-finished",
+                    description: "A run that reached done or merged, so a long queue has an end \
+                                  in sight.",
+                    on: prefs.finished,
+                    first: false,
+                    set: |prefs, on| prefs.finished = on,
+                },
+                NotificationRow {
+                    switch: "settings-switch-notify-desktop",
+                    label: "Desktop notifications",
+                    row: "settings-row-notify-desktop",
+                    description: "Send an enabled event to the desktop too, so another window \
+                                  hears about it.",
+                    on: prefs.desktop,
+                    first: false,
+                    set: |prefs, on| prefs.desktop = on,
+                },
+            ] {
+                rows.push(self.notification_row(row, cx));
+            }
         }
         if engine {
             rows.push(self.door_row());

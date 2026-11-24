@@ -91,11 +91,13 @@ from the door's catalog — three selects beside the text fields, each cascading
 to the next, with an empty choice meaning the engine's own — and the engine
 runs exactly what the step names: a harness it does not publish is a step that
 stops at its own boundary with a repair naming it, never a silent substitution
-(ADR-0017). `Settings` is a list of groups — Appearance, Engine, Files and
-About: the first three hold the reduce-motion switch, where the app keeps its
-files, and the door's state and the version, while the About group is the
-family's About page, which takes the section's whole width in place of the group
-list — a second press on the rail's Settings item returns to the groups.
+(ADR-0017). `Settings` is a list of groups — Appearance, Notifications, Engine,
+Files and About: they hold the reduce-motion switch, which run events the
+window announces (a question, a block, a finished run) and whether the desktop
+hears them too, where the app keeps its files, and the door's state and the
+version, while the About group is the family's About page, which takes the
+section's whole width in place of the group list — a second press on the rail's
+Settings item returns to the groups.
 
 A step can also send the work back: `edges` is a list of back-edges, each
 naming the step the work returns to (`to`), what makes it return (`when`) and
@@ -111,9 +113,12 @@ the step and stops the run, unless the edge says `on_exhausted = "continue"`.
 
 A merge step can name the step that resolves its conflict: `on_conflict` runs
 that step in the task's worktree when the rebase conflicts, and the merge
-retries. The run closes with two sibling steps — `summary` writes the report,
-`cleanup` removes each merged task's worktree and branch — so the issue folder
-outlives the run while the working debris does not (ADR-0020, ADR-0021).
+retries. It can also name the step that repairs a failed per-task gate
+(`on_gate_failed`): the gate measured the rebased branch, so retrying the same
+merge cannot help until that branch changes (ADR-0024). The run closes with two
+sibling steps — `summary` writes the report, `cleanup` removes each merged
+task's worktree and branch — so the issue folder outlives the run while the
+working debris does not (ADR-0020, ADR-0021).
 
 The engine owns an issue folder while it drives a run: Artifacts refuses an
 edit then (one line says why), while the repository's Workflow template may

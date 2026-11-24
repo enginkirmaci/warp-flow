@@ -107,7 +107,8 @@ rules that still matter move into `README.md` or this file.
   The run's Workflow tab is `ScreenRun::read_only` — a reading of the revision
   the run uses — and the template is edited in Repos › Workflow, so a running
   run never reads a file that changes under it. Settings is a list of groups
-  (Appearance, Engine, Files, About); its About group is the family's About page
+  (Appearance, Notifications, Engine, Files, About); its About group is the
+  family's About page
   (`ui::about`), which needs the section's whole width and so takes the place of
   the group list — a second press on the rail's Settings item returns to the
   groups. The rail is three items and the license dialog stays the window's.
@@ -189,6 +190,12 @@ process: the kit ties its `gsettings monitor` to the app's lifetime
   step inside the merge's turn (the barrier still holds), and retries. The step
   never gets an ordinary job — its task is resolved once the merge lands — and
   the merge's attempt budget bounds the rounds (ADR-0020).
+- **A merge may name the step that fixes a failed gate.** `on_gate_failed`
+  names a step with the same shape, for the other failure the queue has: the
+  per-task gates re-run on the rebased branch (ADR-0019), and a retry measures
+  the same branch until that step commits a fix. It runs inside the merge's
+  turn, reads the merge's newest repair, and the merge's attempt budget bounds
+  the rounds (ADR-0024).
 - **A run cleans up after itself.** A `cleanup` step, not per task and declared
   after the summary, names the merge like the summary does: it removes each
   merged task's worktree, deletes its branch and prunes. `main`, the issue

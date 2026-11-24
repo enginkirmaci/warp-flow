@@ -83,6 +83,30 @@ fn the_repositorys_own_template_takes_a_rejection_back_to_the_plan() {
 }
 
 #[test]
+fn the_repositorys_own_template_names_the_step_that_fixes_a_failed_gate() {
+    // A per-task gate re-runs on the rebased branch (ADR-0019). Without a
+    // named fixer, a failure can only be retried against the same branch.
+    let graph = template();
+    let merge = graph.step("merge").expect("merge is in the template");
+    let target = merge
+        .on_gate_failed
+        .as_deref()
+        .expect("a failed merge gate has a step to repair it");
+    let fixer = graph
+        .step(target)
+        .unwrap_or_else(|| panic!("the named fixer `{target}` is in the graph"));
+    assert_eq!(fixer.kind, StepKind::Harness);
+    assert!(fixer.per_task, "the fixer repairs one task's branch");
+    assert!(
+        graph
+            .dependencies(fixer)
+            .iter()
+            .any(|dependency| dependency == "merge"),
+        "the fixer waits for the merge, so it never gets ordinary work"
+    );
+}
+
+#[test]
 fn the_repositorys_own_template_reads_downwards() {
     // The template is written as a pipeline (ADR-0018): a step that names
     // nothing waits for every step above it, so the order in the file is the
@@ -102,6 +126,7 @@ fn the_repositorys_own_template_reads_downwards() {
             "bump",
             "merge",
             "resolve-conflict",
+            "fix-gates",
             "summary",
             "cleanup"
         ],

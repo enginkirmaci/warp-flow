@@ -580,6 +580,7 @@ fn step_request(prompt: &str) -> StepRequest {
             mode: None,
             push: false,
             on_conflict: None,
+            on_gate_failed: None,
         },
         issue: workdir.join("issue"),
         workdir,

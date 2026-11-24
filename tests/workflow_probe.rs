@@ -441,7 +441,7 @@ fn a_run_with_no_workflow_starts_from_the_shipped_shape(cx: &mut TestAppContext)
         .read_with(cx, |host, cx| host.0.read(cx).graph_for_probe().cloned())
         .expect("the window is open")
         .expect("a graph is offered");
-    assert_eq!(graph.steps.len(), 12, "the known pipeline, not one step");
+    assert_eq!(graph.steps.len(), 13, "the known pipeline, not one step");
     assert_eq!(graph.steps[0].id, "analyze");
     assert!(
         graph.steps.iter().all(|step| !step.enabled),
@@ -456,7 +456,7 @@ fn a_run_with_no_workflow_starts_from_the_shipped_shape(cx: &mut TestAppContext)
         .expect("the editor created the file");
     assert_eq!(
         on_disk.steps.len(),
-        13,
+        14,
         "the default document, plus the step the editor added"
     );
     assert_eq!(on_disk.revision, 2, "a fresh graph starts at revision 1");

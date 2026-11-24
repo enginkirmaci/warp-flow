@@ -193,6 +193,9 @@ struct Fields {
     /// The step a merge hands its conflicted branch to (ADR-0020); empty names
     /// none, which is a merge that blocks on a conflict instead.
     on_conflict: Entity<InputState>,
+    /// The step a merge hands a failed per-task gate to (ADR-0024); empty
+    /// names none, which is a merge that retries the same gate.
+    on_gate_failed: Entity<InputState>,
 }
 
 /// The workflow editor: the 320 step list and the selected step's editor.
@@ -593,6 +596,12 @@ impl WorkflowScreen {
             step.on_conflict.clone().unwrap_or_default(),
             "the step that resolves a conflicted merge; empty names none",
         );
+        let on_gate_failed = make(
+            window,
+            cx,
+            step.on_gate_failed.clone().unwrap_or_default(),
+            "the step that fixes a failed per-task gate; empty names none",
+        );
         let watched: Vec<(Entity<InputState>, Field)> = vec![
             (id.clone(), Field::Id),
             (skill.clone(), Field::Skill),
@@ -601,6 +610,7 @@ impl WorkflowScreen {
             (timeout.clone(), Field::Timeout),
             (produces.clone(), Field::Produces),
             (on_conflict.clone(), Field::OnConflict),
+            (on_gate_failed.clone(), Field::OnGateFailed),
         ];
         for (input, which) in watched {
             let watched = input.clone();
@@ -620,6 +630,7 @@ impl WorkflowScreen {
                     }
                     Field::Produces => step.produces = (!text.is_empty()).then_some(text),
                     Field::OnConflict => step.on_conflict = (!text.is_empty()).then_some(text),
+                    Field::OnGateFailed => step.on_gate_failed = (!text.is_empty()).then_some(text),
                 });
             })
             .detach();
@@ -632,6 +643,7 @@ impl WorkflowScreen {
             timeout,
             produces,
             on_conflict,
+            on_gate_failed,
         };
         self.fields = Some(fields.clone());
         Some(fields)
@@ -667,6 +679,10 @@ impl WorkflowScreen {
                 fields.on_conflict.clone(),
                 step.on_conflict.clone().unwrap_or_default(),
             ),
+            (
+                fields.on_gate_failed.clone(),
+                step.on_gate_failed.clone().unwrap_or_default(),
+            ),
         ];
         for (input, value) in values {
             input.update(cx, |state, cx| {
@@ -689,10 +705,12 @@ impl WorkflowScreen {
         self.edit_step(cx, |step| {
             step.kind = kind;
             // `on_conflict` is a merge's field and nobody else's: validation
-            // refuses it on another kind, and a cleanup step in particular
-            // declares nothing (ADR-0020, ADR-0021).
+            // refuses it (or `on_gate_failed`) on another kind, and a cleanup
+            // step in particular declares nothing (ADR-0020, ADR-0021,
+            // ADR-0024).
             if kind != StepKind::Merge {
                 step.on_conflict = None;
+                step.on_gate_failed = None;
             }
             if kind == StepKind::Merge {
                 step.per_task = true;
@@ -718,6 +736,7 @@ impl WorkflowScreen {
                 step.produces = None;
                 step.edges.clear();
                 step.on_conflict = None;
+                step.on_gate_failed = None;
             }
         });
     }
@@ -763,6 +782,7 @@ impl WorkflowScreen {
             mode: None,
             push: false,
             on_conflict: None,
+            on_gate_failed: None,
         };
         let at = match place {
             Place::Front => 0,
@@ -866,9 +886,17 @@ impl WorkflowScreen {
                         });
                     }
                     this.status = Some(if appended {
-                        format!("Saved — revision {}", saved.revision)
+                        format!(
+                            "Saved — revision {}. Commit the file before a run reaches its \
+                             merge: the queue refuses a dirty checkout.",
+                            saved.revision
+                        )
                     } else {
-                        format!("Saved — revision {} (nothing changed)", saved.revision)
+                        format!(
+                            "Saved — revision {} (nothing changed). Commit the file before a \
+                             run reaches its merge: the queue refuses a dirty checkout.",
+                            saved.revision
+                        )
                     });
                     this.loaded = Some(saved.clone());
                     this.graph = Some(saved);
@@ -1314,8 +1342,8 @@ impl WorkflowScreen {
                     .text_size(px(theme::font_mono_meta()))
                     .text_color(theme::text_muted())
                     .child(format!(
-                        "unsaved · revision {} in the file",
-                        self.graph.as_ref().map(|graph| graph.revision).unwrap_or(0)
+                        "unsaved · revision {} in the file · commit before a merge",
+                        self.graph.as_ref().map(|graph| graph.revision).unwrap_or(0),
                     )),
             );
         }
@@ -1412,6 +1440,11 @@ impl WorkflowScreen {
                 "On conflict",
                 "on-conflict",
                 fields.as_ref().map(|fields| fields.on_conflict.clone()),
+            ));
+            rows.push((
+                "On gate failure",
+                "on-gate-failed",
+                fields.as_ref().map(|fields| fields.on_gate_failed.clone()),
             ));
         }
         for (label, key, input) in rows {
@@ -2704,6 +2737,7 @@ enum Field {
     Timeout,
     Produces,
     OnConflict,
+    OnGateFailed,
 }
 
 /// The step's value as a row of its list: the value itself is offered when the
@@ -2998,6 +3032,7 @@ fn new_step(id: &str, kind: StepKind, depends_on: &[&str]) -> Step {
         mode: None,
         push: false,
         on_conflict: None,
+        on_gate_failed: None,
     }
 }
 
@@ -3096,6 +3131,10 @@ fn new_graph() -> Workflow {
             &["merge"],
         ));
     }
+    // A failed per-task gate can be handed to a step the same way (ADR-0024):
+    // the menu offers it off and unnamed, and the person turns the pair on and
+    // names it in the merge's form. The shipped template does both already.
+    steps.push(harness("fix-gates", "code", None, true, &["merge"]));
     // The run's close is two siblings: the summary reports it and the cleanup
     // removes every merged task's worktree and branch (ADR-0021). Both name the
     // merge, so neither waits for the other.

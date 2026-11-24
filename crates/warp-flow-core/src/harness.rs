@@ -227,6 +227,7 @@ mod tests {
                 mode: None,
                 push: false,
                 on_conflict: None,
+                on_gate_failed: None,
             },
             issue: workdir.join("issue"),
             workdir: workdir.to_path_buf(),

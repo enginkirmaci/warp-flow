@@ -170,6 +170,7 @@ per_task = true
 mode = "local"
 push = false
 on_conflict = "resolve-conflict"
+on_gate_failed = "fix-gates"
 
 # The conflict step: takes the rebase that failed on the task branch, resolves
 # it and finishes it, so the retry has nothing left to replay. Its input is the
@@ -180,6 +181,21 @@ on_conflict = "resolve-conflict"
 id = "resolve-conflict"
 kind = "harness"
 skill = "merge-conflict"
+per_task = true
+depends_on = ["merge"]
+harness = "dsh"
+model = "opencode-go/deepseek-v4.1-flash"
+effort = "max"
+
+# The gates above the merge re-run on the rebased branch (ADR-0019). When one
+# of them fails, retrying the same merge cannot help: the branch has not
+# changed. This step repairs it inside the merge's turn, then the merge
+# retries (ADR-0024). Its input is the newest repair the failed attempt wrote;
+# it fixes code on the task branch and commits, so `max`.
+[[step]]
+id = "fix-gates"
+kind = "harness"
+skill = "code"
 per_task = true
 depends_on = ["merge"]
 harness = "dsh"

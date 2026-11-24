@@ -47,6 +47,38 @@ pub struct Settings {
     /// choices, and caching them means the editor still works with the door
     /// closed — a stale list is better than an empty one.
     pub catalog: Vec<CatalogEntry>,
+    /// Which run events the window announces, and whether the desktop hears
+    /// about them too. Additive, so an older document reads the defaults.
+    pub notifications: Notifications,
+}
+
+/// Which run events the window announces, and where.
+///
+/// An enabled event always draws the window's own card; `desktop` adds the OS
+/// notification for a person who is in another window. It is off by default:
+/// the window's card is enough until someone asks for the desktop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Notifications {
+    /// A run stopped to ask a person a question.
+    pub waiting: bool,
+    /// A run blocked.
+    pub blocked: bool,
+    /// A run finished.
+    pub finished: bool,
+    /// Send an enabled event to the desktop too.
+    pub desktop: bool,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Self {
+            waiting: true,
+            blocked: true,
+            finished: true,
+            desktop: false,
+        }
+    }
 }
 
 /// One harness in the cached catalog.
@@ -2260,6 +2292,7 @@ depends_on = []
             mode: None,
             push: false,
             on_conflict: None,
+            on_gate_failed: None,
         }
     }
 
@@ -2386,6 +2419,7 @@ depends_on = []
             mode: None,
             push: false,
             on_conflict: None,
+            on_gate_failed: None,
         }
     }
 
