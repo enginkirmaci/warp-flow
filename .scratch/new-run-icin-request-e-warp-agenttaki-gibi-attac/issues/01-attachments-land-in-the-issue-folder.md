@@ -1,6 +1,6 @@
 # 01: Attachments land in the issue folder and the folder reads back
 
-**Status:** ready-for-agent
+**Status:** resolved
 **Category:** enhancement
 **Blocked by:** None
 **Branch:** agent/01-attachments-land-in-the-issue-folder-and-thef
